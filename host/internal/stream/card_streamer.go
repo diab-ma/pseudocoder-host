@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,25 @@ type ChunkInfo struct {
 	Length      int    // Deprecated: use Content directly
 	Content     string // Raw chunk content (including @@ header)
 	ContentHash string // SHA256 hash prefix for stale detection
+	GroupIndex  int    // Group number for proximity grouping (0-based)
+}
+
+// ChunkGroupInfo describes a group of related chunks for proximity grouping.
+// Groups are formed by collecting chunks within a configurable number of lines
+// of each other. This allows mobile clients to display and act on related
+// chunks together.
+type ChunkGroupInfo struct {
+	// GroupIndex is the 0-based position of this group.
+	GroupIndex int
+
+	// LineStart is the starting line number of the group (minimum of member chunks).
+	LineStart int
+
+	// LineEnd is the ending line number of the group (maximum of member chunks).
+	LineEnd int
+
+	// ChunkCount is the number of chunks in this group.
+	ChunkCount int
 }
 
 // DiffStats mirrors server.DiffStats for the streaming layer.
@@ -43,10 +63,11 @@ type DiffStats struct {
 type CardBroadcaster interface {
 	// BroadcastDiffCard sends a card to all connected clients.
 	// The chunks parameter provides per-chunk metadata for granular decisions.
+	// The chunkGroups parameter provides proximity grouping metadata (nil when disabled).
 	// The isBinary flag indicates per-chunk actions should be disabled.
 	// The isDeleted flag indicates this is a file deletion (use file-level actions).
 	// The stats parameter provides size metrics for large diff warnings.
-	BroadcastDiffCard(cardID, file, diffContent string, chunks []ChunkInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64)
+	BroadcastDiffCard(cardID, file, diffContent string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64)
 
 	// BroadcastCardRemoved notifies clients that a card was removed.
 	// This is called when changes are staged/reverted externally.
@@ -74,6 +95,15 @@ type CardStreamerConfig struct {
 	// OnError is called when an error occurs during streaming.
 	// If nil, errors are logged but not propagated.
 	OnError func(err error)
+
+	// ChunkGroupingEnabled enables proximity-based chunk grouping.
+	// When true, chunks within ChunkGroupingProximity lines are grouped together.
+	ChunkGroupingEnabled bool
+
+	// ChunkGroupingProximity is the maximum line distance for grouping chunks.
+	// Chunks within this many lines of each other are placed in the same group.
+	// Default is 20 lines if not specified.
+	ChunkGroupingProximity int
 }
 
 // CardStreamer coordinates diff polling, storage, and streaming.
@@ -238,6 +268,7 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 
 		var diffContent string
 		var chunkInfoList []ChunkInfo
+		var chunkGroups []ChunkGroupInfo
 		var stats *DiffStats
 
 		// For hashing, we need content that changes when the file changes.
@@ -257,6 +288,15 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 			diffContent = diff.ConcatChunkContent(fileChunkList)
 			hashSource = diffContent
 			chunkInfoList = buildChunkInfo(fileChunkList, diffContent)
+
+			// Apply proximity-based grouping if enabled
+			if cs.config.ChunkGroupingEnabled && len(chunkInfoList) > 0 {
+				proximity := cs.config.ChunkGroupingProximity
+				if proximity <= 0 {
+					proximity = 20 // Default proximity
+				}
+				chunkGroups, chunkInfoList = GroupChunksByProximity(chunkInfoList, proximity)
+			}
 
 			// Calculate diff stats for large file warnings
 			diffStats := diff.CalculateDiffStats(diffContent)
@@ -308,10 +348,10 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 			chunkStatuses := make([]*storage.ChunkStatus, len(chunkInfoList))
 			for i, h := range chunkInfoList {
 				chunkStatuses[i] = &storage.ChunkStatus{
-					CardID:    cardID,
+					CardID:     cardID,
 					ChunkIndex: i,
-					Content:   h.Content,
-					Status:    storage.CardPending,
+					Content:    h.Content,
+					Status:     storage.CardPending,
 				}
 			}
 			if err := cs.config.ChunkStore.SaveChunks(cardID, chunkStatuses); err != nil {
@@ -335,6 +375,7 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 				card.File,
 				card.Diff,
 				chunkInfoList,
+				chunkGroups,
 				isBinary,
 				isDeleted,
 				stats,
@@ -430,8 +471,9 @@ func (cs *CardStreamer) ValidateAndCleanStaleCards() error {
 		return nil // No poller configured, skip validation
 	}
 
-	// Get current diff state using the poller (unstaged only, same as normal polling)
-	chunks, rawDiff, err := cs.config.Poller.PollOnceRaw()
+	// Get current diff state without advancing the poller's hash.
+	// This keeps the next poll tick from thinking nothing changed.
+	chunks, rawDiff, err := cs.config.Poller.SnapshotRaw()
 	if err != nil {
 		return fmt.Errorf("poll failed: %w", err)
 	}
@@ -476,11 +518,21 @@ func (cs *CardStreamer) StreamPendingCards() error {
 		isBinary := card.Diff == diff.BinaryDiffPlaceholder
 
 		var chunkInfoList []ChunkInfo
+		var chunkGroups []ChunkGroupInfo
 		var stats *DiffStats
 
 		if !isBinary {
 			// Parse chunk boundaries from stored diff content
 			chunkInfoList = ParseChunkInfoFromDiff(card.Diff)
+
+			// Apply proximity-based grouping if enabled
+			if cs.config.ChunkGroupingEnabled && len(chunkInfoList) > 0 {
+				proximity := cs.config.ChunkGroupingProximity
+				if proximity <= 0 {
+					proximity = 20 // Default proximity
+				}
+				chunkGroups, chunkInfoList = GroupChunksByProximity(chunkInfoList, proximity)
+			}
 
 			// Reconcile: if ChunkStore is configured but has no chunks for this card,
 			// save the parsed chunks to enable per-chunk decisions.
@@ -505,6 +557,7 @@ func (cs *CardStreamer) StreamPendingCards() error {
 			card.File,
 			card.Diff,
 			chunkInfoList,
+			chunkGroups,
 			isBinary,
 			isDeleted,
 			stats,
@@ -733,4 +786,142 @@ func (cs *CardStreamer) ClearSeen() {
 func hashContent(content string) string {
 	hash := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(hash[:8])
+}
+
+// =============================================================================
+// Phase 2.2: Chunk Grouping by Proximity
+// =============================================================================
+
+// lineRef returns the reference line number for a chunk, used for grouping.
+// Uses new-file line numbers for edits/additions, old-file for deletion-only chunks.
+//
+// Implements the PLANS.md pseudocode:
+//
+//	line_ref(chunk) = chunk.new_start if chunk.new_count > 0 else chunk.old_start
+func lineRef(chunk ChunkInfo) int {
+	if chunk.NewCount > 0 {
+		return chunk.NewStart
+	}
+	return chunk.OldStart
+}
+
+// lineSpan returns the number of lines a chunk spans, used for calculating group end.
+// Uses new-file line count for edits/additions, old-file for deletion-only chunks.
+//
+// Implements the PLANS.md pseudocode:
+//
+//	line_span(chunk) = chunk.new_count if chunk.new_count > 0 else chunk.old_count
+func lineSpan(chunk ChunkInfo) int {
+	if chunk.NewCount > 0 {
+		return chunk.NewCount
+	}
+	return chunk.OldCount
+}
+
+// GroupChunksByProximity groups chunks that are within proximity lines of each other.
+// It returns the list of groups and a copy of the input chunks with GroupIndex set.
+//
+// The algorithm sorts chunks by line reference (new-file line for edits, old-file
+// for deletions), then iterates through them. If a chunk starts within proximity
+// lines of the previous group's end, it joins that group; otherwise it starts a
+// new group.
+//
+// Implements the PLANS.md pseudocode:
+//
+//	groups = []
+//	for chunk in chunks_sorted:
+//	  if groups empty: start new group
+//	  else if line_ref(chunk) <= groups.last.line_end + proximity: add to group
+//	  else start new group
+//	  groups.last.line_end = max(groups.last.line_end, line_ref(chunk) + line_span(chunk) - 1)
+//
+// Parameters:
+//   - chunks: the ChunkInfo slice to group (not modified)
+//   - proximity: maximum line distance to group chunks (typically 20)
+//
+// Returns:
+//   - groups: slice of ChunkGroupInfo describing each group
+//   - indexed: copy of chunks with GroupIndex field set
+func GroupChunksByProximity(chunks []ChunkInfo, proximity int) ([]ChunkGroupInfo, []ChunkInfo) {
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+
+	// Create a copy of chunks with indices for sorting
+	type indexedChunk struct {
+		originalIndex int
+		chunk         ChunkInfo
+		lineRef       int
+	}
+	sortable := make([]indexedChunk, len(chunks))
+	for i, c := range chunks {
+		sortable[i] = indexedChunk{
+			originalIndex: i,
+			chunk:         c,
+			lineRef:       lineRef(c),
+		}
+	}
+
+	// Sort by line reference (stable sort preserves original order for equal keys)
+	sort.SliceStable(sortable, func(i, j int) bool {
+		return sortable[i].lineRef < sortable[j].lineRef
+	})
+
+	// Build groups using the PLANS.md algorithm
+	var groups []ChunkGroupInfo
+	chunkToGroup := make([]int, len(chunks)) // maps original index -> group index
+
+	for _, ic := range sortable {
+		chunkRef := ic.lineRef
+		span := lineSpan(ic.chunk)
+
+		// Calculate this chunk's end line
+		// Handle edge case: if span is 0, treat as 1 line minimum to avoid line_end < line_start
+		if span < 1 {
+			span = 1
+		}
+		chunkEnd := chunkRef + span - 1
+
+		if len(groups) == 0 {
+			// Start first group
+			groups = append(groups, ChunkGroupInfo{
+				GroupIndex: 0,
+				LineStart:  chunkRef,
+				LineEnd:    chunkEnd,
+				ChunkCount: 1,
+			})
+			chunkToGroup[ic.originalIndex] = 0
+		} else {
+			lastGroup := &groups[len(groups)-1]
+			// Check if this chunk is within proximity of the last group's end
+			if chunkRef <= lastGroup.LineEnd+proximity {
+				// Add to existing group
+				lastGroup.ChunkCount++
+				// Extend group's line range if needed
+				if chunkEnd > lastGroup.LineEnd {
+					lastGroup.LineEnd = chunkEnd
+				}
+				chunkToGroup[ic.originalIndex] = lastGroup.GroupIndex
+			} else {
+				// Start new group
+				newGroupIndex := len(groups)
+				groups = append(groups, ChunkGroupInfo{
+					GroupIndex: newGroupIndex,
+					LineStart:  chunkRef,
+					LineEnd:    chunkEnd,
+					ChunkCount: 1,
+				})
+				chunkToGroup[ic.originalIndex] = newGroupIndex
+			}
+		}
+	}
+
+	// Build the indexed output - copy chunks with GroupIndex set
+	indexed := make([]ChunkInfo, len(chunks))
+	for i, c := range chunks {
+		indexed[i] = c
+		indexed[i].GroupIndex = chunkToGroup[i]
+	}
+
+	return groups, indexed
 }

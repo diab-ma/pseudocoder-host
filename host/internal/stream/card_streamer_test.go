@@ -18,14 +18,15 @@ type mockBroadcaster struct {
 }
 
 type broadcastedCard struct {
-	CardID    string
-	File      string
-	Diff      string
-	Chunks     []ChunkInfo
-	IsBinary  bool
-	IsDeleted bool
-	Stats     *DiffStats
-	CreatedAt int64
+	CardID      string
+	File        string
+	Diff        string
+	Chunks      []ChunkInfo
+	ChunkGroups []ChunkGroupInfo
+	IsBinary    bool
+	IsDeleted   bool
+	Stats       *DiffStats
+	CreatedAt   int64
 }
 
 func newMockBroadcaster() *mockBroadcaster {
@@ -35,18 +36,19 @@ func newMockBroadcaster() *mockBroadcaster {
 	}
 }
 
-func (m *mockBroadcaster) BroadcastDiffCard(cardID, file, diffContent string, chunks []ChunkInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) {
+func (m *mockBroadcaster) BroadcastDiffCard(cardID, file, diffContent string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cards = append(m.cards, broadcastedCard{
-		CardID:    cardID,
-		File:      file,
-		Diff:      diffContent,
-		Chunks:     chunks,
-		IsBinary:  isBinary,
-		IsDeleted: isDeleted,
-		Stats:     stats,
-		CreatedAt: createdAt,
+		CardID:      cardID,
+		File:        file,
+		Diff:        diffContent,
+		Chunks:      chunks,
+		ChunkGroups: chunkGroups,
+		IsBinary:    isBinary,
+		IsDeleted:   isDeleted,
+		Stats:       stats,
+		CreatedAt:   createdAt,
 	})
 }
 
@@ -455,9 +457,9 @@ func TestCardStreamer_CardPayloadMatchesProtocol(t *testing.T) {
 // failingStore is a mock CardStore that fails SaveCard a configurable number
 // of times before succeeding. Used to test retry behavior.
 type failingStore struct {
-	storage.CardStore                // Embed real store for other methods
-	failCount         int            // Number of times to fail before succeeding
-	callCount         int            // Number of SaveCard calls made
+	storage.CardStore     // Embed real store for other methods
+	failCount         int // Number of times to fail before succeeding
+	callCount         int // Number of SaveCard calls made
 	mu                sync.Mutex
 }
 
@@ -774,7 +776,7 @@ func TestCardStreamer_StaleCardRemovalDeletesChunks(t *testing.T) {
 
 	streamer := NewCardStreamer(CardStreamerConfig{
 		Store:       store,
-		ChunkStore:   store, // SQLiteStore implements both interfaces
+		ChunkStore:  store, // SQLiteStore implements both interfaces
 		Broadcaster: broadcaster,
 		SessionID:   "test-session",
 	})
@@ -1112,10 +1114,10 @@ func TestCardStreamer_StreamPendingCards_ReconcilesMissingChunks(t *testing.T) {
 	broadcaster := newMockBroadcaster()
 
 	streamer := NewCardStreamer(CardStreamerConfig{
-		Store:      store,
-		ChunkStore: store, // SQLiteStore implements both interfaces
+		Store:       store,
+		ChunkStore:  store, // SQLiteStore implements both interfaces
 		Broadcaster: broadcaster,
-		SessionID:  "test-session",
+		SessionID:   "test-session",
 	})
 
 	// Stream pending cards - this should reconcile missing chunks
@@ -1169,10 +1171,10 @@ func TestCardStreamer_StreamPendingCards_SkipsExistingChunks(t *testing.T) {
 	broadcaster := newMockBroadcaster()
 
 	streamer := NewCardStreamer(CardStreamerConfig{
-		Store:      store,
-		ChunkStore: store,
+		Store:       store,
+		ChunkStore:  store,
 		Broadcaster: broadcaster,
-		SessionID:  "test-session",
+		SessionID:   "test-session",
 	})
 
 	// Create a card with chunks via normal ProcessChunks flow
@@ -1363,10 +1365,10 @@ func TestReconcileChunks_RebuildsStaleMismatch(t *testing.T) {
 	broadcaster := newMockBroadcaster()
 
 	streamer := NewCardStreamer(CardStreamerConfig{
-		Store:      store,
-		ChunkStore: store,
+		Store:       store,
+		ChunkStore:  store,
 		Broadcaster: broadcaster,
-		SessionID:  "test-session",
+		SessionID:   "test-session",
 	})
 
 	// Create a card with chunks via normal ProcessChunks flow
@@ -1445,10 +1447,10 @@ func TestReconcileChunks_RebuildOnCountMismatch(t *testing.T) {
 	broadcaster := newMockBroadcaster()
 
 	streamer := NewCardStreamer(CardStreamerConfig{
-		Store:      store,
-		ChunkStore: store,
+		Store:       store,
+		ChunkStore:  store,
 		Broadcaster: broadcaster,
-		SessionID:  "test-session",
+		SessionID:   "test-session",
 	})
 
 	// Create a card with 2 chunks
@@ -1490,5 +1492,879 @@ func TestReconcileChunks_RebuildOnCountMismatch(t *testing.T) {
 	}
 	if len(rebuiltChunks) != 3 {
 		t.Errorf("expected 3 rebuilt chunks after count mismatch, got %d", len(rebuiltChunks))
+	}
+}
+
+// =============================================================================
+// Phase 2.2: Grouping Algorithm Tests
+// =============================================================================
+
+// TestChunkGroupInfo_Fields verifies the ChunkGroupInfo struct has required fields.
+func TestChunkGroupInfo_Fields(t *testing.T) {
+	group := ChunkGroupInfo{
+		GroupIndex: 0,
+		LineStart:  10,
+		LineEnd:    25,
+		ChunkCount: 3,
+	}
+
+	if group.GroupIndex != 0 {
+		t.Errorf("expected GroupIndex 0, got %d", group.GroupIndex)
+	}
+	if group.LineStart != 10 {
+		t.Errorf("expected LineStart 10, got %d", group.LineStart)
+	}
+	if group.LineEnd != 25 {
+		t.Errorf("expected LineEnd 25, got %d", group.LineEnd)
+	}
+	if group.ChunkCount != 3 {
+		t.Errorf("expected ChunkCount 3, got %d", group.ChunkCount)
+	}
+}
+
+// TestGroupChunksByProximity_SingleChunk tests grouping with one chunk.
+func TestGroupChunksByProximity_SingleChunk(t *testing.T) {
+	chunks := []ChunkInfo{
+		{Index: 0, OldStart: 10, OldCount: 3, NewStart: 10, NewCount: 5},
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(groups))
+	}
+	if groups[0].GroupIndex != 0 {
+		t.Errorf("expected group index 0, got %d", groups[0].GroupIndex)
+	}
+	if groups[0].LineStart != 10 {
+		t.Errorf("expected LineStart 10, got %d", groups[0].LineStart)
+	}
+	// LineEnd = line_ref + line_span - 1 = 10 + 5 - 1 = 14
+	if groups[0].LineEnd != 14 {
+		t.Errorf("expected LineEnd 14, got %d", groups[0].LineEnd)
+	}
+	if groups[0].ChunkCount != 1 {
+		t.Errorf("expected ChunkCount 1, got %d", groups[0].ChunkCount)
+	}
+
+	// Verify indexed chunks have GroupIndex set
+	if len(indexed) != 1 {
+		t.Fatalf("expected 1 indexed chunk, got %d", len(indexed))
+	}
+	if indexed[0].GroupIndex != 0 {
+		t.Errorf("expected chunk GroupIndex 0, got %d", indexed[0].GroupIndex)
+	}
+}
+
+// TestGroupChunksByProximity_MultipleChunks_SameGroup tests chunks within proximity.
+func TestGroupChunksByProximity_MultipleChunks_SameGroup(t *testing.T) {
+	// Chunk 1: lines 10-14 (new_start=10, new_count=5)
+	// Chunk 2: lines 30-32 (new_start=30, new_count=3)
+	// With proximity 20: 30 <= 14 + 20 = 34, so same group
+	chunks := []ChunkInfo{
+		{Index: 0, OldStart: 10, OldCount: 3, NewStart: 10, NewCount: 5},
+		{Index: 1, OldStart: 30, OldCount: 2, NewStart: 30, NewCount: 3},
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group (chunks within proximity), got %d", len(groups))
+	}
+	if groups[0].LineStart != 10 {
+		t.Errorf("expected LineStart 10, got %d", groups[0].LineStart)
+	}
+	// LineEnd = max of both chunks = max(14, 32) = 32
+	if groups[0].LineEnd != 32 {
+		t.Errorf("expected LineEnd 32, got %d", groups[0].LineEnd)
+	}
+	if groups[0].ChunkCount != 2 {
+		t.Errorf("expected ChunkCount 2, got %d", groups[0].ChunkCount)
+	}
+
+	// All chunks in same group
+	for i, chunk := range indexed {
+		if chunk.GroupIndex != 0 {
+			t.Errorf("chunk %d: expected GroupIndex 0, got %d", i, chunk.GroupIndex)
+		}
+	}
+}
+
+// TestGroupChunksByProximity_MultipleChunks_SeparateGroups tests chunks beyond proximity.
+func TestGroupChunksByProximity_MultipleChunks_SeparateGroups(t *testing.T) {
+	// Chunk 1: lines 10-14 (new_start=10, new_count=5)
+	// Chunk 2: lines 50-52 (new_start=50, new_count=3)
+	// With proximity 20: 50 > 14 + 20 = 34, so separate groups
+	chunks := []ChunkInfo{
+		{Index: 0, OldStart: 10, OldCount: 3, NewStart: 10, NewCount: 5},
+		{Index: 1, OldStart: 50, OldCount: 2, NewStart: 50, NewCount: 3},
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups (chunks beyond proximity), got %d", len(groups))
+	}
+
+	// First group
+	if groups[0].GroupIndex != 0 {
+		t.Errorf("group 0: expected index 0, got %d", groups[0].GroupIndex)
+	}
+	if groups[0].LineStart != 10 || groups[0].LineEnd != 14 {
+		t.Errorf("group 0: expected 10-14, got %d-%d", groups[0].LineStart, groups[0].LineEnd)
+	}
+	if groups[0].ChunkCount != 1 {
+		t.Errorf("group 0: expected count 1, got %d", groups[0].ChunkCount)
+	}
+
+	// Second group
+	if groups[1].GroupIndex != 1 {
+		t.Errorf("group 1: expected index 1, got %d", groups[1].GroupIndex)
+	}
+	if groups[1].LineStart != 50 || groups[1].LineEnd != 52 {
+		t.Errorf("group 1: expected 50-52, got %d-%d", groups[1].LineStart, groups[1].LineEnd)
+	}
+	if groups[1].ChunkCount != 1 {
+		t.Errorf("group 1: expected count 1, got %d", groups[1].ChunkCount)
+	}
+
+	// Verify chunk group indices
+	if indexed[0].GroupIndex != 0 {
+		t.Errorf("chunk 0: expected GroupIndex 0, got %d", indexed[0].GroupIndex)
+	}
+	if indexed[1].GroupIndex != 1 {
+		t.Errorf("chunk 1: expected GroupIndex 1, got %d", indexed[1].GroupIndex)
+	}
+}
+
+// TestGroupChunksByProximity_ThreeChunks_TwoGroups tests complex grouping.
+func TestGroupChunksByProximity_ThreeChunks_TwoGroups(t *testing.T) {
+	// Chunk 1: lines 10-14
+	// Chunk 2: lines 25-27 (within 20 of chunk 1's end at 14)
+	// Chunk 3: lines 60-64 (beyond 20 of chunk 2's end at 27)
+	chunks := []ChunkInfo{
+		{Index: 0, NewStart: 10, NewCount: 5},
+		{Index: 1, NewStart: 25, NewCount: 3},
+		{Index: 2, NewStart: 60, NewCount: 5},
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(groups))
+	}
+
+	// First group contains chunks 0 and 1
+	if groups[0].ChunkCount != 2 {
+		t.Errorf("group 0: expected 2 chunks, got %d", groups[0].ChunkCount)
+	}
+	if groups[0].LineStart != 10 {
+		t.Errorf("group 0: expected LineStart 10, got %d", groups[0].LineStart)
+	}
+	if groups[0].LineEnd != 27 {
+		t.Errorf("group 0: expected LineEnd 27 (25+3-1), got %d", groups[0].LineEnd)
+	}
+
+	// Second group contains chunk 2
+	if groups[1].ChunkCount != 1 {
+		t.Errorf("group 1: expected 1 chunk, got %d", groups[1].ChunkCount)
+	}
+	if groups[1].LineStart != 60 {
+		t.Errorf("group 1: expected LineStart 60, got %d", groups[1].LineStart)
+	}
+
+	// Verify chunk assignments
+	if indexed[0].GroupIndex != 0 || indexed[1].GroupIndex != 0 {
+		t.Error("chunks 0 and 1 should be in group 0")
+	}
+	if indexed[2].GroupIndex != 1 {
+		t.Errorf("chunk 2: expected GroupIndex 1, got %d", indexed[2].GroupIndex)
+	}
+}
+
+// TestGroupChunksByProximity_EmptyChunks tests empty input.
+func TestGroupChunksByProximity_EmptyChunks(t *testing.T) {
+	groups, indexed := GroupChunksByProximity(nil, 20)
+
+	if len(groups) != 0 {
+		t.Errorf("expected 0 groups for nil input, got %d", len(groups))
+	}
+	if len(indexed) != 0 {
+		t.Errorf("expected 0 indexed chunks for nil input, got %d", len(indexed))
+	}
+
+	groups, indexed = GroupChunksByProximity([]ChunkInfo{}, 20)
+
+	if len(groups) != 0 {
+		t.Errorf("expected 0 groups for empty input, got %d", len(groups))
+	}
+	if len(indexed) != 0 {
+		t.Errorf("expected 0 indexed chunks for empty input, got %d", len(indexed))
+	}
+}
+
+// TestGroupChunksByProximity_DeletionOnly_UsesOldStart tests the adversarial case:
+// chunk.new_count = 0 -> line_ref uses old_start for grouping
+func TestGroupChunksByProximity_DeletionOnly_UsesOldStart(t *testing.T) {
+	// Chunk is deletion-only: new_count = 0, so use old_start
+	chunks := []ChunkInfo{
+		{Index: 0, OldStart: 100, OldCount: 5, NewStart: 100, NewCount: 0}, // deletion at old line 100
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(groups))
+	}
+
+	// line_ref should be old_start (100) since new_count = 0
+	// line_span should be old_count (5) since new_count = 0
+	// LineEnd = 100 + 5 - 1 = 104
+	if groups[0].LineStart != 100 {
+		t.Errorf("deletion-only chunk: expected LineStart 100 (old_start), got %d", groups[0].LineStart)
+	}
+	if groups[0].LineEnd != 104 {
+		t.Errorf("deletion-only chunk: expected LineEnd 104, got %d", groups[0].LineEnd)
+	}
+	if indexed[0].GroupIndex != 0 {
+		t.Errorf("expected chunk GroupIndex 0, got %d", indexed[0].GroupIndex)
+	}
+}
+
+// TestGroupChunksByProximity_IdenticalLineRef_SameGroup tests the adversarial case:
+// chunks with identical line_ref -> same group (line_end >= line_start)
+func TestGroupChunksByProximity_IdenticalLineRef_SameGroup(t *testing.T) {
+	// Two chunks at exactly the same line
+	chunks := []ChunkInfo{
+		{Index: 0, NewStart: 50, NewCount: 2},
+		{Index: 1, NewStart: 50, NewCount: 3},
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group for identical line_ref, got %d", len(groups))
+	}
+
+	if groups[0].ChunkCount != 2 {
+		t.Errorf("expected 2 chunks in group, got %d", groups[0].ChunkCount)
+	}
+	if groups[0].LineStart != 50 {
+		t.Errorf("expected LineStart 50, got %d", groups[0].LineStart)
+	}
+	// LineEnd should be max(50+2-1, 50+3-1) = max(51, 52) = 52
+	if groups[0].LineEnd != 52 {
+		t.Errorf("expected LineEnd 52, got %d", groups[0].LineEnd)
+	}
+
+	// Both chunks in same group
+	if indexed[0].GroupIndex != indexed[1].GroupIndex {
+		t.Error("identical line_ref chunks should be in the same group")
+	}
+}
+
+// TestGroupChunksByProximity_ProximityBoundary tests exact proximity boundary.
+func TestGroupChunksByProximity_ProximityBoundary(t *testing.T) {
+	// Chunk 1 ends at line 14 (10 + 5 - 1)
+	// Chunk 2 starts at line 34 (exactly 14 + 20)
+	// Should be in the SAME group (<=, not <)
+	chunksWithin := []ChunkInfo{
+		{Index: 0, NewStart: 10, NewCount: 5}, // ends at 14
+		{Index: 1, NewStart: 34, NewCount: 2}, // starts at 34 = 14 + 20
+	}
+
+	groups, _ := GroupChunksByProximity(chunksWithin, 20)
+
+	if len(groups) != 1 {
+		t.Errorf("expected 1 group at exact boundary (34 <= 14+20), got %d", len(groups))
+	}
+
+	// Chunk 2 starts at line 35 (14 + 20 + 1 = 35)
+	// Should be in DIFFERENT group (35 > 34)
+	chunksBeyond := []ChunkInfo{
+		{Index: 0, NewStart: 10, NewCount: 5}, // ends at 14
+		{Index: 1, NewStart: 35, NewCount: 2}, // starts at 35 > 14 + 20
+	}
+
+	groups, _ = GroupChunksByProximity(chunksBeyond, 20)
+
+	if len(groups) != 2 {
+		t.Errorf("expected 2 groups beyond boundary (35 > 14+20), got %d", len(groups))
+	}
+}
+
+// TestGroupChunksByProximity_MinimumProximity tests proximity = 1.
+func TestGroupChunksByProximity_MinimumProximity(t *testing.T) {
+	// With proximity 1, only immediately adjacent chunks are grouped
+	chunks := []ChunkInfo{
+		{Index: 0, NewStart: 10, NewCount: 5}, // ends at 14
+		{Index: 1, NewStart: 15, NewCount: 3}, // starts at 15 = 14 + 1, within proximity
+		{Index: 2, NewStart: 20, NewCount: 2}, // starts at 20 > 17 + 1 = 18, separate group
+	}
+
+	groups, _ := GroupChunksByProximity(chunks, 1)
+
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups with proximity 1, got %d", len(groups))
+	}
+
+	// First group: chunks 0 and 1 (15 <= 14 + 1)
+	if groups[0].ChunkCount != 2 {
+		t.Errorf("group 0: expected 2 chunks, got %d", groups[0].ChunkCount)
+	}
+
+	// Second group: chunk 2 (20 > 17 + 1)
+	if groups[1].ChunkCount != 1 {
+		t.Errorf("group 1: expected 1 chunk, got %d", groups[1].ChunkCount)
+	}
+}
+
+// TestGroupChunksByProximity_UnsortedInput tests that input is sorted by line_ref.
+func TestGroupChunksByProximity_UnsortedInput(t *testing.T) {
+	// Input chunks are NOT sorted by line number
+	chunks := []ChunkInfo{
+		{Index: 0, NewStart: 50, NewCount: 2}, // line 50
+		{Index: 1, NewStart: 10, NewCount: 3}, // line 10 (should come first)
+		{Index: 2, NewStart: 30, NewCount: 2}, // line 30
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	// After sorting by line_ref: 10, 30, 50
+	// 10-12, 30-31 (30 <= 12+20=32, same group)
+	// 50-51 (50 > 31+20=51? No, 50 <= 51, same group)
+	// Actually: 30 <= 12+20=32 ✓, 50 <= 31+20=51 ✓
+	// All in one group
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group after sorting, got %d", len(groups))
+	}
+
+	// All chunks should have GroupIndex 0
+	for i, chunk := range indexed {
+		if chunk.GroupIndex != 0 {
+			t.Errorf("chunk %d: expected GroupIndex 0, got %d", i, chunk.GroupIndex)
+		}
+	}
+}
+
+// TestGroupChunksByProximity_LargeGap tests chunks with very large gap.
+func TestGroupChunksByProximity_LargeGap(t *testing.T) {
+	chunks := []ChunkInfo{
+		{Index: 0, NewStart: 10, NewCount: 5},
+		{Index: 1, NewStart: 1000, NewCount: 5},
+	}
+
+	groups, _ := GroupChunksByProximity(chunks, 20)
+
+	if len(groups) != 2 {
+		t.Errorf("expected 2 groups for large gap, got %d", len(groups))
+	}
+}
+
+// TestGroupChunksByProximity_MixedDeletionAndAddition tests mixed chunk types.
+func TestGroupChunksByProximity_MixedDeletionAndAddition(t *testing.T) {
+	chunks := []ChunkInfo{
+		// Addition chunk at new line 10
+		{Index: 0, OldStart: 10, OldCount: 0, NewStart: 10, NewCount: 5},
+		// Deletion-only chunk at old line 20 (new_count = 0)
+		{Index: 1, OldStart: 20, OldCount: 3, NewStart: 15, NewCount: 0},
+		// Regular edit at new line 30
+		{Index: 2, OldStart: 28, OldCount: 2, NewStart: 30, NewCount: 3},
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	// line_ref values:
+	// chunk 0: new_count > 0, so line_ref = 10
+	// chunk 1: new_count = 0, so line_ref = 20 (old_start)
+	// chunk 2: new_count > 0, so line_ref = 30
+	//
+	// After sorting: 10, 20, 30
+	// 10-14, 20 <= 14+20=34 ✓ (same group)
+	// 30 <= 22+20=42 ✓ (same group, line_end of chunk 1 is 20+3-1=22)
+	// Wait: chunk 1 has old_count=3, new_count=0, so line_span = old_count = 3
+	// line_end = 20 + 3 - 1 = 22
+	// 30 <= 22 + 20 = 42 ✓
+
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group for mixed chunks within proximity, got %d", len(groups))
+	}
+
+	if groups[0].ChunkCount != 3 {
+		t.Errorf("expected 3 chunks in group, got %d", groups[0].ChunkCount)
+	}
+
+	// Verify all chunks assigned to group 0
+	for i, chunk := range indexed {
+		if chunk.GroupIndex != 0 {
+			t.Errorf("chunk %d: expected GroupIndex 0, got %d", i, chunk.GroupIndex)
+		}
+	}
+}
+
+// TestGroupChunksByProximity_PreservesOtherFields tests that other ChunkInfo fields are preserved.
+func TestGroupChunksByProximity_PreservesOtherFields(t *testing.T) {
+	chunks := []ChunkInfo{
+		{
+			Index:       0,
+			OldStart:    10,
+			OldCount:    3,
+			NewStart:    10,
+			NewCount:    5,
+			Offset:      0,
+			Length:      100,
+			Content:     "@@ -10,3 +10,5 @@\n context",
+			ContentHash: "abc123",
+		},
+	}
+
+	_, indexed := GroupChunksByProximity(chunks, 20)
+
+	if len(indexed) != 1 {
+		t.Fatalf("expected 1 indexed chunk, got %d", len(indexed))
+	}
+
+	// All original fields should be preserved
+	if indexed[0].Index != 0 {
+		t.Errorf("Index not preserved: expected 0, got %d", indexed[0].Index)
+	}
+	if indexed[0].OldStart != 10 {
+		t.Errorf("OldStart not preserved: expected 10, got %d", indexed[0].OldStart)
+	}
+	if indexed[0].OldCount != 3 {
+		t.Errorf("OldCount not preserved: expected 3, got %d", indexed[0].OldCount)
+	}
+	if indexed[0].NewStart != 10 {
+		t.Errorf("NewStart not preserved: expected 10, got %d", indexed[0].NewStart)
+	}
+	if indexed[0].NewCount != 5 {
+		t.Errorf("NewCount not preserved: expected 5, got %d", indexed[0].NewCount)
+	}
+	if indexed[0].Offset != 0 {
+		t.Errorf("Offset not preserved: expected 0, got %d", indexed[0].Offset)
+	}
+	if indexed[0].Length != 100 {
+		t.Errorf("Length not preserved: expected 100, got %d", indexed[0].Length)
+	}
+	if indexed[0].Content != "@@ -10,3 +10,5 @@\n context" {
+		t.Errorf("Content not preserved")
+	}
+	if indexed[0].ContentHash != "abc123" {
+		t.Errorf("ContentHash not preserved: expected abc123, got %s", indexed[0].ContentHash)
+	}
+	// GroupIndex should be set
+	if indexed[0].GroupIndex != 0 {
+		t.Errorf("GroupIndex should be 0, got %d", indexed[0].GroupIndex)
+	}
+}
+
+// TestGroupChunksByProximity_ZeroLineSpan tests chunks with 0 line span.
+func TestGroupChunksByProximity_ZeroLineSpan(t *testing.T) {
+	// Edge case: both counts are 0 (unusual but possible)
+	chunks := []ChunkInfo{
+		{Index: 0, OldStart: 10, OldCount: 0, NewStart: 10, NewCount: 0},
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group, got %d", len(groups))
+	}
+
+	// line_span = 0, so line_end = line_start - 1 = 9
+	// But we should handle this gracefully - line_end should be at least line_start
+	if groups[0].LineStart != 10 {
+		t.Errorf("expected LineStart 10, got %d", groups[0].LineStart)
+	}
+	// When span is 0, line_end should equal line_start (treat as 1 line minimum)
+	if groups[0].LineEnd < groups[0].LineStart {
+		t.Errorf("LineEnd (%d) should be >= LineStart (%d)", groups[0].LineEnd, groups[0].LineStart)
+	}
+
+	if len(indexed) != 1 || indexed[0].GroupIndex != 0 {
+		t.Error("chunk should be assigned to group 0")
+	}
+}
+
+// TestGroupChunksByProximity_ManyChunks tests performance with many chunks.
+func TestGroupChunksByProximity_ManyChunks(t *testing.T) {
+	// Create 100 chunks, each 10 lines apart
+	chunks := make([]ChunkInfo, 100)
+	for i := 0; i < 100; i++ {
+		chunks[i] = ChunkInfo{
+			Index:    i,
+			NewStart: i*10 + 1, // 1, 11, 21, 31, ...
+			NewCount: 3,
+		}
+	}
+
+	groups, indexed := GroupChunksByProximity(chunks, 20)
+
+	// With proximity 20, each chunk ends at i*10+3 and next starts at (i+1)*10+1
+	// Gap = (i+1)*10+1 - (i*10+3) = 10+1-3 = 8
+	// 8 <= 20, so all should be in one group
+	if len(groups) != 1 {
+		t.Errorf("expected 1 group for closely spaced chunks, got %d", len(groups))
+	}
+
+	if groups[0].ChunkCount != 100 {
+		t.Errorf("expected 100 chunks in group, got %d", groups[0].ChunkCount)
+	}
+
+	// Verify all have same group index
+	for i, chunk := range indexed {
+		if chunk.GroupIndex != 0 {
+			t.Errorf("chunk %d: expected GroupIndex 0, got %d", i, chunk.GroupIndex)
+		}
+	}
+}
+
+// =============================================================================
+// Phase 2.4: Wiring Integration Tests
+// =============================================================================
+// These tests verify that ChunkGroupingEnabled and ChunkGroupingProximity config
+// fields are correctly wired to CardStreamer's ProcessChunksRaw and StreamPendingCards.
+
+// TestCardStreamer_ProcessChunksRaw_GroupingEnabled_PopulatesGroups verifies that
+// when ChunkGroupingEnabled=true, broadcasts include chunk_groups and chunks have GroupIndex set.
+func TestCardStreamer_ProcessChunksRaw_GroupingEnabled_PopulatesGroups(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	broadcaster := newMockBroadcaster()
+
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:                  store,
+		ChunkStore:             store,
+		Broadcaster:            broadcaster,
+		SessionID:              "test-session",
+		ChunkGroupingEnabled:   true,
+		ChunkGroupingProximity: 20,
+	})
+
+	// Create 3 chunks within proximity (all should be in one group)
+	// Chunk 1: lines 10-14, Chunk 2: lines 25-27, Chunk 3: lines 35-38
+	// With proximity 20: 25 <= 14+20=34 ✓, 35 <= 27+20=47 ✓
+	chunks := []*diff.Chunk{
+		diff.NewChunk("file.go", 10, 5, 10, 5, "@@ -10,5 +10,5 @@\n context\n+added1"),
+		diff.NewChunk("file.go", 25, 3, 25, 3, "@@ -25,3 +25,3 @@\n more\n+added2"),
+		diff.NewChunk("file.go", 35, 4, 35, 4, "@@ -35,4 +35,4 @@\n final\n+added3"),
+	}
+
+	streamer.ProcessChunks(chunks)
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 broadcast card, got %d", len(cards))
+	}
+
+	card := cards[0]
+
+	// Verify chunk_groups is populated
+	if len(card.ChunkGroups) == 0 {
+		t.Fatal("expected chunk_groups to be populated when grouping enabled")
+	}
+
+	// All 3 chunks within proximity should be in 1 group
+	if len(card.ChunkGroups) != 1 {
+		t.Errorf("expected 1 group for chunks within proximity, got %d", len(card.ChunkGroups))
+	}
+
+	if card.ChunkGroups[0].ChunkCount != 3 {
+		t.Errorf("expected group to have 3 chunks, got %d", card.ChunkGroups[0].ChunkCount)
+	}
+
+	// Verify all chunks have GroupIndex set to 0
+	if len(card.Chunks) != 3 {
+		t.Fatalf("expected 3 chunks, got %d", len(card.Chunks))
+	}
+	for i, chunk := range card.Chunks {
+		if chunk.GroupIndex != 0 {
+			t.Errorf("chunk %d: expected GroupIndex 0, got %d", i, chunk.GroupIndex)
+		}
+	}
+}
+
+// TestCardStreamer_ProcessChunksRaw_GroupingDisabled_OmitsGroups verifies that
+// when ChunkGroupingEnabled=false, broadcasts have nil chunk_groups.
+// This is the adversarial case: chunk_groups missing or empty -> render flat list.
+func TestCardStreamer_ProcessChunksRaw_GroupingDisabled_OmitsGroups(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	broadcaster := newMockBroadcaster()
+
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:                  store,
+		ChunkStore:             store,
+		Broadcaster:            broadcaster,
+		SessionID:              "test-session",
+		ChunkGroupingEnabled:   false, // Disabled
+		ChunkGroupingProximity: 20,
+	})
+
+	// Create multiple chunks
+	chunks := []*diff.Chunk{
+		diff.NewChunk("file.go", 10, 3, 10, 4, "@@ -10,3 +10,4 @@\n context\n+added1"),
+		diff.NewChunk("file.go", 50, 2, 51, 3, "@@ -50,2 +51,3 @@\n more\n+added2"),
+	}
+
+	streamer.ProcessChunks(chunks)
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 broadcast card, got %d", len(cards))
+	}
+
+	card := cards[0]
+
+	// Verify chunk_groups is nil/empty when grouping is disabled
+	if len(card.ChunkGroups) != 0 {
+		t.Errorf("expected chunk_groups to be empty when grouping disabled, got %d groups", len(card.ChunkGroups))
+	}
+
+	// Chunks should still be present (without grouping metadata)
+	if len(card.Chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(card.Chunks))
+	}
+
+	// GroupIndex should be 0 (unset/default) for all chunks when grouping disabled
+	for i, chunk := range card.Chunks {
+		if chunk.GroupIndex != 0 {
+			t.Errorf("chunk %d: expected GroupIndex 0 (unset) when grouping disabled, got %d", i, chunk.GroupIndex)
+		}
+	}
+}
+
+// TestCardStreamer_ProcessChunksRaw_GroupingEnabled_UsesConfigProximity verifies that
+// a custom ChunkGroupingProximity value is respected.
+func TestCardStreamer_ProcessChunksRaw_GroupingEnabled_UsesConfigProximity(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	broadcaster := newMockBroadcaster()
+
+	// Use small proximity of 5 lines
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:                  store,
+		ChunkStore:             store,
+		Broadcaster:            broadcaster,
+		SessionID:              "test-session",
+		ChunkGroupingEnabled:   true,
+		ChunkGroupingProximity: 5, // Small proximity
+	})
+
+	// Chunk 1: ends at line 14 (10+5-1)
+	// Chunk 2: starts at line 25
+	// With proximity 5: 25 > 14+5=19, so should be in SEPARATE groups
+	// With default proximity 20: 25 <= 14+20=34, would be same group
+	chunks := []*diff.Chunk{
+		diff.NewChunk("file.go", 10, 5, 10, 5, "@@ -10,5 +10,5 @@\n context\n+added1"),
+		diff.NewChunk("file.go", 25, 3, 25, 3, "@@ -25,3 +25,3 @@\n more\n+added2"),
+	}
+
+	streamer.ProcessChunks(chunks)
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 broadcast card, got %d", len(cards))
+	}
+
+	card := cards[0]
+
+	// With small proximity, chunks should be in separate groups
+	if len(card.ChunkGroups) != 2 {
+		t.Errorf("expected 2 groups with proximity 5, got %d (custom proximity not respected)", len(card.ChunkGroups))
+	}
+
+	// Verify each group has 1 chunk
+	for i, group := range card.ChunkGroups {
+		if group.ChunkCount != 1 {
+			t.Errorf("group %d: expected 1 chunk, got %d", i, group.ChunkCount)
+		}
+	}
+
+	// Verify chunks have different GroupIndex values
+	if len(card.Chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(card.Chunks))
+	}
+	if card.Chunks[0].GroupIndex == card.Chunks[1].GroupIndex {
+		t.Error("chunks should have different GroupIndex values with small proximity")
+	}
+}
+
+// TestCardStreamer_ProcessChunksRaw_GroupingEnabled_DefaultProximity verifies that
+// when ChunkGroupingProximity=0 (unset), the default proximity of 20 is used.
+func TestCardStreamer_ProcessChunksRaw_GroupingEnabled_DefaultProximity(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	broadcaster := newMockBroadcaster()
+
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:                  store,
+		ChunkStore:             store,
+		Broadcaster:            broadcaster,
+		SessionID:              "test-session",
+		ChunkGroupingEnabled:   true,
+		ChunkGroupingProximity: 0, // Unset - should use default of 20
+	})
+
+	// Chunk 1: ends at line 14 (10+5-1)
+	// Chunk 2: starts at line 30
+	// With default proximity 20: 30 <= 14+20=34, should be in SAME group
+	chunks := []*diff.Chunk{
+		diff.NewChunk("file.go", 10, 5, 10, 5, "@@ -10,5 +10,5 @@\n context\n+added1"),
+		diff.NewChunk("file.go", 30, 3, 30, 3, "@@ -30,3 +30,3 @@\n more\n+added2"),
+	}
+
+	streamer.ProcessChunks(chunks)
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 broadcast card, got %d", len(cards))
+	}
+
+	card := cards[0]
+
+	// With default proximity 20, chunks should be in same group
+	if len(card.ChunkGroups) != 1 {
+		t.Errorf("expected 1 group with default proximity 20, got %d", len(card.ChunkGroups))
+	}
+
+	if card.ChunkGroups[0].ChunkCount != 2 {
+		t.Errorf("expected group to have 2 chunks, got %d", card.ChunkGroups[0].ChunkCount)
+	}
+}
+
+// TestCardStreamer_StreamPendingCards_GroupingEnabled verifies that grouping
+// is applied when streaming pending cards on reconnect.
+func TestCardStreamer_StreamPendingCards_GroupingEnabled(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Pre-populate store with a pending card that has multiple chunks
+	diffContent := "@@ -10,3 +10,4 @@\n context\n+added1\n@@ -30,2 +31,3 @@\n more\n+added2"
+	card := &storage.ReviewCard{
+		ID:        "card-for-reconnect",
+		SessionID: "test-session",
+		File:      "test.go",
+		Diff:      diffContent,
+		Status:    storage.CardPending,
+		CreatedAt: time.Now(),
+	}
+	if err := store.SaveCard(card); err != nil {
+		t.Fatalf("failed to save card: %v", err)
+	}
+
+	broadcaster := newMockBroadcaster()
+
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:                  store,
+		ChunkStore:             store,
+		Broadcaster:            broadcaster,
+		SessionID:              "test-session",
+		ChunkGroupingEnabled:   true,
+		ChunkGroupingProximity: 30, // Enough to group both chunks (lines 10 and 30)
+	})
+
+	// Stream pending cards (simulates reconnect)
+	if err := streamer.StreamPendingCards(); err != nil {
+		t.Fatalf("StreamPendingCards() error: %v", err)
+	}
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 broadcast card, got %d", len(cards))
+	}
+
+	streamedCard := cards[0]
+
+	// Verify chunk_groups is populated on reconnect
+	if len(streamedCard.ChunkGroups) == 0 {
+		t.Error("expected chunk_groups to be populated on reconnect when grouping enabled")
+	}
+
+	// Verify chunks have GroupIndex set
+	if len(streamedCard.Chunks) < 2 {
+		t.Fatalf("expected at least 2 chunks, got %d", len(streamedCard.Chunks))
+	}
+
+	// With proximity 30, both chunks (at lines 10 and 30) should be in same group
+	// 30 <= (10 + 4 - 1) + 30 = 13 + 30 = 43 ✓
+	if len(streamedCard.ChunkGroups) != 1 {
+		t.Errorf("expected 1 group on reconnect, got %d", len(streamedCard.ChunkGroups))
+	}
+}
+
+// TestCardStreamer_StreamPendingCards_GroupingDisabled verifies that grouping
+// is NOT applied when streaming pending cards if disabled.
+func TestCardStreamer_StreamPendingCards_GroupingDisabled(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Pre-populate store with a pending card
+	diffContent := "@@ -10,3 +10,4 @@\n context\n+added1\n@@ -50,2 +51,3 @@\n more\n+added2"
+	card := &storage.ReviewCard{
+		ID:        "card-for-reconnect-disabled",
+		SessionID: "test-session",
+		File:      "test.go",
+		Diff:      diffContent,
+		Status:    storage.CardPending,
+		CreatedAt: time.Now(),
+	}
+	if err := store.SaveCard(card); err != nil {
+		t.Fatalf("failed to save card: %v", err)
+	}
+
+	broadcaster := newMockBroadcaster()
+
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:                  store,
+		ChunkStore:             store,
+		Broadcaster:            broadcaster,
+		SessionID:              "test-session",
+		ChunkGroupingEnabled:   false, // Disabled
+		ChunkGroupingProximity: 20,
+	})
+
+	// Stream pending cards
+	if err := streamer.StreamPendingCards(); err != nil {
+		t.Fatalf("StreamPendingCards() error: %v", err)
+	}
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 broadcast card, got %d", len(cards))
+	}
+
+	streamedCard := cards[0]
+
+	// Verify chunk_groups is nil/empty when grouping disabled
+	if len(streamedCard.ChunkGroups) != 0 {
+		t.Errorf("expected chunk_groups to be empty on reconnect when grouping disabled, got %d", len(streamedCard.ChunkGroups))
+	}
+
+	// Chunks should still be present
+	if len(streamedCard.Chunks) < 2 {
+		t.Fatalf("expected at least 2 chunks, got %d", len(streamedCard.Chunks))
 	}
 }

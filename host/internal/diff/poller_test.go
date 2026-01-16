@@ -602,6 +602,35 @@ func TestPoller_IncludeStaged(t *testing.T) {
 	}
 }
 
+func TestPoller_ExcludePaths_SkipsUntracked(t *testing.T) {
+	dir := setupTestRepo(t)
+	defer os.RemoveAll(dir)
+
+	untrackedFile := filepath.Join(dir, "ignored.db")
+	if err := os.WriteFile(untrackedFile, []byte("ignored content\n"), 0644); err != nil {
+		t.Fatalf("failed to write untracked file: %v", err)
+	}
+
+	p := NewPoller(PollerConfig{
+		RepoPath:         dir,
+		PollInterval:     50 * time.Millisecond,
+		IncludeUntracked: true,
+		ExcludePaths:     []string{"ignored.db"},
+	})
+
+	chunks, rawDiff, err := p.PollOnceRaw()
+	if err != nil {
+		t.Fatalf("PollOnceRaw failed: %v", err)
+	}
+
+	if strings.Contains(rawDiff, "ignored.db") {
+		t.Errorf("expected excluded file to be omitted, got raw diff: %s", rawDiff)
+	}
+	if len(chunks) != 0 {
+		t.Errorf("expected 0 chunks when only excluded files exist, got %d", len(chunks))
+	}
+}
+
 // TestPoller_OnChunksRaw_Precedence tests that OnChunksRaw is called instead of
 // OnChunks when both are configured.
 func TestPoller_OnChunksRaw_Precedence(t *testing.T) {
@@ -735,6 +764,51 @@ func TestPollOnceRaw_ReturnsRawDiff(t *testing.T) {
 
 	if !strings.Contains(rawDiff, "diff --git") {
 		t.Error("expected raw diff to contain git header")
+	}
+}
+
+// TestPoller_SnapshotRaw_DoesNotUpdateHash ensures SnapshotRaw does not
+// suppress the next polling tick when changes already exist.
+func TestPoller_SnapshotRaw_DoesNotUpdateHash(t *testing.T) {
+	dir := setupTestRepo(t)
+	defer os.RemoveAll(dir)
+
+	// Create an untracked file to generate a diff
+	untrackedFile := filepath.Join(dir, "snapshot.txt")
+	if err := os.WriteFile(untrackedFile, []byte("snapshot content\n"), 0644); err != nil {
+		t.Fatalf("failed to write untracked file: %v", err)
+	}
+
+	var once sync.Once
+	handlerCalled := make(chan struct{})
+
+	p := NewPoller(PollerConfig{
+		RepoPath:         dir,
+		PollInterval:     50 * time.Millisecond,
+		IncludeUntracked: true,
+		OnChunks: func(chunks []*Chunk) {
+			if len(chunks) == 0 {
+				return
+			}
+			once.Do(func() {
+				close(handlerCalled)
+			})
+		},
+	})
+
+	// Snapshot should not update the poller's hash.
+	if _, _, err := p.SnapshotRaw(); err != nil {
+		t.Fatalf("SnapshotRaw failed: %v", err)
+	}
+
+	p.Start()
+	defer p.Stop()
+
+	select {
+	case <-handlerCalled:
+		// Good - initial poll still emitted chunks.
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected poller to emit chunks after SnapshotRaw")
 	}
 }
 

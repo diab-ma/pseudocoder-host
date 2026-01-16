@@ -93,7 +93,7 @@ type ChunkUndoHandler func(cardID string, chunkIndex int, confirmed bool) (*Undo
 // This is used to re-emit the card to connected clients.
 type UndoResult struct {
 	CardID       string
-	ChunkIndex   int    // -1 for file-level undo
+	ChunkIndex   int // -1 for file-level undo
 	File         string
 	Diff         string
 	OriginalDiff string // Full diff for card re-emission
@@ -614,10 +614,11 @@ func (s *Server) BroadcastTerminalOutputWithID(sessionID, chunk string) {
 // This is called when the diff poller detects new or changed chunks.
 // The card is sent as a diff.card message per the WebSocket protocol.
 // The chunks parameter provides per-chunk metadata for granular decisions.
+// The chunkGroups parameter provides proximity grouping metadata (nil when disabled).
 // The isBinary flag indicates per-chunk actions should be disabled.
 // The isDeleted flag indicates this is a file deletion (use file-level actions).
 // The stats parameter provides size metrics for large diff warnings.
-func (s *Server) BroadcastDiffCard(cardID, file, diff string, chunks []stream.ChunkInfo, isBinary, isDeleted bool, stats *stream.DiffStats, createdAt int64) {
+func (s *Server) BroadcastDiffCard(cardID, file, diff string, chunks []stream.ChunkInfo, chunkGroups []stream.ChunkGroupInfo, isBinary, isDeleted bool, stats *stream.DiffStats, createdAt int64) {
 	// Convert stream.ChunkInfo to server.ChunkInfo
 	serverChunks := make([]ChunkInfo, len(chunks))
 	for i, h := range chunks {
@@ -631,6 +632,21 @@ func (s *Server) BroadcastDiffCard(cardID, file, diff string, chunks []stream.Ch
 			Length:      h.Length,
 			Content:     h.Content,
 			ContentHash: h.ContentHash,
+			GroupIndex:  h.GroupIndex,
+		}
+	}
+
+	// Convert stream.ChunkGroupInfo to server.ChunkGroupInfo
+	var serverChunkGroups []ChunkGroupInfo
+	if chunkGroups != nil {
+		serverChunkGroups = make([]ChunkGroupInfo, len(chunkGroups))
+		for i, g := range chunkGroups {
+			serverChunkGroups[i] = ChunkGroupInfo{
+				GroupIndex: g.GroupIndex,
+				LineStart:  g.LineStart,
+				LineEnd:    g.LineEnd,
+				ChunkCount: g.ChunkCount,
+			}
 		}
 	}
 
@@ -645,7 +661,7 @@ func (s *Server) BroadcastDiffCard(cardID, file, diff string, chunks []stream.Ch
 		}
 	}
 
-	s.Broadcast(NewDiffCardMessage(cardID, file, diff, serverChunks, isBinary, isDeleted, serverStats, createdAt))
+	s.Broadcast(NewDiffCardMessage(cardID, file, diff, serverChunks, serverChunkGroups, isBinary, isDeleted, serverStats, createdAt))
 }
 
 // BroadcastCardRemoved notifies clients that a card was removed.
@@ -1554,6 +1570,7 @@ func (c *Client) handleReviewUndo(data []byte) {
 		result.File,
 		result.OriginalDiff,
 		serverChunks,
+		nil, // chunkGroups: not recomputed during undo
 		isBinary,
 		isDeleted,
 		serverStats,
@@ -2241,17 +2258,17 @@ type ApprovalTokenValidator interface {
 // Phase 6.1b: HTTP endpoint for CLI command approval broker.
 //
 // Security notes:
-// - Loopback only: Requests from non-loopback addresses are rejected with 403.
-// - Token auth: Bearer token is validated before processing the request.
-// - Context cancellation: If the HTTP request context is cancelled (client
-//   disconnect), the approval queue handles cleanup and returns context.Canceled.
+//   - Loopback only: Requests from non-loopback addresses are rejected with 403.
+//   - Token auth: Bearer token is validated before processing the request.
+//   - Context cancellation: If the HTTP request context is cancelled (client
+//     disconnect), the approval queue handles cleanup and returns context.Canceled.
 //
 // Accepted risks:
-// - No request body size limit: Large request bodies are accepted. This is
-//   acceptable as the endpoint is localhost-only and authenticated.
-// - Response always 200: Approval decisions (denied/timeout) return 200 with
-//   approved=false. This simplifies client handling and matches REST conventions
-//   where the request itself succeeded even if the business logic result is negative.
+//   - No request body size limit: Large request bodies are accepted. This is
+//     acceptable as the endpoint is localhost-only and authenticated.
+//   - Response always 200: Approval decisions (denied/timeout) return 200 with
+//     approved=false. This simplifies client handling and matches REST conventions
+//     where the request itself succeeded even if the business logic result is negative.
 type ApproveHandler struct {
 	server         *Server
 	tokenValidator ApprovalTokenValidator
