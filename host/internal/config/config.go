@@ -98,6 +98,16 @@ type Config struct {
 	// QR displays the pairing code as a QR code (requires Pair to be true).
 	// Default: false
 	QR bool `toml:"qr"`
+
+	// ChunkGroupingEnabled enables proximity-based chunk grouping in diff cards.
+	// When true, chunks within ChunkGroupingProximity lines are grouped together.
+	// Default: true (but Go zero value is false; caller must apply defaults)
+	ChunkGroupingEnabled bool `toml:"chunk_grouping_enabled"`
+
+	// ChunkGroupingProximity is the maximum line distance for grouping chunks.
+	// Chunks within this many lines of each other are grouped together.
+	// Default: 20, must be >= 1 when set. Zero means "use default".
+	ChunkGroupingProximity int `toml:"chunk_grouping_proximity"`
 }
 
 // DefaultConfigPath returns the default config file location: ~/.pseudocoder/config.toml.
@@ -190,4 +200,23 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// Validate checks config values for semantic correctness.
+// Returns an error if any value is invalid.
+//
+// Validation rules:
+//   - ChunkGroupingProximity must be >= 1 when set (non-zero).
+//     Zero indicates "use default" and is valid.
+//
+// This method does not apply defaults; the caller is responsible for that.
+// This separation allows Load() to be a pure parser and Validate() to be
+// a semantic checker, matching the existing pattern in this codebase.
+func (c *Config) Validate() error {
+	// ChunkGroupingProximity: 0 means "use default", any positive value is valid,
+	// but negative values are always invalid.
+	if c.ChunkGroupingProximity < 0 {
+		return fmt.Errorf("chunk_grouping_proximity must be >= 1, got %d", c.ChunkGroupingProximity)
+	}
+	return nil
 }

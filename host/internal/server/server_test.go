@@ -287,7 +287,7 @@ func TestNewDiffCardMessage(t *testing.T) {
 		{Index: 0, OldStart: 1, OldCount: 3, NewStart: 1, NewCount: 4, Offset: 0, Length: 11},
 	}
 	stats := &DiffStats{ByteSize: 11, LineCount: 1, AddedLines: 1, DeletedLines: 0}
-	msg := NewDiffCardMessage("card-123", "src/main.go", "+added line", chunks, false, false, stats, 1703500000000)
+	msg := NewDiffCardMessage("card-123", "src/main.go", "+added line", chunks, nil, false, false, stats, 1703500000000)
 
 	if msg.Type != MessageTypeDiffCard {
 		t.Errorf("expected type %s, got %s", MessageTypeDiffCard, msg.Type)
@@ -421,7 +421,7 @@ func TestBroadcastDiffCard(t *testing.T) {
 		{Index: 0, OldStart: 1, OldCount: 3, NewStart: 1, NewCount: 4, Offset: 0, Length: 9},
 	}
 	stats := &stream.DiffStats{ByteSize: 9, LineCount: 1, AddedLines: 1, DeletedLines: 0}
-	s.BroadcastDiffCard("card-abc", "file.go", "+new line", chunks, false, false, stats, 1703500000000)
+	s.BroadcastDiffCard("card-abc", "file.go", "+new line", chunks, nil, false, false, stats, 1703500000000)
 
 	msg := readMessage(t, conn)
 	if msg.Type != MessageTypeDiffCard {
@@ -1010,8 +1010,8 @@ func TestReconnectHandlerWithPendingCards(t *testing.T) {
 
 	s.SetReconnectHandler(func(sendToClient func(Message)) {
 		// Simulate sending pending cards on reconnect
-		sendToClient(NewDiffCardMessage("card-1", "file1.go", "+line1", nil, false, false, nil, 1000))
-		sendToClient(NewDiffCardMessage("card-2", "file2.go", "+line2", nil, false, false, nil, 2000))
+		sendToClient(NewDiffCardMessage("card-1", "file1.go", "+line1", nil, nil, false, false, nil, 1000))
+		sendToClient(NewDiffCardMessage("card-2", "file2.go", "+line2", nil, nil, false, false, nil, 2000))
 	})
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
@@ -1418,7 +1418,7 @@ func TestChunkInfoSerialization(t *testing.T) {
 		{Index: 1, OldStart: 10, OldCount: 2, NewStart: 11, NewCount: 5, Offset: 50, Length: 75},
 	}
 
-	msg := NewDiffCardMessage("card-test", "file.go", "@@ -1,3 +1,4 @@\n+line", chunks, false, false, nil, 1703500000000)
+	msg := NewDiffCardMessage("card-test", "file.go", "@@ -1,3 +1,4 @@\n+line", chunks, nil, false, false, nil, 1703500000000)
 
 	payload, ok := msg.Payload.(DiffCardPayload)
 	if !ok {
@@ -1450,7 +1450,7 @@ func TestHandleChunkDecisionValidPayload(t *testing.T) {
 	var mu sync.Mutex
 	var handlerCalls []struct {
 		CardID      string
-		ChunkIndex   int
+		ChunkIndex  int
 		Action      string
 		ContentHash string
 	}
@@ -1458,7 +1458,7 @@ func TestHandleChunkDecisionValidPayload(t *testing.T) {
 		mu.Lock()
 		handlerCalls = append(handlerCalls, struct {
 			CardID      string
-			ChunkIndex   int
+			ChunkIndex  int
 			Action      string
 			ContentHash string
 		}{cardID, chunkIndex, action, contentHash})
@@ -1479,9 +1479,9 @@ func TestHandleChunkDecisionValidPayload(t *testing.T) {
 	decision := map[string]interface{}{
 		"type": "chunk.decision",
 		"payload": map[string]interface{}{
-			"card_id":    "card-abc",
+			"card_id":     "card-abc",
 			"chunk_index": 1,
-			"action":     "accept",
+			"action":      "accept",
 		},
 	}
 	if err := conn.WriteJSON(decision); err != nil {
@@ -1496,7 +1496,7 @@ func TestHandleChunkDecisionValidPayload(t *testing.T) {
 	callCount := len(handlerCalls)
 	var firstCall struct {
 		CardID      string
-		ChunkIndex   int
+		ChunkIndex  int
 		Action      string
 		ContentHash string
 	}
@@ -1558,9 +1558,9 @@ func TestHandleChunkDecisionInvalidAction(t *testing.T) {
 	decision := map[string]interface{}{
 		"type": "chunk.decision",
 		"payload": map[string]interface{}{
-			"card_id":    "card-abc",
+			"card_id":     "card-abc",
 			"chunk_index": 0,
-			"action":     "maybe",
+			"action":      "maybe",
 		},
 	}
 	if err := conn.WriteJSON(decision); err != nil {
@@ -1604,9 +1604,9 @@ func TestHandleChunkDecisionNegativeIndex(t *testing.T) {
 	decision := map[string]interface{}{
 		"type": "chunk.decision",
 		"payload": map[string]interface{}{
-			"card_id":    "card-abc",
+			"card_id":     "card-abc",
 			"chunk_index": -1,
-			"action":     "accept",
+			"action":      "accept",
 		},
 	}
 	if err := conn.WriteJSON(decision); err != nil {
@@ -1649,9 +1649,9 @@ func TestHandleChunkDecisionNoHandler(t *testing.T) {
 	decision := map[string]interface{}{
 		"type": "chunk.decision",
 		"payload": map[string]interface{}{
-			"card_id":    "card-abc",
+			"card_id":     "card-abc",
 			"chunk_index": 0,
-			"action":     "accept",
+			"action":      "accept",
 		},
 	}
 	if err := conn.WriteJSON(decision); err != nil {
@@ -1993,11 +1993,11 @@ func TestRevokeEndpointInvalidPath(t *testing.T) {
 	handler := NewRevokeDeviceHandler(s, store)
 
 	testCases := []string{
-		"/devices/",              // Missing device ID and revoke
-		"/devices/id",            // Missing /revoke
-		"/devices/id/other",      // Wrong action
-		"/other/id/revoke",       // Wrong prefix
-		"/devices//revoke",       // Empty device ID
+		"/devices/",         // Missing device ID and revoke
+		"/devices/id",       // Missing /revoke
+		"/devices/id/other", // Wrong action
+		"/other/id/revoke",  // Wrong prefix
+		"/devices//revoke",  // Empty device ID
 	}
 
 	for _, path := range testCases {
@@ -3393,7 +3393,7 @@ func TestServer_BroadcastAfterStop(t *testing.T) {
 	// This tests the s.stopped check in Broadcast()
 	s.Broadcast(NewHeartbeatMessage())
 	s.BroadcastTerminalOutput("test output")
-	s.BroadcastDiffCard("card-1", "file.go", "diff content", nil, false, false, nil, time.Now().Unix())
+	s.BroadcastDiffCard("card-1", "file.go", "diff content", nil, nil, false, false, nil, time.Now().Unix())
 
 	// If we get here without panic, the test passes
 }
@@ -3568,9 +3568,9 @@ func TestExtractBearerToken_QueryParam(t *testing.T) {
 // in query parameters are properly decoded.
 func TestExtractBearerToken_QueryParamURLEncoding(t *testing.T) {
 	testCases := []struct {
-		name     string
-		token    string // Decoded value we expect
-		encoded  string // URL-encoded version in query
+		name    string
+		token   string // Decoded value we expect
+		encoded string // URL-encoded version in query
 	}{
 		{"plain token", "abc123xyz", "abc123xyz"},
 		{"with plus signs", "abc+def", "abc%2Bdef"},
@@ -3582,7 +3582,7 @@ func TestExtractBearerToken_QueryParamURLEncoding(t *testing.T) {
 		{"with ampersand", "abc&def", "abc%26def"},
 		{"with percent sign", "abc%def", "abc%25def"},
 		{"mixed special chars", "a+b=c/d?e", "a%2Bb%3Dc%2Fd%3Fe"},
-		{"unicode emoji", "\U0001F4F1", "%F0%9F%93%B1"}, // 📱
+		{"unicode emoji", "\U0001F4F1", "%F0%9F%93%B1"},           // 📱
 		{"unicode chinese", "\u4F60\u597D", "%E4%BD%A0%E5%A5%BD"}, // 你好
 	}
 

@@ -273,6 +273,11 @@ type ChunkInfo struct {
 	// Used to detect stale decisions: client sends this back in chunk.decision,
 	// server validates it matches current content before applying.
 	ContentHash string `json:"content_hash,omitempty"`
+
+	// GroupIndex is the group number for proximity grouping (0-based).
+	// Chunks within configurable proximity (default 20 lines) share the same group.
+	// Always included; clients check chunk_groups at card level to determine if grouping is active.
+	GroupIndex int `json:"group_index"`
 }
 
 // DiffStats provides size metrics for a diff to help mobile clients
@@ -289,6 +294,23 @@ type DiffStats struct {
 
 	// DeletedLines is the count of lines starting with '-'.
 	DeletedLines int `json:"deleted_lines"`
+}
+
+// ChunkGroupInfo provides metadata about a group of proximity-related chunks.
+// Groups collect chunks within a configurable number of lines (default 20),
+// allowing mobile clients to display and act on related chunks together.
+type ChunkGroupInfo struct {
+	// GroupIndex is the 0-based position of this group within the card.
+	GroupIndex int `json:"group_index"`
+
+	// LineStart is the starting line number of the group (minimum of member chunks).
+	LineStart int `json:"line_start"`
+
+	// LineEnd is the ending line number of the group (maximum of member chunks).
+	LineEnd int `json:"line_end"`
+
+	// ChunkCount is the number of chunks in this group.
+	ChunkCount int `json:"chunk_count"`
 }
 
 // DiffCardPayload carries a review card for file changes.
@@ -308,6 +330,12 @@ type DiffCardPayload struct {
 	// Clients can use this to display and act on individual chunks.
 	// May be nil for backward compatibility with older hosts.
 	Chunks []ChunkInfo `json:"chunks,omitempty"`
+
+	// ChunkGroups provides metadata about proximity-based chunk groups.
+	// When present, chunks are grouped by line proximity (configurable, default 20 lines).
+	// Each chunk's GroupIndex references an entry in this array.
+	// Missing or empty means grouping is disabled; render chunks as flat list.
+	ChunkGroups []ChunkGroupInfo `json:"chunk_groups,omitempty"`
 
 	// IsBinary indicates the file is a binary file.
 	// Binary files cannot use per-chunk actions - only file-level accept/reject.
@@ -773,19 +801,21 @@ func NewHeartbeatMessage() Message {
 
 // NewDiffCardMessage creates a message for a review card.
 // The chunks parameter is optional; pass nil for backward compatibility.
+// The chunkGroups parameter provides proximity grouping metadata (nil when disabled).
 // The isBinary, isDeleted, and stats parameters are optional for backward compatibility.
-func NewDiffCardMessage(cardID, file, diff string, chunks []ChunkInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) Message {
+func NewDiffCardMessage(cardID, file, diff string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) Message {
 	return Message{
 		Type: MessageTypeDiffCard,
 		Payload: DiffCardPayload{
-			CardID:    cardID,
-			File:      file,
-			Diff:      diff,
-			Chunks:     chunks,
-			IsBinary:  isBinary,
-			IsDeleted: isDeleted,
-			Stats:     stats,
-			CreatedAt: createdAt,
+			CardID:      cardID,
+			File:        file,
+			Diff:        diff,
+			Chunks:      chunks,
+			ChunkGroups: chunkGroups,
+			IsBinary:    isBinary,
+			IsDeleted:   isDeleted,
+			Stats:       stats,
+			CreatedAt:   createdAt,
 		},
 	}
 }
@@ -824,12 +854,12 @@ func NewChunkDecisionResultMessage(cardID string, chunkIndex int, action string,
 	return Message{
 		Type: MessageTypeChunkDecisionResult,
 		Payload: ChunkDecisionResultPayload{
-			CardID:    cardID,
+			CardID:     cardID,
 			ChunkIndex: chunkIndex,
-			Action:    action,
-			Success:   success,
-			ErrorCode: errCode,
-			Error:     errMsg,
+			Action:     action,
+			Success:    success,
+			ErrorCode:  errCode,
+			Error:      errMsg,
 		},
 	}
 }

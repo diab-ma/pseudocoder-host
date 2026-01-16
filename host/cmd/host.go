@@ -717,13 +717,33 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	// We'll set up the poller's OnChunks callback to use the streamer.
 	var cardStreamer *stream.CardStreamer
 
+	// Avoid surfacing host state files as review cards when stored inside the repo.
+	excludePaths := []string{}
+	if tokenStorePath != "" && tokenStorePath != ":memory:" {
+		repoAbs, err := filepath.Abs(repoPath)
+		if err == nil {
+			tokenAbs, err := filepath.Abs(tokenStorePath)
+			if err == nil {
+				relPath, err := filepath.Rel(repoAbs, tokenAbs)
+				if err == nil {
+					relPath = filepath.ToSlash(relPath)
+					if relPath != "." && relPath != ".." && !strings.HasPrefix(relPath, "../") {
+						excludePaths = append(excludePaths, relPath)
+					}
+				}
+			}
+		}
+	}
+
 	// Create the diff poller with an OnChunksRaw callback that forwards to the streamer.
 	// We use OnChunksRaw instead of OnChunks to get the raw diff output, which is needed
 	// for binary file detection and diff statistics.
 	diffPoller := diff.NewPoller(diff.PollerConfig{
-		RepoPath:      repoPath,
-		PollInterval:  time.Duration(diffPollMs) * time.Millisecond,
-		IncludeStaged: false, // Only track unstaged changes
+		RepoPath:         repoPath,
+		PollInterval:     time.Duration(diffPollMs) * time.Millisecond,
+		IncludeStaged:    false, // Only track unstaged changes
+		IncludeUntracked: true,  // Track new files that haven't been added yet
+		ExcludePaths:     excludePaths,
 		OnChunksRaw: func(chunks []*diff.Chunk, rawDiff string) {
 			// Forward chunks and raw diff to the card streamer.
 			// cardStreamer is set before the poller starts, so this is safe.
@@ -738,11 +758,13 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 
 	// Now create the card streamer with all dependencies.
 	cardStreamer = stream.NewCardStreamer(stream.CardStreamerConfig{
-		Poller:      diffPoller,
-		Store:       store,
-		ChunkStore:   store, // SQLiteStore implements both CardStore and ChunkStore
-		Broadcaster: wsServer,
-		SessionID:   wsServer.SessionID(),
+		Poller:                 diffPoller,
+		Store:                  store,
+		ChunkStore:             store, // SQLiteStore implements both CardStore and ChunkStore
+		Broadcaster:            wsServer,
+		SessionID:              wsServer.SessionID(),
+		ChunkGroupingEnabled:   fileCfg.ChunkGroupingEnabled,
+		ChunkGroupingProximity: fileCfg.ChunkGroupingProximity,
 		OnError: func(err error) {
 			fmt.Fprintf(stderr, "Card streaming error: %v\n", err)
 		},
@@ -865,11 +887,33 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 				isBinary := card.Diff == diff.BinaryDiffPlaceholder
 
 				var serverChunks []server.ChunkInfo
+				var serverChunkGroups []server.ChunkGroupInfo
 				var stats *server.DiffStats
 
 				if !isBinary {
 					// Parse chunk boundaries from stored diff content
 					chunks := stream.ParseChunkInfoFromDiff(card.Diff)
+
+					// Apply proximity-based grouping if enabled
+					if fileCfg.ChunkGroupingEnabled && len(chunks) > 0 {
+						proximity := fileCfg.ChunkGroupingProximity
+						if proximity <= 0 {
+							proximity = 20 // Default proximity
+						}
+						groups, groupedChunks := stream.GroupChunksByProximity(chunks, proximity)
+						chunks = groupedChunks
+
+						// Convert stream.ChunkGroupInfo to server.ChunkGroupInfo
+						serverChunkGroups = make([]server.ChunkGroupInfo, len(groups))
+						for i, g := range groups {
+							serverChunkGroups[i] = server.ChunkGroupInfo{
+								GroupIndex: g.GroupIndex,
+								LineStart:  g.LineStart,
+								LineEnd:    g.LineEnd,
+								ChunkCount: g.ChunkCount,
+							}
+						}
+					}
 
 					// Reconcile chunks in storage to ensure per-chunk decisions work.
 					// This handles missing or stale chunk rows from older sessions.
@@ -888,6 +932,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 							Length:      h.Length,
 							Content:     h.Content,
 							ContentHash: h.ContentHash,
+							GroupIndex:  h.GroupIndex,
 						}
 					}
 
@@ -909,6 +954,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 					card.File,
 					card.Diff,
 					serverChunks,
+					serverChunkGroups,
 					isBinary,
 					isDeleted,
 					stats,

@@ -4,7 +4,12 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,6 +25,14 @@ type PollerConfig struct {
 	// IncludeStaged includes staged changes (git diff --cached) in addition
 	// to unstaged changes. When false, only unstaged changes are detected.
 	IncludeStaged bool
+
+	// IncludeUntracked includes untracked files (git ls-files --others --exclude-standard).
+	// These are presented as new files in the diff.
+	IncludeUntracked bool
+
+	// ExcludePaths contains repo-relative paths to skip when generating
+	// diffs (useful for internal files like host storage).
+	ExcludePaths []string
 
 	// OnChunks is called whenever new or changed chunks are detected.
 	// It receives the full list of current chunks.
@@ -209,7 +222,222 @@ func (p *Poller) runGitDiff() (string, error) {
 		}
 	}
 
+	// Optionally include untracked files
+	if p.config.IncludeUntracked {
+		untrackedDiff, err := p.getUntrackedDiff()
+		if err != nil {
+			// If we fail to get untracked files, we shouldn't fail the whole poll,
+			// as the main diff might still be valid. But we should report it.
+			// For now, return error to be consistent with other parts.
+			return "", err
+		}
+		if untrackedDiff != "" {
+			if result != "" {
+				result += "\n"
+			}
+			result += untrackedDiff
+		}
+	}
+
 	return result, nil
+}
+
+// getUntrackedDiff returns synthetic diffs for untracked files.
+func (p *Poller) getUntrackedDiff() (string, error) {
+	cmd := exec.Command("git", "ls-files", "--others", "--exclude-standard")
+	cmd.Dir = p.config.RepoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	files := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(files) == 0 || (len(files) == 1 && files[0] == "") {
+		return "", nil
+	}
+
+	var sb strings.Builder
+	for _, file := range files {
+		if file == "" {
+			continue
+		}
+		if p.shouldExclude(file) {
+			continue
+		}
+		// Generate synthetic diff
+		diff, err := p.generateSyntheticDiff(file)
+		if err != nil {
+			// If we can't read a file (e.g. permission denied, or deleted during race), just skip it
+			continue
+		}
+		sb.WriteString(diff)
+	}
+	return sb.String(), nil
+}
+
+// shouldExclude returns true if the path should be skipped.
+// Paths are compared using repo-relative, slash-separated values.
+func (p *Poller) shouldExclude(relPath string) bool {
+	if relPath == "" {
+		return false
+	}
+
+	normalizedPath := filepath.ToSlash(filepath.Clean(relPath))
+
+	for _, exclude := range p.config.ExcludePaths {
+		if exclude == "" {
+			continue
+		}
+		normalizedExclude := filepath.ToSlash(filepath.Clean(exclude))
+		normalizedExclude = strings.TrimPrefix(normalizedExclude, "./")
+		if normalizedExclude == "." {
+			continue
+		}
+		if normalizedPath == normalizedExclude || strings.HasPrefix(normalizedPath, normalizedExclude+"/") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// generateSyntheticDiff generates a git-compatible diff for a new untracked file.
+func (p *Poller) generateSyntheticDiff(relPath string) (string, error) {
+	fullPath := filepath.Join(p.config.RepoPath, relPath)
+
+	// Use Lstat to get file info without following symlinks.
+	// This is critical for proper symlink handling - os.Stat would follow the link
+	// and return the target's info (or error if target is missing).
+	info, err := os.Lstat(fullPath)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return "", nil
+	}
+
+	// Check if this is a symbolic link - git represents these specially
+	// with mode 120000 and the link target path as content.
+	if info.Mode()&os.ModeSymlink != 0 {
+		return p.generateSymlinkDiff(relPath, fullPath)
+	}
+
+	// Read file content
+	f, err := os.Open(fullPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	// Read first 8KB to check for binary
+	buf := make([]byte, 8000)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	head := buf[:n]
+
+	isBinary := bytes.IndexByte(head, 0) != -1
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("diff --git a/%s b/%s\n", relPath, relPath))
+	sb.WriteString(fmt.Sprintf("new file mode %o\n", info.Mode().Perm()))
+
+	if isBinary {
+		// Read rest of file to compute content hash for change detection.
+		// Without this hash, CardStreamer cannot detect when binary file contents change
+		// because ExtractFileDiffSection would return identical output.
+		rest, err := io.ReadAll(f)
+		if err != nil {
+			return "", err
+		}
+		content := append(head, rest...)
+
+		// Compute content hash (7 chars like git's abbreviated blob hashes).
+		// Format: index 0000000..<hash> where 0000000 represents /dev/null (new file).
+		hash := sha256.Sum256(content)
+		contentHash := hex.EncodeToString(hash[:])[:7]
+
+		sb.WriteString(fmt.Sprintf("index 0000000..%s\n", contentHash))
+		sb.WriteString(fmt.Sprintf("Binary files /dev/null and b/%s differ\n", relPath))
+	} else {
+		// Read the rest of the file if needed
+		var content []byte
+		if err == io.EOF {
+			content = head
+		} else {
+			rest, err := io.ReadAll(f)
+			if err != nil {
+				return "", err
+			}
+			content = append(head, rest...)
+		}
+
+		// Check if file is empty - still emit the diff header so the file is visible
+		if len(content) == 0 {
+			// Empty files have no content lines, but we emit ---/+++ and an empty hunk
+			// so the file appears in the review flow. The @@ -0,0 +0,0 @@ hunk indicates
+			// zero lines changed (consistent with git's format for empty additions).
+			sb.WriteString("--- /dev/null\n")
+			sb.WriteString(fmt.Sprintf("+++ b/%s\n", relPath))
+			sb.WriteString("@@ -0,0 +0,0 @@\n")
+			return sb.String(), nil
+		}
+
+		// Count lines
+		lc := bytes.Count(content, []byte{'\n'})
+		if len(content) > 0 && content[len(content)-1] != '\n' {
+			lc++
+		}
+
+		sb.WriteString("--- /dev/null\n")
+		sb.WriteString(fmt.Sprintf("+++ b/%s\n", relPath))
+		sb.WriteString(fmt.Sprintf("@@ -0,0 +1,%d @@\n", lc))
+
+		lines := strings.Split(string(content), "\n")
+		for i, line := range lines {
+			if i == len(lines)-1 && line == "" {
+				break
+			}
+			sb.WriteString("+" + line + "\n")
+		}
+
+		if len(content) > 0 && content[len(content)-1] != '\n' {
+			sb.WriteString("\\ No newline at end of file\n")
+		}
+	}
+
+	return sb.String(), nil
+}
+
+// generateSymlinkDiff generates a git-compatible diff for a symbolic link.
+// Git represents symlinks with mode 120000 and the link target path as content
+// (without a trailing newline). This matches git's behavior exactly.
+func (p *Poller) generateSymlinkDiff(relPath, fullPath string) (string, error) {
+	// Read the symlink target - this is what git uses as the "content"
+	target, err := os.Readlink(fullPath)
+	if err != nil {
+		return "", err
+	}
+
+	// Compute hash for change detection (same logic as binary files)
+	hash := sha256.Sum256([]byte(target))
+	contentHash := hex.EncodeToString(hash[:])[:7]
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("diff --git a/%s b/%s\n", relPath, relPath))
+	// 120000 is git's mode for symbolic links
+	sb.WriteString("new file mode 120000\n")
+	sb.WriteString(fmt.Sprintf("index 0000000..%s\n", contentHash))
+	sb.WriteString("--- /dev/null\n")
+	sb.WriteString(fmt.Sprintf("+++ b/%s\n", relPath))
+	sb.WriteString("@@ -0,0 +1 @@\n")
+	sb.WriteString("+" + target + "\n")
+	// Git always emits "No newline at end of file" for symlinks since
+	// the target path is stored without a trailing newline
+	sb.WriteString("\\ No newline at end of file\n")
+
+	return sb.String(), nil
 }
 
 // hashDiff computes a hash of the diff output for change detection.
@@ -251,6 +479,17 @@ func (p *Poller) PollOnceRaw() ([]*Chunk, string, error) {
 	p.mu.Lock()
 	p.lastHash = currentHash
 	p.mu.Unlock()
+
+	return p.parser.Parse(diffOutput), diffOutput, nil
+}
+
+// SnapshotRaw returns the current diff without updating the poller's hash.
+// Use this for read-only checks that should not suppress the next poll tick.
+func (p *Poller) SnapshotRaw() ([]*Chunk, string, error) {
+	diffOutput, err := p.runGitDiff()
+	if err != nil {
+		return nil, "", err
+	}
 
 	return p.parser.Parse(diffOutput), diffOutput, nil
 }
