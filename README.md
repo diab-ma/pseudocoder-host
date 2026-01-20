@@ -8,7 +8,7 @@
   </a>
 </p>
 
-supervise AI coding sessions from your phone. watch terminal output, review code changes, and accept or reject diffs anytime, anywhere.
+supervise terminal coding sessions from your phone. watch terminal output, review code changes, and accept or reject diffs anytime, anywhere.
 
 > **WARNING:**
 > 
