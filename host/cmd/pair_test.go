@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -236,5 +238,95 @@ func TestFormatCodeWithSpaces(t *testing.T) {
 				t.Errorf("formatCodeWithSpaces(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRunPair_InvalidPort(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runPair([]string{"--port", "0"}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Errorf("runPair(--port 0) = %d, want 1", code)
+	}
+}
+
+func TestRequestPairingCode_IPCFallback(t *testing.T) {
+	originalIPC := requestPairingCodeIPCFunc
+	originalHTTP := requestPairingCodeHTTPFunc
+	t.Cleanup(func() {
+		requestPairingCodeIPCFunc = originalIPC
+		requestPairingCodeHTTPFunc = originalHTTP
+	})
+
+	requestPairingCodeIPCFunc = func(socketPath string) (string, time.Time, error) {
+		return "", time.Time{}, errPairSocketNotFound
+	}
+	requestPairingCodeHTTPFunc = func(addrs []string, noTLS bool, tlsConfig *tls.Config) (string, time.Time, error) {
+		return "123456", time.Unix(0, 0), nil
+	}
+
+	var stderr bytes.Buffer
+	code, expiry, _, err := requestPairingCode(&PairConfig{Addrs: []string{"127.0.0.1:7070"}, NoTLS: true, PairSocket: "/tmp/missing.sock"}, &stderr)
+	if err != nil {
+		t.Fatalf("requestPairingCode() error: %v", err)
+	}
+	if code != "123456" {
+		t.Fatalf("code = %q, want %q", code, "123456")
+	}
+	if expiry != time.Unix(0, 0) {
+		t.Fatalf("expiry = %v, want %v", expiry, time.Unix(0, 0))
+	}
+	if !strings.Contains(stderr.String(), "falling back to localhost HTTP") {
+		t.Fatalf("stderr missing fallback warning, got: %s", stderr.String())
+	}
+}
+
+func TestRequestPairingCode_IPCPermissionDenied(t *testing.T) {
+	originalIPC := requestPairingCodeIPCFunc
+	originalHTTP := requestPairingCodeHTTPFunc
+	t.Cleanup(func() {
+		requestPairingCodeIPCFunc = originalIPC
+		requestPairingCodeHTTPFunc = originalHTTP
+	})
+
+	requestPairingCodeIPCFunc = func(socketPath string) (string, time.Time, error) {
+		return "", time.Time{}, errPairSocketPermission
+	}
+	requestPairingCodeHTTPFunc = func(addrs []string, noTLS bool, tlsConfig *tls.Config) (string, time.Time, error) {
+		return "", time.Time{}, fmt.Errorf("unexpected HTTP fallback")
+	}
+
+	var stderr bytes.Buffer
+	_, _, _, err := requestPairingCode(&PairConfig{Addrs: []string{"127.0.0.1:7070"}, NoTLS: true, PairSocket: "/tmp/denied.sock"}, &stderr)
+	if err == nil {
+		t.Fatal("requestPairingCode() expected error")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("error = %v, want permission denied", err)
+	}
+}
+
+func TestRequestPairingCode_IPCUnavailable(t *testing.T) {
+	originalIPC := requestPairingCodeIPCFunc
+	originalHTTP := requestPairingCodeHTTPFunc
+	t.Cleanup(func() {
+		requestPairingCodeIPCFunc = originalIPC
+		requestPairingCodeHTTPFunc = originalHTTP
+	})
+
+	requestPairingCodeIPCFunc = func(socketPath string) (string, time.Time, error) {
+		return "", time.Time{}, errPairSocketUnavailable
+	}
+	requestPairingCodeHTTPFunc = func(addrs []string, noTLS bool, tlsConfig *tls.Config) (string, time.Time, error) {
+		return "", time.Time{}, fmt.Errorf("unexpected HTTP fallback")
+	}
+
+	var stderr bytes.Buffer
+	_, _, _, err := requestPairingCode(&PairConfig{Addrs: []string{"127.0.0.1:7070"}, NoTLS: true, PairSocket: "/tmp/unavailable.sock"}, &stderr)
+	if err == nil {
+		t.Fatal("requestPairingCode() expected error")
+	}
+	if !strings.Contains(err.Error(), "not accepting connections") {
+		t.Fatalf("error = %v, want not accepting connections", err)
 	}
 }

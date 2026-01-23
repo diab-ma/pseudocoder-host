@@ -29,6 +29,7 @@ pid_file = "/var/run/pseudocoder.pid"
 log_file = "/var/log/pseudocoder.log"
 pair = true
 qr = true
+pair_socket = "/tmp/pseudocoder-pair.sock"
 chunk_grouping_enabled = true
 chunk_grouping_proximity = 25
 `
@@ -102,6 +103,9 @@ chunk_grouping_proximity = 25
 	if !cfg.QR {
 		t.Error("QR = false, want true")
 	}
+	if cfg.PairSocket != "/tmp/pseudocoder-pair.sock" {
+		t.Errorf("PairSocket = %q, want %q", cfg.PairSocket, "/tmp/pseudocoder-pair.sock")
+	}
 	// Unit 2.1: Chunk grouping fields
 	if !cfg.ChunkGroupingEnabled {
 		t.Error("ChunkGroupingEnabled = false, want true")
@@ -168,6 +172,9 @@ history_lines = 3000
 	}
 	if cfg.QR {
 		t.Error("QR = true, want false")
+	}
+	if cfg.PairSocket != "" {
+		t.Errorf("PairSocket = %q, want empty", cfg.PairSocket)
 	}
 	// Unit 2.1: Chunk grouping fields should default to zero values
 	if cfg.ChunkGroupingEnabled {
@@ -272,6 +279,21 @@ func TestDefaultConfigPath(t *testing.T) {
 	}
 }
 
+// TestDefaultPairSocketPath verifies the default pairing socket path format.
+func TestDefaultPairSocketPath(t *testing.T) {
+	path, err := DefaultPairSocketPath()
+	if err != nil {
+		t.Fatalf("DefaultPairSocketPath() error: %v", err)
+	}
+
+	if filepath.Base(path) != "pair.sock" {
+		t.Errorf("DefaultPairSocketPath() = %q, want filename pair.sock", path)
+	}
+	if filepath.Base(filepath.Dir(path)) != ".pseudocoder" {
+		t.Errorf("DefaultPairSocketPath() = %q, want parent dir .pseudocoder", path)
+	}
+}
+
 // TestWriteDefault_CreatesFile verifies that WriteDefault creates a config file
 // with mobile-ready defaults.
 func TestWriteDefault_CreatesFile(t *testing.T) {
@@ -301,10 +323,6 @@ func TestWriteDefault_CreatesFile(t *testing.T) {
 	cfg, err := Load(configPath)
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
-	}
-
-	if cfg.Addr != "0.0.0.0:7070" {
-		t.Errorf("Addr = %q, want %q", cfg.Addr, "0.0.0.0:7070")
 	}
 	if !cfg.RequireAuth {
 		t.Error("RequireAuth = false, want true")

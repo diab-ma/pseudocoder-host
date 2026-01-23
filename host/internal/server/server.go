@@ -2222,9 +2222,9 @@ func (h *RevokeDeviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// isLoopbackRequest checks if the HTTP request came from a loopback address.
-// This is used to restrict sensitive endpoints to localhost-only access.
-// Returns true for 127.0.0.0/8 (IPv4) and ::1 (IPv6).
+// isLoopbackRequest checks if the HTTP request came from the local machine.
+// This is used to restrict sensitive endpoints to local-only access.
+// Returns true for loopback or local interface addresses.
 // Note: This duplicates the function in auth/handler.go to avoid circular imports.
 func isLoopbackRequest(r *http.Request) bool {
 	// Extract the host part from RemoteAddr (format is "host:port" or "[host]:port" for IPv6)
@@ -2243,8 +2243,53 @@ func isLoopbackRequest(r *http.Request) bool {
 		return false
 	}
 
-	// Check if it's a loopback address (127.0.0.0/8 for IPv4, ::1 for IPv6)
-	return ip.IsLoopback()
+	if ip.IsLoopback() {
+		return true
+	}
+
+	return isLocalInterfaceIP(ip)
+}
+
+func isLocalInterfaceIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("server: failed to list interfaces: %v", err)
+		return false
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var localIP net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				localIP = v.IP
+			case *net.IPAddr:
+				localIP = v.IP
+			}
+			if localIP == nil {
+				continue
+			}
+			if localIP4 := localIP.To4(); localIP4 != nil {
+				localIP = localIP4
+			}
+			if localIP.Equal(ip) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // ApprovalTokenValidator validates approval tokens for the /approve endpoint.

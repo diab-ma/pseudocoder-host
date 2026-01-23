@@ -20,9 +20,8 @@ type SessionConfig struct {
 	Addr string // Host address (e.g., "127.0.0.1:7070")
 }
 
-// getDefaultAddr returns the default host address for CLI commands.
-func getDefaultAddr() string {
-	return "127.0.0.1:7070"
+func resolveSessionAddrs(addr string, port int, explicitFlags map[string]bool, stderr io.Writer) []string {
+	return resolveAddrCandidates(addr, port, explicitFlags["port"], stderr)
 }
 
 // runSession handles the "pseudocoder session" subcommand.
@@ -70,9 +69,11 @@ func runSessionNew(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	var name, command, addr string
+	var port int
 	fs.StringVar(&name, "name", "", "Human-readable name for the session")
 	fs.StringVar(&command, "command", "", "Command to run (default: host's default shell)")
-	fs.StringVar(&addr, "addr", "", "Host address (default: 127.0.0.1:7070)")
+	fs.StringVar(&addr, "addr", "", "Host address (default: localhost, then Tailscale/LAN)")
+	fs.IntVar(&port, "port", 7070, "Port to query when auto-selecting address")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: pseudocoder session new [options]\n\nCreate a new PTY session.\n\nOptions:\n")
@@ -86,9 +87,17 @@ func runSessionNew(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	if addr == "" {
-		addr = getDefaultAddr()
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
 	}
+
+	addrs := resolveSessionAddrs(addr, port, explicitFlags, stderr)
 
 	// Build request body
 	reqBody := struct {
@@ -101,7 +110,7 @@ func runSessionNew(args []string, stdout, stderr io.Writer) int {
 	}
 
 	// Make the API call
-	resp, err := callSessionAPI(addr, "POST", "/api/session/new", reqBody)
+	resp, err := callSessionAPI(addrs, "POST", "/api/session/new", reqBody)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
@@ -144,7 +153,9 @@ func runSessionList(args []string, stdout, stderr io.Writer) int {
 
 	var addr string
 	var jsonOutput bool
-	fs.StringVar(&addr, "addr", "", "Host address (default: 127.0.0.1:7070)")
+	var port int
+	fs.StringVar(&addr, "addr", "", "Host address (default: localhost, then Tailscale/LAN)")
+	fs.IntVar(&port, "port", 7070, "Port to query when auto-selecting address")
 	fs.BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 
 	fs.Usage = func() {
@@ -159,12 +170,20 @@ func runSessionList(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	if addr == "" {
-		addr = getDefaultAddr()
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
 	}
 
+	addrs := resolveSessionAddrs(addr, port, explicitFlags, stderr)
+
 	// Make the API call
-	resp, err := callSessionAPI(addr, "GET", "/api/session/list", nil)
+	resp, err := callSessionAPI(addrs, "GET", "/api/session/list", nil)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
@@ -252,7 +271,9 @@ func runSessionKill(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	var addr string
-	fs.StringVar(&addr, "addr", "", "Host address (default: 127.0.0.1:7070)")
+	var port int
+	fs.StringVar(&addr, "addr", "", "Host address (default: localhost, then Tailscale/LAN)")
+	fs.IntVar(&port, "port", 7070, "Port to query when auto-selecting address")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: pseudocoder session kill [options] <session-id>\n\nKill a session.\n\nOptions:\n")
@@ -274,13 +295,21 @@ func runSessionKill(args []string, stdout, stderr io.Writer) int {
 
 	sessionID := fs.Arg(0)
 
-	if addr == "" {
-		addr = getDefaultAddr()
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
 	}
+
+	addrs := resolveSessionAddrs(addr, port, explicitFlags, stderr)
 
 	// Make the API call
 	path := fmt.Sprintf("/api/session/%s/kill", sessionID)
-	resp, err := callSessionAPI(addr, "POST", path, nil)
+	resp, err := callSessionAPI(addrs, "POST", path, nil)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
@@ -313,7 +342,9 @@ func runSessionRename(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	var addr string
-	fs.StringVar(&addr, "addr", "", "Host address (default: 127.0.0.1:7070)")
+	var port int
+	fs.StringVar(&addr, "addr", "", "Host address (default: localhost, then Tailscale/LAN)")
+	fs.IntVar(&port, "port", 7070, "Port to query when auto-selecting address")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: pseudocoder session rename [options] <session-id> <new-name>\n\nRename a session.\n\nOptions:\n")
@@ -336,9 +367,17 @@ func runSessionRename(args []string, stdout, stderr io.Writer) int {
 	sessionID := fs.Arg(0)
 	newName := fs.Arg(1)
 
-	if addr == "" {
-		addr = getDefaultAddr()
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
 	}
+
+	addrs := resolveSessionAddrs(addr, port, explicitFlags, stderr)
 
 	// Build request body
 	reqBody := struct {
@@ -349,7 +388,7 @@ func runSessionRename(args []string, stdout, stderr io.Writer) int {
 
 	// Make the API call
 	path := fmt.Sprintf("/api/session/%s/rename", sessionID)
-	resp, err := callSessionAPI(addr, "POST", path, reqBody)
+	resp, err := callSessionAPI(addrs, "POST", path, reqBody)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
@@ -378,7 +417,7 @@ func runSessionRename(args []string, stdout, stderr io.Writer) int {
 // callSessionAPI makes an HTTP request to the session API.
 // It tries HTTPS first, then falls back to HTTP.
 // Returns the response body or an error.
-func callSessionAPI(addr, method, path string, body interface{}) ([]byte, error) {
+func callSessionAPI(addrs []string, method, path string, body interface{}) ([]byte, error) {
 	// Create HTTP client with short timeout and TLS config that accepts self-signed certs.
 	client := &http.Client{
 		Timeout: 5 * time.Second,
@@ -393,57 +432,69 @@ func callSessionAPI(addr, method, path string, body interface{}) ([]byte, error)
 	schemes := []string{"https", "http"}
 
 	var lastErr error
-	for _, scheme := range schemes {
-		url := fmt.Sprintf("%s://%s%s", scheme, addr, path)
+	var firstHTTPErr error
+	for _, addr := range addrs {
+		for _, scheme := range schemes {
+			url := fmt.Sprintf("%s://%s%s", scheme, addr, path)
 
-		var bodyReader io.Reader
-		if body != nil {
-			bodyBytes, err := json.Marshal(body)
+			var bodyReader io.Reader
+			if body != nil {
+				bodyBytes, err := json.Marshal(body)
+				if err != nil {
+					return nil, fmt.Errorf("failed to encode request: %w", err)
+				}
+				bodyReader = strings.NewReader(string(bodyBytes))
+			}
+
+			req, err := http.NewRequest(method, url, bodyReader)
 			if err != nil {
-				return nil, fmt.Errorf("failed to encode request: %w", err)
+				lastErr = err
+				continue
 			}
-			bodyReader = strings.NewReader(string(bodyBytes))
-		}
 
-		req, err := http.NewRequest(method, url, bodyReader)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		if body != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			continue // Try next scheme
-		}
-		defer resp.Body.Close()
-
-		// Read response body
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		// Check for HTTP errors
-		if resp.StatusCode >= 400 {
-			// Try to parse error message from body
-			var errResp struct {
-				Error string `json:"error"`
+			if body != nil {
+				req.Header.Set("Content-Type", "application/json")
 			}
-			if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
-				return nil, fmt.Errorf("%s", errResp.Error)
-			}
-			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
-		}
 
-		return respBody, nil
+			resp, err := client.Do(req)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			defer resp.Body.Close()
+
+			// Read response body
+			respBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+
+			// Check for HTTP errors
+			if resp.StatusCode >= 400 {
+				// Try to parse error message from body
+				var errResp struct {
+					Error string `json:"error"`
+				}
+				if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
+					if firstHTTPErr == nil {
+						firstHTTPErr = fmt.Errorf("%s", errResp.Error)
+					}
+					continue
+				}
+				if firstHTTPErr == nil {
+					firstHTTPErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+				}
+				continue
+			}
+
+			return respBody, nil
+		}
 	}
 
+	if firstHTTPErr != nil {
+		return nil, firstHTTPErr
+	}
 	if lastErr != nil {
 		return nil, fmt.Errorf("host unreachable: %w", lastErr)
 	}
@@ -458,7 +509,9 @@ func runSessionListTmux(args []string, stdout, stderr io.Writer) int {
 
 	var addr string
 	var jsonOutput bool
-	fs.StringVar(&addr, "addr", "", "Host address (default: 127.0.0.1:7070)")
+	var port int
+	fs.StringVar(&addr, "addr", "", "Host address (default: localhost, then Tailscale/LAN)")
+	fs.IntVar(&port, "port", 7070, "Port to query when auto-selecting address")
 	fs.BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 
 	fs.Usage = func() {
@@ -473,12 +526,20 @@ func runSessionListTmux(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	if addr == "" {
-		addr = getDefaultAddr()
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
 	}
 
+	addrs := resolveSessionAddrs(addr, port, explicitFlags, stderr)
+
 	// Make the API call
-	resp, err := callSessionAPI(addr, "GET", "/api/tmux/list", nil)
+	resp, err := callSessionAPI(addrs, "GET", "/api/tmux/list", nil)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
@@ -554,7 +615,9 @@ func runSessionAttachTmux(args []string, stdout, stderr io.Writer) int {
 
 	var addr string
 	var sessionName string
-	fs.StringVar(&addr, "addr", "", "Host address (default: 127.0.0.1:7070)")
+	var port int
+	fs.StringVar(&addr, "addr", "", "Host address (default: localhost, then Tailscale/LAN)")
+	fs.IntVar(&port, "port", 7070, "Port to query when auto-selecting address")
 	fs.StringVar(&sessionName, "name", "", "Optional name for the pseudocoder session")
 
 	fs.Usage = func() {
@@ -577,9 +640,17 @@ func runSessionAttachTmux(args []string, stdout, stderr io.Writer) int {
 
 	tmuxSession := fs.Arg(0)
 
-	if addr == "" {
-		addr = getDefaultAddr()
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
 	}
+
+	addrs := resolveSessionAddrs(addr, port, explicitFlags, stderr)
 
 	// Build request body
 	reqBody := struct {
@@ -591,7 +662,7 @@ func runSessionAttachTmux(args []string, stdout, stderr io.Writer) int {
 	}
 
 	// Make the API call
-	resp, err := callSessionAPI(addr, "POST", "/api/tmux/attach", reqBody)
+	resp, err := callSessionAPI(addrs, "POST", "/api/tmux/attach", reqBody)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
@@ -634,7 +705,9 @@ func runSessionDetach(args []string, stdout, stderr io.Writer) int {
 
 	var addr string
 	var kill bool
-	fs.StringVar(&addr, "addr", "", "Host address (default: 127.0.0.1:7070)")
+	var port int
+	fs.StringVar(&addr, "addr", "", "Host address (default: localhost, then Tailscale/LAN)")
+	fs.IntVar(&port, "port", 7070, "Port to query when auto-selecting address")
 	fs.BoolVar(&kill, "kill", false, "Also kill the tmux session (not just detach)")
 
 	fs.Usage = func() {
@@ -657,9 +730,17 @@ func runSessionDetach(args []string, stdout, stderr io.Writer) int {
 
 	sessionID := fs.Arg(0)
 
-	if addr == "" {
-		addr = getDefaultAddr()
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
 	}
+
+	addrs := resolveSessionAddrs(addr, port, explicitFlags, stderr)
 
 	// Build request body
 	reqBody := struct {
@@ -670,7 +751,7 @@ func runSessionDetach(args []string, stdout, stderr io.Writer) int {
 
 	// Make the API call
 	path := fmt.Sprintf("/api/tmux/%s/detach", sessionID)
-	resp, err := callSessionAPI(addr, "POST", path, reqBody)
+	resp, err := callSessionAPI(addrs, "POST", path, reqBody)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1

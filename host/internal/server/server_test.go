@@ -2058,12 +2058,16 @@ func TestIsLoopbackRequest(t *testing.T) {
 		{"127.0.0.10:12345", true},
 		{"127.255.255.255:12345", true},
 		{"[::1]:12345", true},
-		{"192.168.1.1:12345", false},
-		{"10.0.0.1:12345", false},
-		{"172.16.0.1:12345", false},
 		{"8.8.8.8:12345", false},
 		{"", false},
 		{"invalid", false},
+	}
+
+	if ip := findLocalNonLoopbackIP(); ip != "" {
+		testCases = append(testCases, struct {
+			remoteAddr string
+			expected   bool
+		}{remoteAddr: net.JoinHostPort(ip, "12345"), expected: true})
 	}
 
 	for _, tc := range testCases {
@@ -2074,6 +2078,38 @@ func TestIsLoopbackRequest(t *testing.T) {
 			t.Errorf("isLoopbackRequest(%q) = %v, expected %v", tc.remoteAddr, result, tc.expected)
 		}
 	}
+}
+
+func findLocalNonLoopbackIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			if ip4 := ip.To4(); ip4 != nil {
+				return ip4.String()
+			}
+			return ip.String()
+		}
+	}
+
+	return ""
 }
 
 // ===== Unit 5.5a: Terminal Input Tests =====

@@ -99,6 +99,10 @@ type Config struct {
 	// Default: false
 	QR bool `toml:"qr"`
 
+	// PairSocket is the Unix socket path for pairing IPC.
+	// Default: ~/.pseudocoder/pair.sock
+	PairSocket string `toml:"pair_socket"`
+
 	// ChunkGroupingEnabled enables proximity-based chunk grouping in diff cards.
 	// When true, chunks within ChunkGroupingProximity lines are grouped together.
 	// Default: true (but Go zero value is false; caller must apply defaults)
@@ -120,8 +124,19 @@ func DefaultConfigPath() (string, error) {
 	return filepath.Join(home, ".pseudocoder", "config.toml"), nil
 }
 
+// DefaultPairSocketPath returns the default pairing IPC socket path: ~/.pseudocoder/pair.sock.
+// Returns an error only if the user's home directory cannot be determined.
+func DefaultPairSocketPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	return filepath.Join(home, ".pseudocoder", "pair.sock"), nil
+}
+
 // WriteDefault creates a config file with mobile-ready defaults at the given path.
-// The config enables LAN access (0.0.0.0:7070) and requires authentication.
+// The config requires authentication and leaves the bind address unset so
+// CLI defaults can decide the runtime listen address.
 //
 // Behavior:
 //   - If the file already exists, returns without error (does not overwrite).
@@ -143,9 +158,6 @@ func WriteDefault(path string, repo string) error {
 	// Using raw string to control formatting exactly
 	content := fmt.Sprintf(`# Pseudocoder configuration
 # Created by 'pseudocoder start' for mobile-ready defaults
-
-# Listen on all interfaces for LAN access
-addr = "0.0.0.0:7070"
 
 # Require authentication for security
 require_auth = true

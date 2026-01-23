@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -13,20 +14,36 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/skip2/go-qrcode"
 
+	"github.com/pseudocoder/host/internal/config"
 	hostTLS "github.com/pseudocoder/host/internal/tls"
 )
 
 // PairConfig holds configuration for the pair command.
 type PairConfig struct {
-	Addr    string
-	TLSCert string
-	NoTLS   bool
-	QR      bool // Display pairing info as QR code
+	Addr       string
+	Addrs      []string
+	TLSCert    string
+	NoTLS      bool
+	QR         bool // Display pairing info as QR code
+	Port       int
+	PairSocket string
 }
+
+var (
+	errPairSocketNotFound    = errors.New("pairing socket not found")
+	errPairSocketPermission  = errors.New("pairing socket permission denied")
+	errPairSocketUnavailable = errors.New("pairing socket unavailable")
+)
+
+var (
+	requestPairingCodeIPCFunc  = requestPairingCodeIPC
+	requestPairingCodeHTTPFunc = requestPairingCodeHTTP
+)
 
 func runPair(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
@@ -34,9 +51,11 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 
 	cfg := &PairConfig{}
 	fs.StringVar(&cfg.Addr, "addr", "", "Host address for QR code/display (default: Tailscale or LAN IP:7070)")
+	fs.IntVar(&cfg.Port, "port", 7070, "Port for LAN access when auto-selecting IPs")
 	fs.StringVar(&cfg.TLSCert, "tls-cert", "", "Path to host TLS certificate for verification (default: ~/.pseudocoder/certs/host.crt)")
 	fs.BoolVar(&cfg.NoTLS, "no-tls", false, "Use HTTP instead of HTTPS (insecure, for development only)")
 	fs.BoolVar(&cfg.QR, "qr", false, "Display pairing information as QR code")
+	fs.StringVar(&cfg.PairSocket, "pair-socket", "", "Path to pairing IPC socket (default: ~/.pseudocoder/pair.sock)")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: pseudocoder pair [options]\n\nGenerate a short pairing code for mobile device.\n\nOptions:\n")
@@ -52,23 +71,45 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(cfg.Port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	if cfg.PairSocket == "" {
+		defaultPairSocket, err := config.DefaultPairSocketPath()
+		if err != nil {
+			fmt.Fprintf(stderr, "Error: failed to determine pairing socket path: %v\n", err)
+			return 1
+		}
+		cfg.PairSocket = defaultPairSocket
+	}
+
 	// Determine display address for QR code reachability from mobile.
 	// Priority: Tailscale IP > LAN IP > localhost (with warning).
 	// This is separate from the connection address (always localhost for code generation).
+	portStr := fmt.Sprintf("%d", cfg.Port)
 	displayAddr := cfg.Addr
 	if displayAddr == "" {
 		if ip := GetTailscaleIP(); ip != "" {
-			displayAddr = ip + ":7070"
+			displayAddr = ip + ":" + portStr
 		} else if ip := GetPreferredOutboundIP(); ip != "" {
-			displayAddr = ip + ":7070"
+			displayAddr = ip + ":" + portStr
 		} else {
 			fmt.Fprintf(stderr, "Warning: could not detect network IP, using localhost\n")
-			displayAddr = "127.0.0.1:7070"
+			displayAddr = "127.0.0.1:" + portStr
 		}
+	} else if explicitFlags["port"] {
+		fmt.Fprintf(stderr, "Warning: --addr overrides --port; using %s\n", displayAddr)
 	}
 
-	// Always connect to localhost for code generation (host restricts /pair/generate to localhost).
-	cfg.Addr = "127.0.0.1:7070"
+	// Use local candidates for legacy HTTP fallback when IPC is unavailable.
+	cfg.Addrs = resolveAddrCandidates("", cfg.Port, false, stderr)
 
 	// Determine cert path default
 	if cfg.TLSCert == "" && !cfg.NoTLS {
@@ -99,51 +140,146 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 }
 
 // requestPairingCode tries to get a pairing code from a running host daemon.
-// It uses HTTPS by default and verifies the host certificate.
+// It attempts IPC first and falls back to loopback HTTP when the socket is missing.
 // Returns the pairing code, expiry time, and certificate fingerprint (empty if no TLS).
 func requestPairingCode(cfg *PairConfig, stderr io.Writer) (code string, expiry time.Time, fingerprint string, err error) {
-	var reqURL string
-	var client *http.Client
-
+	var tlsConfig *tls.Config
 	if cfg.NoTLS {
-		// Insecure mode: use plain HTTP (development only)
-		reqURL = fmt.Sprintf("http://%s/pair/generate", cfg.Addr)
-		client = &http.Client{Timeout: 5 * time.Second}
-		fingerprint = "" // No fingerprint in insecure mode
+		fingerprint = ""
 	} else {
-		// Secure mode: use HTTPS with certificate verification
-		reqURL = fmt.Sprintf("https://%s/pair/generate", cfg.Addr)
-
-		// Load and verify the host certificate
-		tlsConfig, fp, loadErr := loadHostCertificate(cfg.TLSCert)
+		var loadErr error
+		tlsConfig, fingerprint, loadErr = loadHostCertificate(cfg.TLSCert)
 		if loadErr != nil {
 			return "", time.Time{}, "", fmt.Errorf("failed to load host certificate: %w", loadErr)
 		}
-		fingerprint = fp
 
 		fmt.Fprintf(stderr, "Using certificate: %s\n", cfg.TLSCert)
 		fmt.Fprintf(stderr, "Fingerprint: %s\n", fingerprint)
-
-		client = &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: tlsConfig,
-			},
-		}
 	}
 
-	resp, err := client.Post(reqURL, "application/json", nil)
+	code, expiry, err = requestPairingCodeIPCFunc(cfg.PairSocket)
+	if err == nil {
+		return code, expiry, fingerprint, nil
+	}
+	if errors.Is(err, errPairSocketNotFound) {
+		fmt.Fprintf(stderr, "Warning: pairing IPC socket not found at %s; falling back to localhost HTTP\n", cfg.PairSocket)
+	} else if errors.Is(err, errPairSocketPermission) {
+		return "", time.Time{}, "", fmt.Errorf("permission denied accessing pairing socket %s (run as the host user or fix permissions)", cfg.PairSocket)
+	} else if errors.Is(err, errPairSocketUnavailable) {
+		return "", time.Time{}, "", fmt.Errorf("pairing socket at %s is not accepting connections (restart the host)", cfg.PairSocket)
+	} else {
+		return "", time.Time{}, "", err
+	}
+
+	code, expiry, err = requestPairingCodeHTTPFunc(cfg.Addrs, cfg.NoTLS, tlsConfig)
 	if err != nil {
-		return "", time.Time{}, "", fmt.Errorf("could not connect to host at %s: %w", cfg.Addr, err)
+		return "", time.Time{}, "", err
+	}
+
+	return code, expiry, fingerprint, nil
+}
+
+func requestPairingCodeIPC(socketPath string) (code string, expiry time.Time, err error) {
+	if socketPath == "" {
+		return "", time.Time{}, errPairSocketNotFound
+	}
+
+	info, err := os.Stat(socketPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", time.Time{}, errPairSocketNotFound
+		}
+		if os.IsPermission(err) {
+			return "", time.Time{}, errPairSocketPermission
+		}
+		return "", time.Time{}, fmt.Errorf("failed to stat pairing socket: %w", err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return "", time.Time{}, fmt.Errorf("pairing socket path is not a socket: %s", socketPath)
+	}
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", socketPath)
+		},
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second, Transport: transport}
+	resp, err := client.Post("http://unix/pair/generate", "application/json", nil)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
+			return "", time.Time{}, errPairSocketNotFound
+		}
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EACCES) {
+			return "", time.Time{}, errPairSocketPermission
+		}
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return "", time.Time{}, errPairSocketUnavailable
+		}
+		return "", time.Time{}, fmt.Errorf("failed to connect to pairing socket: %w", err)
 	}
 	defer resp.Body.Close()
 
+	code, expiry, err = parsePairingCodeResponse(resp)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+
+	return code, expiry, nil
+}
+
+func requestPairingCodeHTTP(addrs []string, noTLS bool, tlsConfig *tls.Config) (code string, expiry time.Time, err error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	if !noTLS {
+		if tlsConfig == nil {
+			return "", time.Time{}, fmt.Errorf("missing TLS config for secure pairing request")
+		}
+		client.Transport = &http.Transport{TLSClientConfig: tlsConfig}
+	}
+
+	var lastErr error
+	for _, addr := range addrs {
+		var reqURL string
+		if noTLS {
+			// Insecure mode: use plain HTTP (development only)
+			reqURL = fmt.Sprintf("http://%s/pair/generate", addr)
+		} else {
+			// Secure mode: use HTTPS with certificate verification
+			reqURL = fmt.Sprintf("https://%s/pair/generate", addr)
+		}
+
+		resp, err := client.Post(reqURL, "application/json", nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		defer resp.Body.Close()
+
+		code, expiry, err = parsePairingCodeResponse(resp)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		return code, expiry, nil
+	}
+
+	if lastErr != nil {
+		return "", time.Time{}, fmt.Errorf("could not connect to host: %w", lastErr)
+	}
+
+	return "", time.Time{}, fmt.Errorf("could not connect to host")
+}
+
+func parsePairingCodeResponse(resp *http.Response) (code string, expiry time.Time, err error) {
 	if resp.StatusCode == http.StatusForbidden {
-		return "", time.Time{}, "", fmt.Errorf("pairing code generation is restricted to localhost")
+		return "", time.Time{}, fmt.Errorf("pairing code generation is restricted to localhost")
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", time.Time{}, "", fmt.Errorf("host returned status %d", resp.StatusCode)
+		return "", time.Time{}, fmt.Errorf("host returned status %d", resp.StatusCode)
 	}
 
 	var result struct {
@@ -151,10 +287,10 @@ func requestPairingCode(cfg *PairConfig, stderr io.Writer) (code string, expiry 
 		Expiry time.Time `json:"expiry"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", time.Time{}, "", err
+		return "", time.Time{}, err
 	}
 
-	return result.Code, result.Expiry, fingerprint, nil
+	return result.Code, result.Expiry, nil
 }
 
 // loadHostCertificate loads the host's TLS certificate and creates a TLS config

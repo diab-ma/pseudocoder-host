@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"github.com/pseudocoder/host/internal/auth"
 	"github.com/pseudocoder/host/internal/config"
 	"github.com/pseudocoder/host/internal/diff"
+	"github.com/pseudocoder/host/internal/ipc"
 	"github.com/pseudocoder/host/internal/mdns"
 	"github.com/pseudocoder/host/internal/pty"
 	"github.com/pseudocoder/host/internal/server"
@@ -55,6 +57,7 @@ type HostStartConfig struct {
 	MdnsEnabled             bool
 	Pair                    bool
 	QR                      bool
+	PairSocket              string
 }
 
 func runHostStart(args []string, stdout, stderr io.Writer) int {
@@ -85,6 +88,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&cfg.MdnsEnabled, "mdns", false, "Enable mDNS/Bonjour discovery (LAN-visible)")
 	fs.BoolVar(&cfg.Pair, "pair", false, "Generate and display pairing code during startup")
 	fs.BoolVar(&cfg.QR, "qr", false, "Display pairing code as QR code (requires --pair)")
+	fs.StringVar(&cfg.PairSocket, "pair-socket", "", "Path to pairing IPC socket (default: ~/.pseudocoder/pair.sock)")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: pseudocoder host start [options]\n\nOptions:\n")
@@ -176,6 +180,17 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if !explicitFlags["qr"] {
 		cfg.QR = fileCfg.QR
+	}
+	if cfg.PairSocket == "" {
+		cfg.PairSocket = fileCfg.PairSocket
+	}
+	if cfg.PairSocket == "" {
+		defaultPairSocket, err := config.DefaultPairSocketPath()
+		if err != nil {
+			fmt.Fprintf(stderr, "Error: failed to determine pairing socket path: %v\n", err)
+			return 1
+		}
+		cfg.PairSocket = defaultPairSocket
 	}
 
 	// If --qr is set without --pair, auto-enable --pair.
@@ -355,6 +370,34 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		DeviceStore: store,
 	})
 
+	// Start the pairing IPC server for local code generation.
+	// This keeps code generation off loopback HTTP unless explicitly used.
+	pairSocketLogger := log.New(stderr, "ipc: ", log.LstdFlags)
+	pairSocketServer := ipc.NewPairSocketServer(cfg.PairSocket, auth.NewGenerateCodeHandler(pairingManager), pairSocketLogger)
+	pairIPCRunning := false
+	pairIPCCleanup := false
+	stopPairIPC := func() {
+		if !pairIPCCleanup {
+			return
+		}
+		pairIPCCleanup = false
+		if err := pairSocketServer.Stop(); err != nil {
+			fmt.Fprintf(stderr, "Warning: failed to stop pairing IPC: %v\n", err)
+		}
+	}
+	if err := pairSocketServer.Start(); err != nil {
+		if cfg.RequireAuth || cfg.Pair {
+			fmt.Fprintf(stderr, "Error: failed to start pairing IPC: %v\n", err)
+			store.Close()
+			return 1
+		}
+		fmt.Fprintf(stderr, "Warning: pairing IPC unavailable (%v); pairing requires --require-auth\n", err)
+	} else {
+		pairIPCRunning = true
+		pairIPCCleanup = true
+		defer stopPairIPC()
+	}
+
 	// Create the token validator for WebSocket authentication.
 	tokenValidator := auth.NewTokenValidator(store)
 
@@ -376,6 +419,11 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "Warning: failed to save session: %v\n", err)
 	} else {
 		fmt.Fprintf(stdout, "Session: %s (branch: %s)\n", currentSession.ID, currentSession.Branch)
+	}
+	if pairIPCRunning {
+		fmt.Fprintf(stdout, "Pairing:  %s\n", cfg.PairSocket)
+	} else {
+		fmt.Fprintf(stdout, "Pairing:  disabled (IPC unavailable)\n")
 	}
 
 	// Wire up authentication
@@ -441,7 +489,11 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	// Wire up status handler for CLI queries (Unit 7.5).
 	// This enables "pseudocoder host status" to query the running host.
 	// Must be set BEFORE starting the server so the endpoint is registered.
-	statusHandler := server.NewStatusHandler(wsServer, repoPath, currentSession.Branch, !cfg.NoTLS, cfg.RequireAuth)
+	pairSocket := ""
+	if pairIPCRunning {
+		pairSocket = cfg.PairSocket
+	}
+	statusHandler := server.NewStatusHandler(wsServer, repoPath, currentSession.Branch, !cfg.NoTLS, cfg.RequireAuth, pairSocket)
 	wsServer.SetStatusHandler(statusHandler)
 
 	// Create session manager for multi-session support (Unit 9.1-9.5).
@@ -541,6 +593,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	// This fails fast if the port is already in use or can't be bound.
 	if err := <-wsErrCh; err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
+		stopPairIPC()
 		store.Close()
 		return 1
 	}
@@ -782,6 +835,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		if pidFilePath != "" {
 			removePIDFile(pidFilePath, stderr)
 		}
+		stopPairIPC()
 		store.Close()
 		wsServer.Stop()
 		return 1
@@ -820,6 +874,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 			removePIDFile(pidFilePath, stderr)
 		}
 		cardStreamer.Stop()
+		stopPairIPC()
 		store.Close()
 		wsServer.Stop()
 		return 1
@@ -997,6 +1052,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	cardStreamer.Stop()
 	store.Close()
 	wsServer.Stop()
+	stopPairIPC()
 
 	// Remove PID file
 	if pidFilePath != "" {
@@ -1018,7 +1074,8 @@ func runHostStatus(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("host status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	addr := fs.String("addr", "127.0.0.1:7070", "Host address to query")
+	addr := fs.String("addr", "", "Host address to query (default: localhost, then Tailscale/LAN)")
+	port := fs.Int("port", 7070, "Port to query when auto-selecting address")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: pseudocoder host status [options]\n\nShow the current status of the host daemon.\n\nOptions:\n")
@@ -1032,8 +1089,27 @@ func runHostStatus(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(*port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	addrs := resolveAddrCandidates(*addr, *port, explicitFlags["port"], stderr)
+
 	// Query the running host for status
-	status, err := queryHostStatus(*addr)
+	var status *server.StatusResponse
+	var err error
+	for _, target := range addrs {
+		status, err = queryHostStatus(target)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
@@ -1045,6 +1121,11 @@ func runHostStatus(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "Listening:    %s\n", status.ListeningAddress)
 	fmt.Fprintf(stdout, "TLS:          %v\n", status.TLSEnabled)
 	fmt.Fprintf(stdout, "Auth:         %v\n", status.RequireAuth)
+	if status.PairSocketPath != "" {
+		fmt.Fprintf(stdout, "Pairing:      %s\n", status.PairSocketPath)
+	} else {
+		fmt.Fprintf(stdout, "Pairing:      disabled (IPC unavailable)\n")
+	}
 	fmt.Fprintf(stdout, "Clients:      %d connected\n", status.ConnectedClients)
 	fmt.Fprintf(stdout, "Session:      %s\n", status.SessionID)
 	fmt.Fprintf(stdout, "Repository:   %s\n", status.RepositoryPath)

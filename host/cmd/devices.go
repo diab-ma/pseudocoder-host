@@ -131,8 +131,10 @@ func runDevicesRevoke(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	cfg := &DevicesConfig{}
+	var port int
 	fs.StringVar(&cfg.TokenStore, "token-store", "", "Path to token/device store (default: ~/.pseudocoder/pseudocoder.db)")
-	fs.StringVar(&cfg.Addr, "addr", "", "Host address to notify (default: 127.0.0.1:7070)")
+	fs.StringVar(&cfg.Addr, "addr", "", "Host address to notify (default: localhost, then Tailscale/LAN)")
+	fs.IntVar(&port, "port", 7070, "Port to query when auto-selecting address")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: pseudocoder devices revoke [options] <device-id>\n\nRevoke a device token and disconnect any active sessions.\n\nOptions:\n")
@@ -149,6 +151,16 @@ func runDevicesRevoke(args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() < 1 {
 		fmt.Fprintln(stderr, "Error: device-id is required")
 		fs.Usage()
+		return 1
+	}
+
+	explicitFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
+
+	if err := validatePort(port); err != nil {
+		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
 	}
 
@@ -190,16 +202,13 @@ func runDevicesRevoke(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	addr := cfg.Addr
-	if addr == "" {
-		addr = "127.0.0.1:7070"
-	}
+	addrs := resolveAddrCandidates(cfg.Addr, port, explicitFlags["port"], stderr)
 
 	// Try to notify the running host first. The host endpoint will:
 	// 1. Close active connections for this device
 	// 2. Delete the device from storage
 	// This order ensures connections are closed before the device is removed.
-	closedCount, hostHandled := notifyHostRevocation(deviceID, addr)
+	closedCount, hostHandled := notifyHostRevocation(deviceID, addrs)
 	if hostHandled {
 		// Host handled the revocation (closed connections + deleted from DB)
 		fmt.Fprintf(stdout, "Revoked device: %s (%s)\n", device.ID, device.Name)
@@ -224,7 +233,7 @@ func runDevicesRevoke(args []string, stdout, stderr io.Writer) int {
 // and delete the device. Returns (connections_closed, true) if the host handled the request,
 // or (0, false) if the host is unreachable.
 // This tries HTTPS first (default), then falls back to HTTP for --no-tls hosts.
-func notifyHostRevocation(deviceID, addr string) (int, bool) {
+func notifyHostRevocation(deviceID string, addrs []string) (int, bool) {
 	// Create HTTP client with short timeout and TLS config that accepts self-signed certs.
 	// We use InsecureSkipVerify because:
 	// 1. This is localhost-only communication (enforced by host endpoint)
@@ -242,35 +251,35 @@ func notifyHostRevocation(deviceID, addr string) (int, bool) {
 	// Try HTTPS first (default), then HTTP (for --no-tls hosts)
 	schemes := []string{"https", "http"}
 
-	for _, scheme := range schemes {
-		url := fmt.Sprintf("%s://%s/devices/%s/revoke", scheme, addr, deviceID)
+	for _, addr := range addrs {
+		for _, scheme := range schemes {
+			url := fmt.Sprintf("%s://%s/devices/%s/revoke", scheme, addr, deviceID)
 
-		req, err := http.NewRequest(http.MethodPost, url, nil)
-		if err != nil {
+			req, err := http.NewRequest(http.MethodPost, url, nil)
+			if err != nil {
+				continue
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				continue
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				var result struct {
+					DeviceID          string `json:"device_id"`
+					DeviceName        string `json:"device_name"`
+					ConnectionsClosed int    `json:"connections_closed"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+					return result.ConnectionsClosed, true
+				}
+			}
+
+			// Got a response but not success - keep trying other candidates.
 			continue
 		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			continue // Try next scheme
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK {
-			var result struct {
-				DeviceID          string `json:"device_id"`
-				DeviceName        string `json:"device_name"`
-				ConnectionsClosed int    `json:"connections_closed"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
-				return result.ConnectionsClosed, true
-			}
-		}
-
-		// Got a response but not success - host is reachable but request failed
-		// (e.g., 404 if device not found, 500 on error)
-		// Return false so caller can handle the failure
-		return 0, false
 	}
 
 	// Host unreachable
