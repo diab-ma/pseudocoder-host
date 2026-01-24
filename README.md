@@ -103,7 +103,7 @@ real-time terminal output streaming. send terminal commands, monitor CLI tools a
 
 <h3 align="center">Review Cards</h3>
 
-commit panel in review tab allows to frictionless way to enter message, commit, and push. track all your accepted/rejected changes and easily undo.
+commit panel in review tab allows a frictionless way to enter message, commit, and push. track all your accepted/rejected changes and easily undo. nearby chunks are grouped by proximity so related changes stay together.
 
 - **Accept** stages changes (`git add`)
 - **Reject** restores original (`git restore`)
@@ -121,12 +121,23 @@ commit panel in review tab allows to frictionless way to enter message, commit, 
 
 use Tailscale or trusted LAN only. we recommend never exposing to public internet. 
 all connections use TLS 1.2+. paired devices have full terminal access. only pair devices you control.
+pairing codes are generated locally (IPC/loopback) to avoid exposing them on the network.
 
 manage devices:
 ```bash
 pseudocoder devices list          # view paired devices
 pseudocoder devices revoke <id>   # remove access
 ```
+
+---
+
+## Configuration
+
+`pseudocoder start` creates `~/.pseudocoder/config.toml` if missing. optional settings:
+
+- `pair_socket`: local IPC socket used by `pseudocoder pair` (default: `~/.pseudocoder/pair.sock`)
+- `chunk_grouping_enabled`: group nearby diff hunks into a single review card section
+- `chunk_grouping_proximity`: max line distance for grouping (default: `20` when enabled)
 
 ---
 
@@ -137,6 +148,7 @@ pseudocoder devices revoke <id>   # remove access
 | connection refused | use Tailscale IP (`100.x.x.x`), check `tailscale status` |
 | certificate errors | tap **Trust** on first connection, or re-pair |
 | pairing code expired | run `pseudocoder pair --qr` (codes last 5 min) |
+| `pseudocoder pair` fails | ensure the host is running and `~/.pseudocoder/pair.sock` is accessible |
 | QR won't scan | enter manually: host IP, port `7070`, 6-digit code |
 | macOS Gatekeeper | `xattr -d com.apple.quarantine /usr/local/bin/pseudocoder` |
 
@@ -146,11 +158,17 @@ pseudocoder devices revoke <id>   # remove access
 
 | command | description |
 |---------|-------------|
-| `pseudocoder start --pair --qr` | start host with pairing QR |
+| `pseudocoder start --pair --qr` | start host with mobile-ready defaults + pairing QR |
+| `pseudocoder host start` | start host daemon with advanced options |
+| `pseudocoder host status` | show host daemon status |
 | `pseudocoder pair --qr` | generate new pairing code |
-| `pseudocoder --version` | show version |
+| `pseudocoder session list` | list active sessions |
+| `pseudocoder session new --name <name>` | create a new session |
+| `pseudocoder session list-tmux` | list available tmux sessions |
+| `pseudocoder session attach-tmux <name>` | attach to a tmux session |
 | `pseudocoder devices list` | list paired devices |
 | `pseudocoder devices revoke <id>` | revoke device access |
+| `pseudocoder --version` | show version |
 
 ---
 
