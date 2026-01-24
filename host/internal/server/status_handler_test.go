@@ -14,7 +14,7 @@ func TestStatusHandler_Success(t *testing.T) {
 	srv := NewServer("127.0.0.1:7070")
 
 	// Create handler with known values
-	handler := NewStatusHandler(srv, "/path/to/repo", "main", true, false)
+	handler := NewStatusHandler(srv, "/path/to/repo", "main", true, false, "/tmp/pseudocoder.sock")
 
 	// Create a request from loopback address
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
@@ -57,6 +57,9 @@ func TestStatusHandler_Success(t *testing.T) {
 	if status.RequireAuth {
 		t.Error("expected RequireAuth false")
 	}
+	if status.PairSocketPath != "/tmp/pseudocoder.sock" {
+		t.Errorf("expected PairSocketPath /tmp/pseudocoder.sock, got %s", status.PairSocketPath)
+	}
 	if status.ConnectedClients != 0 {
 		t.Errorf("expected ConnectedClients 0, got %d", status.ConnectedClients)
 	}
@@ -74,7 +77,7 @@ func TestStatusHandler_Uptime(t *testing.T) {
 	srv := NewServer("127.0.0.1:7070")
 
 	// Create handler and wait a bit
-	handler := NewStatusHandler(srv, "/repo", "main", true, false)
+	handler := NewStatusHandler(srv, "/repo", "main", true, false, "")
 	time.Sleep(100 * time.Millisecond)
 
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
@@ -97,7 +100,7 @@ func TestStatusHandler_Uptime(t *testing.T) {
 // TestStatusHandler_LoopbackOnly tests that non-loopback requests are rejected.
 func TestStatusHandler_LoopbackOnly(t *testing.T) {
 	srv := NewServer("127.0.0.1:7070")
-	handler := NewStatusHandler(srv, "/repo", "main", true, false)
+	handler := NewStatusHandler(srv, "/repo", "main", true, false, "")
 
 	tests := []struct {
 		name       string
@@ -144,7 +147,7 @@ func TestStatusHandler_LoopbackOnly(t *testing.T) {
 // TestStatusHandler_MethodNotAllowed tests that non-GET methods are rejected.
 func TestStatusHandler_MethodNotAllowed(t *testing.T) {
 	srv := NewServer("127.0.0.1:7070")
-	handler := NewStatusHandler(srv, "/repo", "main", true, false)
+	handler := NewStatusHandler(srv, "/repo", "main", true, false, "")
 
 	methods := []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch}
 
@@ -180,7 +183,7 @@ func TestStatusHandler_AuthVariations(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := NewStatusHandler(srv, "/repo", "feature-branch", tt.tlsEnabled, tt.requireAuth)
+			handler := NewStatusHandler(srv, "/repo", "feature-branch", tt.tlsEnabled, tt.requireAuth, "")
 
 			req := httptest.NewRequest(http.MethodGet, "/status", nil)
 			req.RemoteAddr = "127.0.0.1:12345"

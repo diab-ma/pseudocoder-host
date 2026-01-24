@@ -27,11 +27,20 @@ func TestRunStart_Help(t *testing.T) {
 	if !strings.Contains(output, "-repo") {
 		t.Errorf("Help output missing -repo flag, got: %s", output)
 	}
+	if !strings.Contains(output, "-addr") {
+		t.Errorf("Help output missing -addr flag, got: %s", output)
+	}
 	if !strings.Contains(output, "-pair") {
 		t.Errorf("Help output missing -pair flag, got: %s", output)
 	}
 	if !strings.Contains(output, "-qr") {
 		t.Errorf("Help output missing -qr flag, got: %s", output)
+	}
+	if !strings.Contains(output, "-port") {
+		t.Errorf("Help output missing -port flag, got: %s", output)
+	}
+	if !strings.Contains(output, "-pair-socket") {
+		t.Errorf("Help output missing -pair-socket flag, got: %s", output)
 	}
 }
 
@@ -42,6 +51,15 @@ func TestRunStart_InvalidFlag(t *testing.T) {
 
 	if code != 1 {
 		t.Errorf("runStart(--invalid-flag) = %d, want 1", code)
+	}
+}
+
+func TestRunStart_InvalidPort(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runStart([]string{"--port", "0"}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Errorf("runStart(--port 0) = %d, want 1", code)
 	}
 }
 
@@ -63,9 +81,6 @@ func TestWriteDefaultIntegration(t *testing.T) {
 	}
 
 	// Verify mobile-ready defaults match what runStart expects
-	if cfg.Addr != "0.0.0.0:7070" {
-		t.Errorf("Addr = %q, want %q (LAN-ready default)", cfg.Addr, "0.0.0.0:7070")
-	}
 	if !cfg.RequireAuth {
 		t.Error("RequireAuth = false, want true (security default)")
 	}
@@ -118,6 +133,81 @@ require_auth = false
 	}
 	if cfg.RequireAuth {
 		t.Error("RequireAuth = true, want false (original should be preserved)")
+	}
+}
+
+func TestSelectBindAddr_PrioritizesTailscale(t *testing.T) {
+	originalTailscale := getTailscaleIP
+	originalOutbound := getPreferredOutboundIP
+	getTailscaleIP = func() string { return "100.64.0.5" }
+	getPreferredOutboundIP = func() string { return "192.168.1.10" }
+	t.Cleanup(func() {
+		getTailscaleIP = originalTailscale
+		getPreferredOutboundIP = originalOutbound
+	})
+
+	var stderr bytes.Buffer
+	addr := selectBindAddr("", 7070, false, &stderr)
+
+	if addr != "100.64.0.5:7070" {
+		t.Errorf("selectBindAddr() = %q, want %q", addr, "100.64.0.5:7070")
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("selectBindAddr() unexpected warning: %s", stderr.String())
+	}
+}
+
+func TestSelectBindAddr_FallsBackToLAN(t *testing.T) {
+	originalTailscale := getTailscaleIP
+	originalOutbound := getPreferredOutboundIP
+	getTailscaleIP = func() string { return "" }
+	getPreferredOutboundIP = func() string { return "192.168.1.10" }
+	t.Cleanup(func() {
+		getTailscaleIP = originalTailscale
+		getPreferredOutboundIP = originalOutbound
+	})
+
+	var stderr bytes.Buffer
+	addr := selectBindAddr("", 7071, false, &stderr)
+
+	if addr != "192.168.1.10:7071" {
+		t.Errorf("selectBindAddr() = %q, want %q", addr, "192.168.1.10:7071")
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("selectBindAddr() unexpected warning: %s", stderr.String())
+	}
+}
+
+func TestSelectBindAddr_WarnsOnLocalhostFallback(t *testing.T) {
+	originalTailscale := getTailscaleIP
+	originalOutbound := getPreferredOutboundIP
+	getTailscaleIP = func() string { return "" }
+	getPreferredOutboundIP = func() string { return "" }
+	t.Cleanup(func() {
+		getTailscaleIP = originalTailscale
+		getPreferredOutboundIP = originalOutbound
+	})
+
+	var stderr bytes.Buffer
+	addr := selectBindAddr("", 7072, false, &stderr)
+
+	if addr != "127.0.0.1:7072" {
+		t.Errorf("selectBindAddr() = %q, want %q", addr, "127.0.0.1:7072")
+	}
+	if !strings.Contains(stderr.String(), "using localhost") {
+		t.Errorf("selectBindAddr() missing warning, got: %s", stderr.String())
+	}
+}
+
+func TestSelectBindAddr_AddrOverridesPort(t *testing.T) {
+	var stderr bytes.Buffer
+	addr := selectBindAddr("192.168.1.20:7073", 7074, true, &stderr)
+
+	if addr != "192.168.1.20:7073" {
+		t.Errorf("selectBindAddr() = %q, want %q", addr, "192.168.1.20:7073")
+	}
+	if !strings.Contains(stderr.String(), "overrides --port") {
+		t.Errorf("selectBindAddr() missing override warning, got: %s", stderr.String())
 	}
 }
 

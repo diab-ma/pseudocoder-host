@@ -114,8 +114,23 @@ func TestHostStatusHelp(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("expected exit code 0, got %d", code)
 	}
-	if !strings.Contains(stderr.String(), "Usage: pseudocoder host status") {
-		t.Fatalf("expected host status usage, got %q", stderr.String())
+	output := stderr.String()
+	if !strings.Contains(output, "Usage: pseudocoder host status") {
+		t.Fatalf("expected host status usage, got %q", output)
+	}
+	if !strings.Contains(output, "-addr") {
+		t.Fatalf("expected host status addr flag, got %q", output)
+	}
+	if !strings.Contains(output, "-port") {
+		t.Fatalf("expected host status port flag, got %q", output)
+	}
+}
+
+func TestHostStatusInvalidPort(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runHostStatus([]string{"--port", "0"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
 	}
 }
 

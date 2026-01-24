@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -278,14 +279,14 @@ func TestGenerateCodeHandlerLoopbackOnly(t *testing.T) {
 	})
 	handler := NewGenerateCodeHandler(pm)
 
-	// Test various non-loopback addresses that should be rejected
+	// Test various non-local addresses that should be rejected
 	nonLoopbackAddrs := []string{
-		"192.168.1.100:54321",  // Private IPv4
-		"10.0.0.5:54321",       // Private IPv4
-		"172.16.0.1:54321",     // Private IPv4
-		"8.8.8.8:54321",        // Public IPv4
-		"[2001:db8::1]:54321",  // Public IPv6
-		"[fe80::1]:54321",      // Link-local IPv6
+		"192.0.2.10:54321",    // TEST-NET-1
+		"198.51.100.5:54321",  // TEST-NET-2
+		"203.0.113.20:54321",  // TEST-NET-3
+		"8.8.8.8:54321",       // Public IPv4
+		"[2001:db8::1]:54321", // Documentation IPv6
+		"[2001:db8::2]:54321", // Documentation IPv6
 	}
 
 	for _, addr := range nonLoopbackAddrs {
@@ -320,10 +321,13 @@ func TestGenerateCodeHandlerLoopbackAccepted(t *testing.T) {
 
 	// Test various loopback addresses that should be accepted
 	loopbackAddrs := []string{
-		"127.0.0.1:54321",      // Standard IPv4 loopback
-		"127.0.0.2:54321",      // Other 127.x.x.x address
-		"127.255.255.1:54321",  // Another 127.x.x.x address
-		"[::1]:54321",          // IPv6 loopback
+		"127.0.0.1:54321",       // Standard IPv4 loopback
+		"127.0.0.2:54321",       // Other 127.x.x.x address
+		"127.255.255.1:54321",   // Another 127.x.x.x address
+		"[::1]:54321",           // IPv6 loopback
+		"/tmp/pseudocoder.sock", // Unix socket
+		"@pseudocoder.sock",     // Abstract Unix socket
+		"",                      // Unnamed Unix socket
 	}
 
 	for _, addr := range loopbackAddrs {
@@ -350,21 +354,28 @@ func TestIsLoopbackRequest(t *testing.T) {
 		{"127.0.0.2:54321", true},
 		{"127.255.255.255:54321", true},
 		{"[::1]:54321", true},
+		{"/tmp/pseudocoder.sock", true},
+		{"@pseudocoder.sock", true},
+		{"", true},
 
-		// Non-loopback addresses (should return false)
-		{"192.168.1.1:54321", false},
-		{"10.0.0.1:54321", false},
-		{"172.16.0.1:54321", false},
+		// Non-local addresses (should return false)
 		{"8.8.8.8:54321", false},
 		{"0.0.0.0:54321", false},
 		{"[2001:db8::1]:54321", false},
-		{"[fe80::1]:54321", false},
 		{"[::]:54321", false},
 
+		// Local interface addresses (should return false)
+
 		// Edge cases (should return false)
-		{"", false},
 		{"invalid", false},
 		{"no-port", false},
+	}
+
+	if ip := findLocalNonLoopbackIP(); ip != "" {
+		tests = append(tests, struct {
+			remoteAddr string
+			expected   bool
+		}{remoteAddr: net.JoinHostPort(ip, "54321"), expected: false})
 	}
 
 	for _, tt := range tests {
@@ -376,6 +387,38 @@ func TestIsLoopbackRequest(t *testing.T) {
 			t.Errorf("isLoopbackRequest(%q) = %v, expected %v", tt.remoteAddr, result, tt.expected)
 		}
 	}
+}
+
+func findLocalNonLoopbackIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			if ip4 := ip.To4(); ip4 != nil {
+				return ip4.String()
+			}
+			return ip.String()
+		}
+	}
+
+	return ""
 }
 
 // TestPairHandlerDefaultDeviceName tests default device name.

@@ -34,10 +34,13 @@ type StatusResponse struct {
 
 	// RequireAuth indicates whether authentication is required for WebSocket connections.
 	RequireAuth bool `json:"require_auth"`
+
+	// PairSocketPath is the path to the pairing IPC socket, or empty if unavailable.
+	PairSocketPath string `json:"pair_socket_path,omitempty"`
 }
 
 // StatusHandler handles HTTP requests for host status.
-// This endpoint is restricted to loopback addresses for security.
+// This endpoint is restricted to local machine addresses for security.
 // It provides information needed by the "pseudocoder host status" CLI command.
 type StatusHandler struct {
 	server      *Server
@@ -46,6 +49,7 @@ type StatusHandler struct {
 	branch      string
 	tlsEnabled  bool
 	requireAuth bool
+	pairSocket  string
 }
 
 // NewStatusHandler creates a new StatusHandler.
@@ -57,7 +61,8 @@ type StatusHandler struct {
 //   - branch: Current git branch
 //   - tlsEnabled: Whether TLS is enabled
 //   - requireAuth: Whether authentication is required
-func NewStatusHandler(s *Server, repoPath, branch string, tlsEnabled, requireAuth bool) *StatusHandler {
+//   - pairSocketPath: Path to the pairing IPC socket (empty if unavailable)
+func NewStatusHandler(s *Server, repoPath, branch string, tlsEnabled, requireAuth bool, pairSocketPath string) *StatusHandler {
 	return &StatusHandler{
 		server:      s,
 		startTime:   time.Now(),
@@ -65,21 +70,22 @@ func NewStatusHandler(s *Server, repoPath, branch string, tlsEnabled, requireAut
 		branch:      branch,
 		tlsEnabled:  tlsEnabled,
 		requireAuth: requireAuth,
+		pairSocket:  pairSocketPath,
 	}
 }
 
 // ServeHTTP handles HTTP GET requests to the /status endpoint.
 // It returns a JSON StatusResponse with current host information.
 //
-// Security: This endpoint only responds to loopback requests (127.0.0.1, ::1).
-// Non-loopback requests receive HTTP 403 Forbidden.
+// Security: This endpoint only responds to local machine requests.
+// Non-local requests receive HTTP 403 Forbidden.
 //
 // Only GET method is allowed; other methods receive HTTP 405 Method Not Allowed.
 func (h *StatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Security: Only allow requests from loopback addresses.
+	// Security: Only allow requests from local machine addresses.
 	// This prevents exposure of status information over the network.
 	if !isLoopbackRequest(r) {
-		http.Error(w, "Forbidden: status endpoint is loopback-only", http.StatusForbidden)
+		http.Error(w, "Forbidden: status endpoint is local-only", http.StatusForbidden)
 		return
 	}
 
@@ -99,6 +105,7 @@ func (h *StatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds:    int64(time.Since(h.startTime).Seconds()),
 		TLSEnabled:       h.tlsEnabled,
 		RequireAuth:      h.requireAuth,
+		PairSocketPath:   h.pairSocket,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
