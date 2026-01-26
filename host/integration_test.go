@@ -57,6 +57,21 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// shortSocketDir creates a short temp directory for Unix sockets.
+// Unix sockets have a path length limit (104 bytes on macOS), so t.TempDir()
+// paths are often too long. This helper creates a short path in /tmp.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "pc-")
+	if err != nil {
+		t.Fatalf("failed to create socket temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+	return dir
+}
+
 type hostProcess struct {
 	cmd    *exec.Cmd
 	stdout bytes.Buffer
@@ -68,6 +83,10 @@ type hostProcess struct {
 func startHost(t *testing.T, addr, sessionCmd string) *hostProcess {
 	t.Helper()
 
+	// Use unique pair socket per test to avoid IPC conflicts between tests.
+	// Use shortSocketDir() for short paths (Unix socket 104-byte limit).
+	pairSocket := filepath.Join(shortSocketDir(t), "pair.sock")
+
 	cmd := exec.Command(
 		binaryPath,
 		"host",
@@ -76,8 +95,10 @@ func startHost(t *testing.T, addr, sessionCmd string) *hostProcess {
 		addr,
 		"--session-cmd",
 		sessionCmd,
-		"--no-tls",            // Use plaintext for basic integration tests
+		"--no-tls",             // Use plaintext for basic integration tests
 		"--require-auth=false", // Disable auth for tests
+		"--pair-socket",
+		pairSocket,
 	)
 	cmd.Dir = moduleDir
 
@@ -312,6 +333,10 @@ func TestIntegrationPortConflictFailsFast(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "session_started.txt")
 	sessionCmd := fmt.Sprintf("echo started > %s", shellEscape(marker))
 
+	// Use unique pair socket to avoid IPC conflict (we want to test port conflict).
+	// Use shortSocketDir() for short paths (Unix socket 104-byte limit).
+	pairSocket := filepath.Join(shortSocketDir(t), "pair.sock")
+
 	cmd := exec.Command(
 		binaryPath,
 		"host",
@@ -320,6 +345,8 @@ func TestIntegrationPortConflictFailsFast(t *testing.T) {
 		addr,
 		"--session-cmd",
 		sessionCmd,
+		"--pair-socket",
+		pairSocket,
 	)
 	cmd.Dir = moduleDir
 	output, err := cmd.CombinedOutput()
@@ -924,6 +951,10 @@ type errorResponse struct {
 func startHostWithAuth(t *testing.T, addr, sessionCmd string) *hostProcess {
 	t.Helper()
 
+	// Use unique pair socket per test to avoid IPC conflicts between tests.
+	// Use shortSocketDir() for short paths (Unix socket 104-byte limit).
+	pairSocket := filepath.Join(shortSocketDir(t), "pair.sock")
+
 	cmd := exec.Command(
 		binaryPath,
 		"host",
@@ -932,6 +963,7 @@ func startHostWithAuth(t *testing.T, addr, sessionCmd string) *hostProcess {
 		"--session-cmd", sessionCmd,
 		"--require-auth",
 		"--no-tls", // Use plaintext for auth integration tests
+		"--pair-socket", pairSocket,
 	)
 	cmd.Dir = moduleDir
 
@@ -1296,6 +1328,10 @@ func startHostWithTLS(t *testing.T, addr, sessionCmd, certDir string) *hostProce
 	certPath := filepath.Join(certDir, "host.crt")
 	keyPath := filepath.Join(certDir, "host.key")
 
+	// Use unique pair socket per test to avoid IPC conflicts between tests.
+	// Use shortSocketDir() for short paths (Unix socket 104-byte limit).
+	pairSocket := filepath.Join(shortSocketDir(t), "pair.sock")
+
 	cmd := exec.Command(
 		binaryPath,
 		"host",
@@ -1305,6 +1341,7 @@ func startHostWithTLS(t *testing.T, addr, sessionCmd, certDir string) *hostProce
 		"--tls-cert", certPath,
 		"--tls-key", keyPath,
 		"--require-auth=false",
+		"--pair-socket", pairSocket,
 	)
 	cmd.Dir = moduleDir
 
