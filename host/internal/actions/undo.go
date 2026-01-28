@@ -137,22 +137,54 @@ func (p *Processor) ProcessUndo(cardID string, confirmed bool) (*storage.Decided
 // On success, the chunk is removed from decided storage and its status is restored.
 // Returns the restored chunk and parent card information for re-emission to clients.
 //
+// contentHash is preferred over chunkIndex for stable identity. When provided, the
+// chunk is looked up and deleted by hash instead of index. This prevents undo failures
+// when chunk indices shift after staging (the host's diff poller uses IncludeStaged=false).
+//
 // Returns a CodedError with appropriate error code:
 //   - storage.not_found if the chunk doesn't exist in decided storage
 //   - undo.already_pending if the chunk is already pending
 //   - undo.conflict if the patch fails to apply
 //   - undo.base_missing if the file state doesn't match patch assumptions
-func (p *Processor) ProcessChunkUndo(cardID string, chunkIndex int, confirmed bool) (*storage.DecidedChunk, *storage.DecidedCard, error) {
+func (p *Processor) ProcessChunkUndo(cardID string, chunkIndex int, contentHash string, confirmed bool) (*storage.DecidedChunk, *storage.DecidedCard, error) {
 	// Ensure decided store is available
 	if p.decidedStore == nil {
 		return nil, nil, apperrors.New(apperrors.CodeInternal, "decided store not configured")
 	}
 
-	// Retrieve the decided chunk
-	chunk, err := p.decidedStore.GetDecidedChunk(cardID, chunkIndex)
-	if err != nil {
-		return nil, nil, apperrors.Wrap(apperrors.CodeInternal, "failed to get decided chunk", err)
+	// Retrieve the decided chunk - prefer lookup by contentHash when available.
+	// Fall back to index-based lookup for legacy decided chunks (pre-content_hash migration)
+	// where DB rows have NULL content_hash.
+	var chunk *storage.DecidedChunk
+	var err error
+
+	if contentHash != "" {
+		chunk, err = p.decidedStore.GetDecidedChunkByHash(cardID, contentHash)
+		if err != nil {
+			return nil, nil, apperrors.Wrap(apperrors.CodeInternal, "failed to get decided chunk by hash", err)
+		}
+		// Legacy fallback: hash lookup returned nil but index is valid.
+		// This handles decided chunks saved before content_hash migration (NULL hash in DB).
+		// IMPORTANT: Only match legacy rows with NULL content_hash to avoid undoing
+		// the wrong chunk when multiple chunks share the same index under v8 schema.
+		if chunk == nil && chunkIndex >= 0 {
+			log.Printf("actions: hash lookup returned nil for %s hash=%s, falling back to legacy index %d",
+				cardID, contentHash, chunkIndex)
+			chunk, err = p.decidedStore.GetLegacyDecidedChunk(cardID, chunkIndex)
+			if err != nil {
+				return nil, nil, apperrors.Wrap(apperrors.CodeInternal, "failed to get legacy decided chunk", err)
+			}
+		}
+	} else {
+		// No contentHash provided (legacy client). Only match truly legacy chunks
+		// (NULL hash in DB) to avoid undoing the wrong chunk when v8 schema allows
+		// multiple rows per (card_id, chunk_index) with different hashes.
+		chunk, err = p.decidedStore.GetLegacyDecidedChunk(cardID, chunkIndex)
+		if err != nil {
+			return nil, nil, apperrors.Wrap(apperrors.CodeInternal, "failed to get legacy decided chunk", err)
+		}
 	}
+
 	if chunk == nil {
 		return nil, nil, apperrors.NotFound("decided chunk")
 	}
@@ -207,39 +239,53 @@ func (p *Processor) ProcessChunkUndo(cardID string, chunkIndex int, confirmed bo
 	// Git operation succeeded - restore the chunk to pending in chunk store.
 	// The card and chunks may have been deleted when all chunks were decided,
 	// so we need to check and recreate them if necessary.
+	//
+	// IMPORTANT: Use chunk.ChunkIndex (from the decided chunk we found) instead of
+	// the request's chunkIndex. When looking up by content_hash, the request's index
+	// may be stale if indices shifted after staging.
+	decidedIndex := chunk.ChunkIndex
 	if p.chunkStore != nil {
 		// First, check if the chunk exists in active storage
-		existingChunk, err := p.chunkStore.GetChunk(cardID, chunkIndex)
+		existingChunk, err := p.chunkStore.GetChunk(cardID, decidedIndex)
 		if err != nil {
-			log.Printf("actions: failed to check chunk existence %s:%d: %v", cardID, chunkIndex, err)
+			log.Printf("actions: failed to check chunk existence %s:%d: %v", cardID, decidedIndex, err)
 		}
 
 		if existingChunk == nil {
 			// Chunk doesn't exist - card and chunks were likely deleted when all were decided.
 			// We need to recreate the card and all chunks from the decided card's original diff.
-			log.Printf("actions: chunk %s:%d not found in active storage, recreating card and chunks", cardID, chunkIndex)
-			p.recreateCardAndChunksFromDecided(cardID, card, chunkIndex)
+			log.Printf("actions: chunk %s:%d not found in active storage, recreating card and chunks", cardID, decidedIndex)
+			p.recreateCardAndChunksFromDecided(cardID, card, decidedIndex)
 		} else {
 			// Chunk exists - just update its status to pending
 			restoredDecision := &storage.ChunkDecision{
 				CardID:     cardID,
-				ChunkIndex: chunkIndex,
+				ChunkIndex: decidedIndex,
 				Status:     storage.CardPending,
 				Timestamp:  time.Now(),
 			}
 			if err := p.chunkStore.RecordChunkDecision(restoredDecision); err != nil {
-				log.Printf("actions: failed to restore chunk %s:%d to pending: %v", cardID, chunkIndex, err)
+				log.Printf("actions: failed to restore chunk %s:%d to pending: %v", cardID, decidedIndex, err)
 			}
 		}
 	}
 
 	// Delete the chunk from decided storage
 	// Note: We delete the single chunk, not all chunks for the card
-	if err := p.decidedStore.DeleteDecidedChunk(cardID, chunkIndex); err != nil {
-		log.Printf("actions: failed to delete decided chunk %s:%d after undo: %v", cardID, chunkIndex, err)
+	// Prefer deletion by contentHash when available for stable identity
+	if chunk.ContentHash != "" {
+		if err := p.decidedStore.DeleteDecidedChunkByHash(cardID, chunk.ContentHash); err != nil {
+			log.Printf("actions: failed to delete decided chunk %s hash=%s after undo: %v", cardID, chunk.ContentHash, err)
+		}
+	} else {
+		// Legacy chunk (pre-content_hash migration): use safe delete that only removes
+		// rows with NULL content_hash to avoid accidentally deleting newer rows.
+		if err := p.decidedStore.DeleteLegacyDecidedChunk(cardID, chunk.ChunkIndex); err != nil {
+			log.Printf("actions: failed to delete legacy decided chunk %s:%d after undo: %v", cardID, chunk.ChunkIndex, err)
+		}
 	}
 
-	log.Printf("actions: chunk undo completed for %s:%d (was %s)", cardID, chunkIndex, chunk.Status)
+	log.Printf("actions: chunk undo completed for %s:%d hash=%s (was %s)", cardID, chunk.ChunkIndex, chunk.ContentHash, chunk.Status)
 
 	return chunk, card, nil
 }

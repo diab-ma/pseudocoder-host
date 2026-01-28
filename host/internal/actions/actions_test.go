@@ -2091,8 +2091,8 @@ func TestProcessChunkUndo_AcceptedChunk(t *testing.T) {
 	processor.SetDecidedStore(store)
 	processor.SetChunkStore(store)
 
-	// Undo the chunk
-	chunk, card, err := processor.ProcessChunkUndo("card-chunk-undo", 0, false)
+	// Undo the chunk (empty contentHash falls back to index lookup)
+	chunk, card, err := processor.ProcessChunkUndo("card-chunk-undo", 0, "", false)
 	if err != nil {
 		t.Fatalf("ProcessChunkUndo failed: %v", err)
 	}

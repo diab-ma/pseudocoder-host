@@ -250,7 +250,12 @@ func (s *SQLiteStore) DeleteDecidedCard(id string) error {
 }
 
 // SaveDecidedChunk archives a chunk after a per-chunk decision.
-// Uses INSERT OR REPLACE to handle updates (e.g., marking as committed).
+// Uses content_hash as primary identity when available (stable across index shifts).
+// Falls back to plain INSERT for legacy chunks without content_hash.
+//
+// Schema (V8): decided_chunks uses auto-increment id as primary key with UNIQUE
+// constraint on (card_id, content_hash). This allows multiple rows per card with
+// the same chunk_index but different content_hash (happens when indices shift after staging).
 func (s *SQLiteStore) SaveDecidedChunk(chunk *DecidedChunk) error {
 	if chunk == nil {
 		return errors.New("decided chunk cannot be nil")
@@ -259,7 +264,8 @@ func (s *SQLiteStore) SaveDecidedChunk(chunk *DecidedChunk) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	log.Printf("storage: saving decided chunk %s:%d (status=%s)", chunk.CardID, chunk.ChunkIndex, chunk.Status)
+	log.Printf("storage: saving decided chunk %s:%d hash=%s (status=%s)",
+		chunk.CardID, chunk.ChunkIndex, chunk.ContentHash, chunk.Status)
 
 	decidedAt := chunk.DecidedAt.Format(time.RFC3339Nano)
 	var commitHash sql.NullString
@@ -270,22 +276,80 @@ func (s *SQLiteStore) SaveDecidedChunk(chunk *DecidedChunk) error {
 	if chunk.CommittedAt != nil {
 		committedAt = sql.NullString{String: chunk.CommittedAt.Format(time.RFC3339Nano), Valid: true}
 	}
+	var contentHash sql.NullString
+	if chunk.ContentHash != "" {
+		contentHash = sql.NullString{String: chunk.ContentHash, Valid: true}
+	}
 
-	const query = `
-		INSERT OR REPLACE INTO decided_chunks
-			(card_id, chunk_index, patch, status, decided_at, commit_hash, committed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`
+	var query string
+	var args []interface{}
 
-	_, err := s.db.Exec(query,
-		chunk.CardID,
-		chunk.ChunkIndex,
-		chunk.Patch,
-		string(chunk.Status),
-		decidedAt,
-		commitHash,
-		committedAt,
-	)
+	if chunk.ContentHash != "" {
+		// Content-hash based upsert: check if row exists by (card_id, content_hash).
+		// If exists, UPDATE (chunk_index may have shifted). If not, INSERT.
+		var existingID int
+		err := s.db.QueryRow(
+			"SELECT id FROM decided_chunks WHERE card_id = ? AND content_hash = ?",
+			chunk.CardID, chunk.ContentHash,
+		).Scan(&existingID)
+		if err == nil {
+			// Update existing row by content_hash
+			query = `
+				UPDATE decided_chunks
+				SET chunk_index = ?, patch = ?, status = ?, decided_at = ?, commit_hash = ?, committed_at = ?
+				WHERE card_id = ? AND content_hash = ?
+			`
+			args = []interface{}{
+				chunk.ChunkIndex,
+				chunk.Patch,
+				string(chunk.Status),
+				decidedAt,
+				commitHash,
+				committedAt,
+				chunk.CardID,
+				chunk.ContentHash,
+			}
+		} else if errors.Is(err, sql.ErrNoRows) {
+			// Insert new row
+			query = `
+				INSERT INTO decided_chunks
+					(card_id, chunk_index, content_hash, patch, status, decided_at, commit_hash, committed_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`
+			args = []interface{}{
+				chunk.CardID,
+				chunk.ChunkIndex,
+				contentHash,
+				chunk.Patch,
+				string(chunk.Status),
+				decidedAt,
+				commitHash,
+				committedAt,
+			}
+		} else {
+			return fmt.Errorf("check existing chunk: %w", err)
+		}
+	} else {
+		// Legacy path: no content_hash, plain INSERT.
+		// With V8 schema (id as PK), no upsert by chunk_index.
+		query = `
+			INSERT INTO decided_chunks
+				(card_id, chunk_index, content_hash, patch, status, decided_at, commit_hash, committed_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`
+		args = []interface{}{
+			chunk.CardID,
+			chunk.ChunkIndex,
+			contentHash,
+			chunk.Patch,
+			string(chunk.Status),
+			decidedAt,
+			commitHash,
+			committedAt,
+		}
+	}
+
+	_, err := s.db.Exec(query, args...)
 	if err != nil {
 		return fmt.Errorf("save decided chunk: %w", err)
 	}
@@ -295,12 +359,13 @@ func (s *SQLiteStore) SaveDecidedChunk(chunk *DecidedChunk) error {
 
 // GetDecidedChunk retrieves an archived chunk by card ID and index.
 // Returns nil, nil if the chunk does not exist.
+// Note: Prefer GetDecidedChunkByHash when content_hash is available for stable identity.
 func (s *SQLiteStore) GetDecidedChunk(cardID string, chunkIndex int) (*DecidedChunk, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	const query = `
-		SELECT card_id, chunk_index, patch, status, decided_at, commit_hash, committed_at
+		SELECT card_id, chunk_index, content_hash, patch, status, decided_at, commit_hash, committed_at
 		FROM decided_chunks
 		WHERE card_id = ? AND chunk_index = ?
 	`
@@ -317,6 +382,63 @@ func (s *SQLiteStore) GetDecidedChunk(cardID string, chunkIndex int) (*DecidedCh
 	return chunk, nil
 }
 
+// GetDecidedChunkByHash retrieves an archived chunk by card ID and content hash.
+// Returns nil, nil if the chunk does not exist.
+// Preferred over GetDecidedChunk when content_hash is available for stable identity.
+func (s *SQLiteStore) GetDecidedChunkByHash(cardID string, contentHash string) (*DecidedChunk, error) {
+	if contentHash == "" {
+		return nil, errors.New("content_hash cannot be empty")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	const query = `
+		SELECT card_id, chunk_index, content_hash, patch, status, decided_at, commit_hash, committed_at
+		FROM decided_chunks
+		WHERE card_id = ? AND content_hash = ?
+	`
+
+	row := s.db.QueryRow(query, cardID, contentHash)
+	chunk, err := s.scanDecidedChunkRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get decided chunk by hash: %w", err)
+	}
+
+	return chunk, nil
+}
+
+// GetLegacyDecidedChunk retrieves a legacy archived chunk by card ID and index.
+// Only returns chunks with NULL content_hash (saved before content_hash migration).
+// Returns nil, nil if no legacy chunk exists at that index.
+// This is used for safe fallback when hash lookup fails - avoids matching
+// newer chunks with different hashes that happen to share the same index.
+func (s *SQLiteStore) GetLegacyDecidedChunk(cardID string, chunkIndex int) (*DecidedChunk, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	const query = `
+		SELECT card_id, chunk_index, content_hash, patch, status, decided_at, commit_hash, committed_at
+		FROM decided_chunks
+		WHERE card_id = ? AND chunk_index = ? AND content_hash IS NULL
+	`
+
+	row := s.db.QueryRow(query, cardID, chunkIndex)
+	chunk, err := s.scanDecidedChunkRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get legacy decided chunk: %w", err)
+	}
+
+	log.Printf("storage: found legacy decided chunk %s:%d (NULL hash)", cardID, chunkIndex)
+	return chunk, nil
+}
+
 // GetDecidedChunks retrieves all archived chunks for a card.
 // Results are ordered by chunk_index.
 func (s *SQLiteStore) GetDecidedChunks(cardID string) ([]*DecidedChunk, error) {
@@ -324,7 +446,7 @@ func (s *SQLiteStore) GetDecidedChunks(cardID string) ([]*DecidedChunk, error) {
 	defer s.mu.RUnlock()
 
 	const query = `
-		SELECT card_id, chunk_index, patch, status, decided_at, commit_hash, committed_at
+		SELECT card_id, chunk_index, content_hash, patch, status, decided_at, commit_hash, committed_at
 		FROM decided_chunks
 		WHERE card_id = ?
 		ORDER BY chunk_index ASC
@@ -394,8 +516,9 @@ func (s *SQLiteStore) MarkChunksCommitted(cardID string, chunkIndexes []int, com
 	return nil
 }
 
-// DeleteDecidedChunk removes a single archived chunk.
+// DeleteDecidedChunk removes a single archived chunk by index.
 // This is used when undoing a single chunk decision.
+// Note: Prefer DeleteDecidedChunkByHash when content_hash is available for stable identity.
 func (s *SQLiteStore) DeleteDecidedChunk(cardID string, chunkIndex int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -405,6 +528,58 @@ func (s *SQLiteStore) DeleteDecidedChunk(cardID string, chunkIndex int) error {
 	_, err := s.db.Exec("DELETE FROM decided_chunks WHERE card_id = ? AND chunk_index = ?", cardID, chunkIndex)
 	if err != nil {
 		return fmt.Errorf("delete decided chunk: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteLegacyDecidedChunk removes a legacy archived chunk (one with NULL content_hash).
+// This is safe to call even with schema v8 (multiple rows per card_id + chunk_index)
+// because it only deletes rows where content_hash IS NULL.
+// Use this instead of DeleteDecidedChunk for legacy chunks to avoid accidentally
+// deleting newer rows that have a content_hash.
+func (s *SQLiteStore) DeleteLegacyDecidedChunk(cardID string, chunkIndex int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	log.Printf("storage: deleting legacy decided chunk %s:%d (NULL hash only)", cardID, chunkIndex)
+
+	result, err := s.db.Exec(
+		"DELETE FROM decided_chunks WHERE card_id = ? AND chunk_index = ? AND content_hash IS NULL",
+		cardID, chunkIndex,
+	)
+	if err != nil {
+		return fmt.Errorf("delete legacy decided chunk: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		log.Printf("storage: no legacy decided chunk found with card_id=%s chunk_index=%d", cardID, chunkIndex)
+	}
+
+	return nil
+}
+
+// DeleteDecidedChunkByHash removes a single archived chunk by content hash.
+// Preferred over DeleteDecidedChunk when content_hash is available for stable identity.
+func (s *SQLiteStore) DeleteDecidedChunkByHash(cardID string, contentHash string) error {
+	if contentHash == "" {
+		return errors.New("content_hash cannot be empty")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	log.Printf("storage: deleting decided chunk %s hash=%s", cardID, contentHash)
+
+	result, err := s.db.Exec("DELETE FROM decided_chunks WHERE card_id = ? AND content_hash = ?", cardID, contentHash)
+	if err != nil {
+		return fmt.Errorf("delete decided chunk by hash: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		log.Printf("storage: no decided chunk found with card_id=%s content_hash=%s", cardID, contentHash)
 	}
 
 	return nil
@@ -527,6 +702,7 @@ func (s *SQLiteStore) scanDecidedChunkRow(row *sql.Row) (*DecidedChunk, error) {
 		chunk       DecidedChunk
 		status      string
 		decidedAt   string
+		contentHash sql.NullString
 		commitHash  sql.NullString
 		committedAt sql.NullString
 	)
@@ -534,6 +710,7 @@ func (s *SQLiteStore) scanDecidedChunkRow(row *sql.Row) (*DecidedChunk, error) {
 	err := row.Scan(
 		&chunk.CardID,
 		&chunk.ChunkIndex,
+		&contentHash,
 		&chunk.Patch,
 		&status,
 		&decidedAt,
@@ -545,6 +722,10 @@ func (s *SQLiteStore) scanDecidedChunkRow(row *sql.Row) (*DecidedChunk, error) {
 	}
 
 	chunk.Status = CardStatus(status)
+
+	if contentHash.Valid {
+		chunk.ContentHash = contentHash.String
+	}
 
 	t, err := time.Parse(time.RFC3339Nano, decidedAt)
 	if err != nil {
@@ -573,6 +754,7 @@ func (s *SQLiteStore) scanDecidedChunkRows(rows *sql.Rows) (*DecidedChunk, error
 		chunk       DecidedChunk
 		status      string
 		decidedAt   string
+		contentHash sql.NullString
 		commitHash  sql.NullString
 		committedAt sql.NullString
 	)
@@ -580,6 +762,7 @@ func (s *SQLiteStore) scanDecidedChunkRows(rows *sql.Rows) (*DecidedChunk, error
 	err := rows.Scan(
 		&chunk.CardID,
 		&chunk.ChunkIndex,
+		&contentHash,
 		&chunk.Patch,
 		&status,
 		&decidedAt,
@@ -591,6 +774,10 @@ func (s *SQLiteStore) scanDecidedChunkRows(rows *sql.Rows) (*DecidedChunk, error
 	}
 
 	chunk.Status = CardStatus(status)
+
+	if contentHash.Valid {
+		chunk.ContentHash = contentHash.String
+	}
 
 	t, err := time.Parse(time.RFC3339Nano, decidedAt)
 	if err != nil {

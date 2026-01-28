@@ -183,12 +183,20 @@ func (p *Processor) ProcessChunkDecision(cardID string, chunkIndex int, action s
 			}
 		}
 
+		// Use the contentHash passed to the function for stable identity.
+		// If not provided, compute it from chunk content for consistency.
+		chunkContentHash := contentHash
+		if chunkContentHash == "" && chunk != nil {
+			chunkContentHash = hashChunkContent(chunk.Content)
+		}
+
 		decidedChunk := &storage.DecidedChunk{
-			CardID:     cardID,
-			ChunkIndex: chunkIndex,
-			Patch:      patch,
-			Status:     status,
-			DecidedAt:  time.Now(),
+			CardID:      cardID,
+			ChunkIndex:  chunkIndex,
+			ContentHash: chunkContentHash, // Stable identity for undo operations
+			Patch:       patch,
+			Status:      status,
+			DecidedAt:   time.Now(),
 		}
 
 		if err := p.decidedStore.SaveDecidedChunk(decidedChunk); err != nil {

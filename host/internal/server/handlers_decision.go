@@ -86,6 +86,7 @@ func (c *Client) handleChunkDecision(data []byte) {
 	}
 
 	payload := msg.Payload
+
 	if payload.CardID == "" {
 		log.Printf("chunk.decision missing card_id")
 		c.sendChunkDecisionResult("", payload.ChunkIndex, payload.Action, false,

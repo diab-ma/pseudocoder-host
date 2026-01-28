@@ -131,6 +131,7 @@ func (c *Client) handleReviewUndo(data []byte) {
 // handleChunkUndo processes a chunk.undo message from the client.
 // This reverses a previous per-chunk accept/reject decision.
 // Phase 20.2: Enables per-chunk undo flow from mobile.
+// ContentHash is preferred over ChunkIndex for stable identity (indices can shift after staging).
 func (c *Client) handleChunkUndo(data []byte) {
 	// Parse the full message with the typed payload
 	var msg struct {
@@ -159,25 +160,35 @@ func (c *Client) handleChunkUndo(data []byte) {
 	c.server.mu.RUnlock()
 
 	if handler == nil {
-		log.Printf("No chunk undo handler registered, ignoring undo for card %s chunk %d",
-			payload.CardID, payload.ChunkIndex)
-		c.sendUndoResult(payload.CardID, payload.ChunkIndex, false,
+		log.Printf("No chunk undo handler registered, ignoring undo for card %s chunk %d hash=%s",
+			payload.CardID, payload.ChunkIndex, payload.ContentHash)
+		c.sendUndoResultWithHash(payload.CardID, payload.ChunkIndex, payload.ContentHash, false,
 			apperrors.CodeServerHandlerMissing, "chunk undo handler not configured")
 		return
 	}
 
 	// Call the handler to undo the chunk decision
-	result, err := handler(payload.CardID, payload.ChunkIndex, payload.Confirmed)
+	// ContentHash is preferred for stable identity when available
+	result, err := handler(payload.CardID, payload.ChunkIndex, payload.ContentHash, payload.Confirmed)
 	if err != nil {
-		log.Printf("Chunk undo handler error for card %s chunk %d: %v",
-			payload.CardID, payload.ChunkIndex, err)
+		log.Printf("Chunk undo handler error for card %s chunk %d hash=%s: %v",
+			payload.CardID, payload.ChunkIndex, payload.ContentHash, err)
 		code, message := apperrors.ToCodeAndMessage(err)
-		c.sendUndoResult(payload.CardID, payload.ChunkIndex, false, code, message)
+		// Include content_hash from request so client can clear hash-keyed pending state
+		c.sendUndoResultWithHash(payload.CardID, payload.ChunkIndex, payload.ContentHash, false, code, message)
 		return
 	}
 
-	log.Printf("Chunk undo applied: card=%s chunk=%d file=%s",
-		payload.CardID, payload.ChunkIndex, result.File)
+	// Use result's content_hash if available, otherwise fall back to request's hash.
+	// This handles legacy decided chunks (pre-migration) where the stored hash is empty
+	// but the client sent a hash from the current card's chunkInfo.
+	contentHash := result.ContentHash
+	if contentHash == "" {
+		contentHash = payload.ContentHash
+	}
+
+	log.Printf("Chunk undo applied: card=%s chunk=%d hash=%s file=%s",
+		payload.CardID, payload.ChunkIndex, contentHash, result.File)
 
 	// Note: For chunk undos, we don't re-emit the full card immediately.
 	// The card/chunk state transitions happen in storage, and the mobile
@@ -185,6 +196,11 @@ func (c *Client) handleChunkUndo(data []byte) {
 	// If the card needs to be re-emitted (all chunks now pending), the
 	// handler should handle that via the broadcaster.
 
-	// Broadcast success result to all clients
-	c.server.Broadcast(NewUndoResultMessage(payload.CardID, payload.ChunkIndex, true, "", ""))
+	// Broadcast success result to all clients, including content_hash for stable identity
+	c.server.Broadcast(NewUndoResultMessageWithHash(
+		payload.CardID,
+		result.ChunkIndex,
+		contentHash,
+		true, "", "",
+	))
 }

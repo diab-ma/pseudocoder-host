@@ -1178,7 +1178,14 @@ type ChunkUndoPayload struct {
 	CardID string `json:"card_id"`
 
 	// ChunkIndex is the zero-based index of the chunk to undo.
+	// Note: When ContentHash is provided, it takes precedence for stable identity
+	// since chunk indices can shift after staging.
 	ChunkIndex int `json:"chunk_index"`
+
+	// ContentHash is the stable identifier for this chunk's content.
+	// When provided, the host prefers lookup by hash over chunk_index.
+	// This prevents undo failures when indices shift after staging.
+	ContentHash string `json:"content_hash,omitempty"`
 
 	// Confirmed indicates explicit user confirmation for committed chunk undo.
 	// Required when undoing chunks that have been committed.
@@ -1192,8 +1199,12 @@ type UndoResultPayload struct {
 	CardID string `json:"card_id"`
 
 	// ChunkIndex is the chunk index if this was a per-chunk undo.
-	// Omitted (zero value) for file-level undos.
-	ChunkIndex int `json:"chunk_index,omitempty"`
+	// Pointer type so 0 is serialized (nil omits the field for file-level undos).
+	ChunkIndex *int `json:"chunk_index,omitempty"`
+
+	// ContentHash is the stable identifier for the chunk that was undone.
+	// Clients should use this to clear pending state when available.
+	ContentHash string `json:"content_hash,omitempty"`
 
 	// Success indicates whether the undo operation succeeded.
 	Success bool `json:"success"`
@@ -1210,16 +1221,26 @@ type UndoResultPayload struct {
 // NewUndoResultMessage creates an undo.result message.
 // For file-level undos, set chunkIndex to -1 (it will be omitted from JSON).
 // For chunk-level undos, set chunkIndex to the actual chunk index.
+// Deprecated: Use NewUndoResultMessageWithHash for chunk-level undos.
 func NewUndoResultMessage(cardID string, chunkIndex int, success bool, errCode, errMsg string) Message {
+	return NewUndoResultMessageWithHash(cardID, chunkIndex, "", success, errCode, errMsg)
+}
+
+// NewUndoResultMessageWithHash creates an undo.result message with content hash.
+// For file-level undos, set chunkIndex to -1 (it will be omitted from JSON).
+// For chunk-level undos, include contentHash for stable identity.
+func NewUndoResultMessageWithHash(cardID string, chunkIndex int, contentHash string, success bool, errCode, errMsg string) Message {
 	payload := UndoResultPayload{
-		CardID:    cardID,
-		Success:   success,
-		ErrorCode: errCode,
-		Error:     errMsg,
+		CardID:      cardID,
+		ContentHash: contentHash,
+		Success:     success,
+		ErrorCode:   errCode,
+		Error:       errMsg,
 	}
-	// Only include chunk index for chunk-level undos (non-negative)
+	// Only include chunk index for chunk-level undos (non-negative).
+	// Use pointer so 0 is serialized (nil omits the field).
 	if chunkIndex >= 0 {
-		payload.ChunkIndex = chunkIndex
+		payload.ChunkIndex = &chunkIndex
 	}
 	return Message{
 		Type:    MessageTypeUndoResult,

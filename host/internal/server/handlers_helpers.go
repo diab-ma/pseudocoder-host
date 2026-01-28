@@ -41,10 +41,19 @@ func (c *Client) sendDeleteResult(cardID string, success bool, errCode, errMsg s
 // sendUndoResult sends an undo result message to this client.
 // For file-level undos, set chunkIndex to -1 (omitted from JSON).
 // For failures, provide both errCode and errMsg. For success, both should be empty.
+// Deprecated: Use sendUndoResultWithHash for chunk-level undos to enable hash-based pending tracking.
 func (c *Client) sendUndoResult(cardID string, chunkIndex int, success bool, errCode, errMsg string) {
+	c.sendUndoResultWithHash(cardID, chunkIndex, "", success, errCode, errMsg)
+}
+
+// sendUndoResultWithHash sends an undo result message with content hash to this client.
+// For file-level undos, set chunkIndex to -1 (omitted from JSON).
+// For chunk-level undos, include contentHash so clients can clear hash-keyed pending state.
+// For failures, provide both errCode and errMsg. For success, both should be empty.
+func (c *Client) sendUndoResultWithHash(cardID string, chunkIndex int, contentHash string, success bool, errCode, errMsg string) {
 	// Use non-blocking send to avoid blocking on slow clients
 	select {
-	case c.send <- NewUndoResultMessage(cardID, chunkIndex, success, errCode, errMsg):
+	case c.send <- NewUndoResultMessageWithHash(cardID, chunkIndex, contentHash, success, errCode, errMsg):
 	default:
 		log.Printf("Warning: client send buffer full, dropping undo result")
 	}

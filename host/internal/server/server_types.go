@@ -71,13 +71,15 @@ type UndoHandler func(cardID string, confirmed bool) (*UndoResult, error)
 // It reverses a previous chunk accept/reject decision.
 // Returns the restored chunk info for re-emission to clients.
 // Phase 20.2: Enables per-chunk undo flow from mobile.
-type ChunkUndoHandler func(cardID string, chunkIndex int, confirmed bool) (*UndoResult, error)
+// contentHash is preferred over chunkIndex for stable identity (indices can shift after staging).
+type ChunkUndoHandler func(cardID string, chunkIndex int, contentHash string, confirmed bool) (*UndoResult, error)
 
 // UndoResult carries the restored card/chunk information after a successful undo.
 // This is used to re-emit the card to connected clients.
 type UndoResult struct {
 	CardID       string
-	ChunkIndex   int // -1 for file-level undo
+	ChunkIndex   int    // -1 for file-level undo
+	ContentHash  string // Stable chunk identifier (returned for client to clear pending state)
 	File         string
 	Diff         string
 	OriginalDiff string // Full diff for card re-emission
