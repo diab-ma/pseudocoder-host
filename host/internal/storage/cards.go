@@ -175,6 +175,60 @@ func (s *SQLiteStore) RecordDecision(decision *Decision) error {
 	return nil
 }
 
+// recordDecisionTx updates a card's status inside an existing transaction.
+// The caller must hold the store mutex via WithTransaction.
+func (s *SQLiteStore) recordDecisionTx(tx *sql.Tx, decision *Decision) error {
+	if decision == nil {
+		return errors.New("decision cannot be nil")
+	}
+
+	log.Printf("storage: recording decision (tx) for card %s (status=%s)", decision.CardID, decision.Status)
+
+	decidedAt := decision.Timestamp.Format(time.RFC3339Nano)
+	const query = `
+		UPDATE review_cards
+		SET status = ?, decided_at = ?, comment = ?
+		WHERE id = ? AND status = 'pending'
+	`
+
+	result, err := tx.Exec(query, string(decision.Status), decidedAt, decision.Comment, decision.CardID)
+	if err != nil {
+		return fmt.Errorf("record decision: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		var status string
+		err := tx.QueryRow("SELECT status FROM review_cards WHERE id = ?", decision.CardID).Scan(&status)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrCardNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("check card status: %w", err)
+		}
+		return ErrAlreadyDecided
+	}
+
+	return nil
+}
+
+// deleteCardTx removes a card inside an existing transaction.
+// The caller must hold the store mutex via WithTransaction.
+func (s *SQLiteStore) deleteCardTx(tx *sql.Tx, id string) error {
+	log.Printf("storage: deleting card (tx) %s", id)
+
+	_, err := tx.Exec("DELETE FROM review_cards WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("delete card: %w", err)
+	}
+
+	return nil
+}
+
 // DeleteCard removes a card from storage.
 // Returns nil if the card does not exist (idempotent delete).
 func (s *SQLiteStore) DeleteCard(id string) error {

@@ -38,6 +38,47 @@ type SQLiteStore struct {
 	mu sync.RWMutex // Guards all database operations for thread safety.
 }
 
+// Transaction defines the operations allowed inside a storage transaction.
+type Transaction interface {
+	RecordDecision(decision *Decision) error
+	DeleteCard(id string) error
+	RecordChunkDecision(decision *ChunkDecision) error
+	DeleteChunks(cardID string) error
+	CountPendingChunks(cardID string) (int, error)
+}
+
+// TxStore exposes transaction-scoped storage helpers.
+// It should only be used inside SQLiteStore.WithTransaction.
+type TxStore struct {
+	store *SQLiteStore
+	tx    *sql.Tx
+}
+
+// RecordDecision updates a card's status inside the transaction.
+func (t *TxStore) RecordDecision(decision *Decision) error {
+	return t.store.recordDecisionTx(t.tx, decision)
+}
+
+// DeleteCard removes a card inside the transaction.
+func (t *TxStore) DeleteCard(id string) error {
+	return t.store.deleteCardTx(t.tx, id)
+}
+
+// RecordChunkDecision updates a chunk's status inside the transaction.
+func (t *TxStore) RecordChunkDecision(decision *ChunkDecision) error {
+	return t.store.recordChunkDecisionTx(t.tx, decision)
+}
+
+// DeleteChunks removes all chunks for a card inside the transaction.
+func (t *TxStore) DeleteChunks(cardID string) error {
+	return t.store.deleteChunksTx(t.tx, cardID)
+}
+
+// CountPendingChunks returns the number of pending chunks inside the transaction.
+func (t *TxStore) CountPendingChunks(cardID string) (int, error) {
+	return t.store.countPendingChunksTx(t.tx, cardID)
+}
+
 // NewSQLiteStore opens or creates a SQLite database at the given path.
 // It initializes the schema if the tables don't exist.
 // The path should be a file path like "/path/to/pseudocoder.db".
@@ -76,4 +117,38 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 func (s *SQLiteStore) Close() error {
 	log.Printf("storage: closing database")
 	return s.db.Close()
+}
+
+// WithTransaction runs the provided callback inside a database transaction.
+// The store mutex is held for the duration to prevent concurrent writes.
+func (s *SQLiteStore) WithTransaction(fn func(tx Transaction) error) error {
+	if fn == nil {
+		return errors.New("transaction callback cannot be nil")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	txStore := &TxStore{
+		store: s,
+		tx:    tx,
+	}
+
+	if err := fn(txStore); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			return fmt.Errorf("rollback transaction: %w (original error: %v)", rbErr, err)
+		}
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+
+	return nil
 }

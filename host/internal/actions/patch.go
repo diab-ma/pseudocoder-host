@@ -79,3 +79,35 @@ func (p *Processor) applyPatch(patch string, cached, reverse bool) error {
 	}
 	return nil
 }
+
+// checkPatch validates a patch using git apply --check.
+// If cached is true, validation is against the index (--cached).
+// If reverse is true, validation checks the reverse application.
+func (p *Processor) checkPatch(patch string, cached, reverse bool) error {
+	args := []string{"apply", "--check"}
+	if cached {
+		args = append(args, "--cached")
+	}
+	if reverse {
+		args = append(args, "--reverse")
+	}
+	args = append(args, "-")
+
+	cmd := exec.Command("git", args...)
+	cmd.Dir = p.repoPath
+	cmd.Stdin = strings.NewReader(patch)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git apply --check failed: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// verifyPatchApplied ensures the patch can be reversed after application.
+// If reverseApplied is true, this checks the forward apply instead.
+func (p *Processor) verifyPatchApplied(patch string, cached, reverseApplied bool) error {
+	// If we applied the patch in reverse, verify forward apply is possible.
+	// Otherwise, verify reverse apply is possible.
+	return p.checkPatch(patch, cached, !reverseApplied)
+}

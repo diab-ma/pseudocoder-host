@@ -166,6 +166,64 @@ func (s *SQLiteStore) RecordChunkDecision(decision *ChunkDecision) error {
 	return nil
 }
 
+// recordChunkDecisionTx updates a chunk's status inside an existing transaction.
+// The caller must hold the store mutex via WithTransaction.
+func (s *SQLiteStore) recordChunkDecisionTx(tx *sql.Tx, decision *ChunkDecision) error {
+	if decision == nil {
+		return errors.New("decision cannot be nil")
+	}
+
+	log.Printf("storage: recording chunk decision (tx) for card %s chunk %d (status=%s)",
+		decision.CardID, decision.ChunkIndex, decision.Status)
+
+	decidedAt := decision.Timestamp.Format(time.RFC3339Nano)
+	const query = `
+		UPDATE card_chunks
+		SET status = ?, decided_at = ?
+		WHERE card_id = ? AND chunk_index = ? AND status = 'pending'
+	`
+
+	result, err := tx.Exec(query, string(decision.Status), decidedAt, decision.CardID, decision.ChunkIndex)
+	if err != nil {
+		return fmt.Errorf("record chunk decision: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		var status string
+		err := tx.QueryRow(
+			"SELECT status FROM card_chunks WHERE card_id = ? AND chunk_index = ?",
+			decision.CardID, decision.ChunkIndex,
+		).Scan(&status)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrChunkNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("check chunk status: %w", err)
+		}
+		return ErrAlreadyDecided
+	}
+
+	return nil
+}
+
+// deleteChunksTx removes all chunks for a card inside an existing transaction.
+// The caller must hold the store mutex via WithTransaction.
+func (s *SQLiteStore) deleteChunksTx(tx *sql.Tx, cardID string) error {
+	log.Printf("storage: deleting chunks (tx) for card %s", cardID)
+
+	_, err := tx.Exec("DELETE FROM card_chunks WHERE card_id = ?", cardID)
+	if err != nil {
+		return fmt.Errorf("delete chunks: %w", err)
+	}
+
+	return nil
+}
+
 // DeleteChunks removes all chunks for a card.
 // Returns nil if no chunks exist (idempotent).
 func (s *SQLiteStore) DeleteChunks(cardID string) error {
@@ -189,6 +247,21 @@ func (s *SQLiteStore) CountPendingChunks(cardID string) (int, error) {
 
 	var count int
 	err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM card_chunks WHERE card_id = ? AND status = 'pending'",
+		cardID,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count pending chunks: %w", err)
+	}
+
+	return count, nil
+}
+
+// countPendingChunksTx returns the number of pending chunks inside an existing transaction.
+// The caller must hold the store mutex via WithTransaction.
+func (s *SQLiteStore) countPendingChunksTx(tx *sql.Tx, cardID string) (int, error) {
+	var count int
+	err := tx.QueryRow(
 		"SELECT COUNT(*) FROM card_chunks WHERE card_id = ? AND status = 'pending'",
 		cardID,
 	).Scan(&count)
