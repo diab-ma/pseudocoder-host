@@ -670,9 +670,9 @@ func TestSchemaVersion(t *testing.T) {
 		t.Fatalf("SchemaVersion failed: %v", err)
 	}
 
-	// Current schema version should be 6 (cards + devices + card_chunks + approval_audit + sessions + decided_cards/chunks tables)
-	if version != 6 {
-		t.Errorf("SchemaVersion = %d, want 6", version)
+	// Current schema version should be 8 (V8 restructured decided_chunks with id as PK)
+	if version != 8 {
+		t.Errorf("SchemaVersion = %d, want 8", version)
 	}
 }
 
@@ -2634,4 +2634,382 @@ func TestUpdateLastSeenRapidUpdates(t *testing.T) {
 	}
 
 	t.Logf("Completed %d concurrent updates in %v", numUpdates, elapsed)
+}
+
+// -----------------------------------------------------------------------------
+// Decided Chunks Tests (V8 Schema)
+// -----------------------------------------------------------------------------
+
+// TestDecidedChunkSaveAndGet verifies basic decided chunk save and retrieve.
+func TestDecidedChunkSaveAndGet(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().Truncate(time.Millisecond)
+	chunk := &DecidedChunk{
+		CardID:      "card-1",
+		ChunkIndex:  0,
+		ContentHash: "abc123",
+		Patch:       "patch content",
+		Status:      CardAccepted,
+		DecidedAt:   now,
+	}
+
+	if err := store.SaveDecidedChunk(chunk); err != nil {
+		t.Fatalf("SaveDecidedChunk failed: %v", err)
+	}
+
+	// Get by hash (preferred)
+	found, err := store.GetDecidedChunkByHash("card-1", "abc123")
+	if err != nil {
+		t.Fatalf("GetDecidedChunkByHash failed: %v", err)
+	}
+	if found == nil {
+		t.Fatal("chunk not found by hash")
+	}
+	if found.ChunkIndex != 0 {
+		t.Errorf("ChunkIndex = %d, want 0", found.ChunkIndex)
+	}
+	if found.ContentHash != "abc123" {
+		t.Errorf("ContentHash = %s, want abc123", found.ContentHash)
+	}
+
+	// Get by index (backward compat)
+	found2, err := store.GetDecidedChunk("card-1", 0)
+	if err != nil {
+		t.Fatalf("GetDecidedChunk failed: %v", err)
+	}
+	if found2 == nil {
+		t.Fatal("chunk not found by index")
+	}
+}
+
+// TestDecidedChunkSameIndexDifferentHash verifies that two chunks with the
+// same chunk_index but different content_hash can both persist (V8 schema).
+// This is the key fix for the undo spinner bug.
+func TestDecidedChunkSameIndexDifferentHash(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+
+	// Save first chunk with index 0
+	chunk1 := &DecidedChunk{
+		CardID:      "card-1",
+		ChunkIndex:  0,
+		ContentHash: "hash-aaa",
+		Patch:       "patch 1",
+		Status:      CardAccepted,
+		DecidedAt:   now,
+	}
+	if err := store.SaveDecidedChunk(chunk1); err != nil {
+		t.Fatalf("SaveDecidedChunk chunk1 failed: %v", err)
+	}
+
+	// Save second chunk with SAME index 0 but DIFFERENT hash
+	// This simulates what happens when chunk indices shift after staging
+	chunk2 := &DecidedChunk{
+		CardID:      "card-1",
+		ChunkIndex:  0, // Same index as chunk1
+		ContentHash: "hash-bbb",
+		Patch:       "patch 2",
+		Status:      CardRejected,
+		DecidedAt:   now,
+	}
+	if err := store.SaveDecidedChunk(chunk2); err != nil {
+		t.Fatalf("SaveDecidedChunk chunk2 failed: %v", err)
+	}
+
+	// Both chunks should exist and be retrievable by hash
+	found1, err := store.GetDecidedChunkByHash("card-1", "hash-aaa")
+	if err != nil {
+		t.Fatalf("GetDecidedChunkByHash hash-aaa failed: %v", err)
+	}
+	if found1 == nil {
+		t.Fatal("chunk1 not found by hash after saving chunk2 with same index")
+	}
+	if found1.Patch != "patch 1" {
+		t.Errorf("chunk1 Patch = %s, want 'patch 1'", found1.Patch)
+	}
+	if found1.Status != CardAccepted {
+		t.Errorf("chunk1 Status = %s, want accepted", found1.Status)
+	}
+
+	found2, err := store.GetDecidedChunkByHash("card-1", "hash-bbb")
+	if err != nil {
+		t.Fatalf("GetDecidedChunkByHash hash-bbb failed: %v", err)
+	}
+	if found2 == nil {
+		t.Fatal("chunk2 not found by hash")
+	}
+	if found2.Patch != "patch 2" {
+		t.Errorf("chunk2 Patch = %s, want 'patch 2'", found2.Patch)
+	}
+	if found2.Status != CardRejected {
+		t.Errorf("chunk2 Status = %s, want rejected", found2.Status)
+	}
+
+	// GetDecidedChunks should return both
+	all, err := store.GetDecidedChunks("card-1")
+	if err != nil {
+		t.Fatalf("GetDecidedChunks failed: %v", err)
+	}
+	if len(all) != 2 {
+		t.Errorf("expected 2 chunks, got %d", len(all))
+	}
+}
+
+// TestDecidedChunkDeleteByHash verifies that undo by content_hash deletes
+// only the correct chunk when multiple chunks have the same index.
+func TestDecidedChunkDeleteByHash(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+
+	// Save two chunks with same index but different hashes
+	chunk1 := &DecidedChunk{
+		CardID:      "card-1",
+		ChunkIndex:  0,
+		ContentHash: "hash-aaa",
+		Patch:       "patch 1",
+		Status:      CardAccepted,
+		DecidedAt:   now,
+	}
+	if err := store.SaveDecidedChunk(chunk1); err != nil {
+		t.Fatalf("SaveDecidedChunk chunk1 failed: %v", err)
+	}
+
+	chunk2 := &DecidedChunk{
+		CardID:      "card-1",
+		ChunkIndex:  0,
+		ContentHash: "hash-bbb",
+		Patch:       "patch 2",
+		Status:      CardRejected,
+		DecidedAt:   now,
+	}
+	if err := store.SaveDecidedChunk(chunk2); err != nil {
+		t.Fatalf("SaveDecidedChunk chunk2 failed: %v", err)
+	}
+
+	// Delete chunk1 by hash
+	if err := store.DeleteDecidedChunkByHash("card-1", "hash-aaa"); err != nil {
+		t.Fatalf("DeleteDecidedChunkByHash failed: %v", err)
+	}
+
+	// chunk1 should be gone
+	found1, err := store.GetDecidedChunkByHash("card-1", "hash-aaa")
+	if err != nil {
+		t.Fatalf("GetDecidedChunkByHash after delete failed: %v", err)
+	}
+	if found1 != nil {
+		t.Error("chunk1 should be deleted but was found")
+	}
+
+	// chunk2 should still exist
+	found2, err := store.GetDecidedChunkByHash("card-1", "hash-bbb")
+	if err != nil {
+		t.Fatalf("GetDecidedChunkByHash chunk2 failed: %v", err)
+	}
+	if found2 == nil {
+		t.Error("chunk2 should still exist but was not found")
+	}
+}
+
+// TestDecidedChunkUpdateByHash verifies that saving a chunk with an existing
+// content_hash updates the row instead of creating a duplicate.
+func TestDecidedChunkUpdateByHash(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+
+	// Save initial chunk
+	chunk := &DecidedChunk{
+		CardID:      "card-1",
+		ChunkIndex:  0,
+		ContentHash: "hash-aaa",
+		Patch:       "patch v1",
+		Status:      CardAccepted,
+		DecidedAt:   now,
+	}
+	if err := store.SaveDecidedChunk(chunk); err != nil {
+		t.Fatalf("SaveDecidedChunk failed: %v", err)
+	}
+
+	// Update the same chunk (same hash) with new data
+	// Simulate chunk_index shifting from 0 to 1 after staging
+	chunk.ChunkIndex = 1
+	chunk.Status = CardCommitted
+	chunk.Patch = "patch v2"
+	if err := store.SaveDecidedChunk(chunk); err != nil {
+		t.Fatalf("SaveDecidedChunk update failed: %v", err)
+	}
+
+	// Should be only one chunk with that hash
+	all, err := store.GetDecidedChunks("card-1")
+	if err != nil {
+		t.Fatalf("GetDecidedChunks failed: %v", err)
+	}
+	if len(all) != 1 {
+		t.Errorf("expected 1 chunk after update, got %d", len(all))
+	}
+
+	// Verify the chunk was updated
+	found, err := store.GetDecidedChunkByHash("card-1", "hash-aaa")
+	if err != nil {
+		t.Fatalf("GetDecidedChunkByHash failed: %v", err)
+	}
+	if found == nil {
+		t.Fatal("chunk not found")
+	}
+	if found.ChunkIndex != 1 {
+		t.Errorf("ChunkIndex = %d, want 1", found.ChunkIndex)
+	}
+	if found.Status != CardCommitted {
+		t.Errorf("Status = %s, want committed", found.Status)
+	}
+	if found.Patch != "patch v2" {
+		t.Errorf("Patch = %s, want 'patch v2'", found.Patch)
+	}
+}
+
+// TestDecidedChunkNullHashLegacy verifies backward compatibility with chunks
+// that don't have a content_hash (legacy/NULL hash).
+func TestDecidedChunkNullHashLegacy(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+
+	// Save chunk without content_hash (legacy)
+	chunk := &DecidedChunk{
+		CardID:      "card-1",
+		ChunkIndex:  0,
+		ContentHash: "", // No hash
+		Patch:       "legacy patch",
+		Status:      CardAccepted,
+		DecidedAt:   now,
+	}
+	if err := store.SaveDecidedChunk(chunk); err != nil {
+		t.Fatalf("SaveDecidedChunk failed: %v", err)
+	}
+
+	// Can retrieve by index
+	found, err := store.GetDecidedChunk("card-1", 0)
+	if err != nil {
+		t.Fatalf("GetDecidedChunk failed: %v", err)
+	}
+	if found == nil {
+		t.Fatal("chunk not found by index")
+	}
+	if found.ContentHash != "" {
+		t.Errorf("ContentHash = %s, want empty", found.ContentHash)
+	}
+
+	// GetDecidedChunkByHash with empty hash should fail
+	_, err = store.GetDecidedChunkByHash("card-1", "")
+	if err == nil {
+		t.Error("expected error for empty content_hash lookup")
+	}
+
+	// Can delete by index
+	if err := store.DeleteDecidedChunk("card-1", 0); err != nil {
+		t.Fatalf("DeleteDecidedChunk failed: %v", err)
+	}
+
+	found2, err := store.GetDecidedChunk("card-1", 0)
+	if err != nil {
+		t.Fatalf("GetDecidedChunk after delete failed: %v", err)
+	}
+	if found2 != nil {
+		t.Error("chunk should be deleted")
+	}
+}
+
+// TestGetLegacyDecidedChunkOnlyMatchesNullHash verifies that GetLegacyDecidedChunk
+// only returns chunks with NULL content_hash, not chunks with a hash at the same index.
+// This prevents the undo fallback from reverting the wrong chunk.
+func TestGetLegacyDecidedChunkOnlyMatchesNullHash(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+
+	// Save a chunk WITH content_hash at index 0
+	chunkWithHash := &DecidedChunk{
+		CardID:      "card-1",
+		ChunkIndex:  0,
+		ContentHash: "hash-abc",
+		Patch:       "patch with hash",
+		Status:      CardAccepted,
+		DecidedAt:   now,
+	}
+	if err := store.SaveDecidedChunk(chunkWithHash); err != nil {
+		t.Fatalf("SaveDecidedChunk failed: %v", err)
+	}
+
+	// GetLegacyDecidedChunk should NOT return this chunk
+	legacy, err := store.GetLegacyDecidedChunk("card-1", 0)
+	if err != nil {
+		t.Fatalf("GetLegacyDecidedChunk failed: %v", err)
+	}
+	if legacy != nil {
+		t.Error("GetLegacyDecidedChunk should return nil for chunk with hash")
+	}
+
+	// Now add a legacy chunk (NULL hash) at a different index
+	legacyChunk := &DecidedChunk{
+		CardID:      "card-1",
+		ChunkIndex:  1,
+		ContentHash: "", // Legacy - no hash
+		Patch:       "legacy patch",
+		Status:      CardRejected,
+		DecidedAt:   now,
+	}
+	if err := store.SaveDecidedChunk(legacyChunk); err != nil {
+		t.Fatalf("SaveDecidedChunk failed: %v", err)
+	}
+
+	// GetLegacyDecidedChunk SHOULD return the legacy chunk at index 1
+	legacy, err = store.GetLegacyDecidedChunk("card-1", 1)
+	if err != nil {
+		t.Fatalf("GetLegacyDecidedChunk failed: %v", err)
+	}
+	if legacy == nil {
+		t.Fatal("GetLegacyDecidedChunk should return legacy chunk")
+	}
+	if legacy.Patch != "legacy patch" {
+		t.Errorf("Patch = %s, want 'legacy patch'", legacy.Patch)
+	}
+
+	// GetDecidedChunk at index 0 should still return the hash chunk
+	found, err := store.GetDecidedChunk("card-1", 0)
+	if err != nil {
+		t.Fatalf("GetDecidedChunk failed: %v", err)
+	}
+	if found == nil {
+		t.Fatal("GetDecidedChunk should return hash chunk")
+	}
+	if found.ContentHash != "hash-abc" {
+		t.Errorf("ContentHash = %s, want 'hash-abc'", found.ContentHash)
+	}
 }

@@ -739,14 +739,15 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		}, nil
 	})
 
-	wsServer.SetChunkUndoHandler(func(cardID string, chunkIndex int, confirmed bool) (*server.UndoResult, error) {
-		chunk, card, err := actionProcessor.ProcessChunkUndo(cardID, chunkIndex, confirmed)
+	wsServer.SetChunkUndoHandler(func(cardID string, chunkIndex int, contentHash string, confirmed bool) (*server.UndoResult, error) {
+		chunk, card, err := actionProcessor.ProcessChunkUndo(cardID, chunkIndex, contentHash, confirmed)
 		if err != nil {
 			return nil, err
 		}
 		return &server.UndoResult{
 			CardID:       card.ID,
 			ChunkIndex:   chunk.ChunkIndex,
+			ContentHash:  chunk.ContentHash, // Return for client to clear pending state
 			File:         card.File,
 			Diff:         chunk.Patch,
 			OriginalDiff: card.OriginalDiff,

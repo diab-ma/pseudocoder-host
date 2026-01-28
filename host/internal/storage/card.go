@@ -211,7 +211,14 @@ type DecidedChunk struct {
 	CardID string `json:"card_id"`
 
 	// ChunkIndex is the zero-based position of this chunk.
+	// Note: This index may change when the diff is refreshed after staging.
+	// Use ContentHash for stable identity when available.
 	ChunkIndex int `json:"chunk_index"`
+
+	// ContentHash is the stable identifier for this chunk's content.
+	// SHA256 hash (first 16 hex chars) of the chunk diff content.
+	// Used as stable identity since chunk_index can shift after staging.
+	ContentHash string `json:"content_hash,omitempty"`
 
 	// Patch is the git patch for this chunk at decision time.
 	Patch string `json:"patch"`
@@ -270,6 +277,16 @@ type DecidedCardStore interface {
 	// Returns nil, nil if the chunk does not exist.
 	GetDecidedChunk(cardID string, chunkIndex int) (*DecidedChunk, error)
 
+	// GetDecidedChunkByHash retrieves an archived chunk by card ID and content hash.
+	// Returns nil, nil if the chunk does not exist.
+	// Preferred over GetDecidedChunk when content_hash is available for stable identity.
+	GetDecidedChunkByHash(cardID string, contentHash string) (*DecidedChunk, error)
+
+	// GetLegacyDecidedChunk retrieves a legacy archived chunk by card ID and index.
+	// Only returns chunks with NULL content_hash (saved before content_hash migration).
+	// Used for safe fallback when hash lookup fails - avoids matching newer chunks.
+	GetLegacyDecidedChunk(cardID string, chunkIndex int) (*DecidedChunk, error)
+
 	// GetDecidedChunks retrieves all archived chunks for a card.
 	// Results are ordered by chunk_index.
 	GetDecidedChunks(cardID string) ([]*DecidedChunk, error)
@@ -280,6 +297,15 @@ type DecidedCardStore interface {
 	// DeleteDecidedChunk removes a single archived chunk.
 	// This is used when undoing a single chunk decision.
 	DeleteDecidedChunk(cardID string, chunkIndex int) error
+
+	// DeleteDecidedChunkByHash removes a single archived chunk by content hash.
+	// Preferred over DeleteDecidedChunk when content_hash is available.
+	DeleteDecidedChunkByHash(cardID string, contentHash string) error
+
+	// DeleteLegacyDecidedChunk removes a single archived chunk by index, only if
+	// it has no content_hash (NULL). This prevents accidentally deleting newer rows
+	// when schema v8 allows multiple rows per (card_id, chunk_index) with different hashes.
+	DeleteLegacyDecidedChunk(cardID string, chunkIndex int) error
 
 	// DeleteDecidedChunks removes all archived chunks for a card.
 	DeleteDecidedChunks(cardID string) error

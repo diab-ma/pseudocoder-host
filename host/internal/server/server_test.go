@@ -1411,6 +1411,141 @@ func TestNewChunkDecisionResultMessageWithError(t *testing.T) {
 	}
 }
 
+// TestUndoResultMessageChunkIndexZero verifies that chunk_index=0 is serialized
+// in undo.result JSON (not omitted due to omitempty). This guards against regressions
+// where the mobile client would misinterpret chunk 0 undo as file-level undo.
+func TestUndoResultMessageChunkIndexZero(t *testing.T) {
+	msg := NewUndoResultMessageWithHash("card-123", 0, "hash-abc", true, "", "")
+
+	// Marshal to JSON to verify serialization
+	jsonBytes, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("failed to marshal message: %v", err)
+	}
+
+	// Parse JSON to check fields
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	payload, ok := parsed["payload"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected payload to be a map, got %T", parsed["payload"])
+	}
+
+	// Verify chunk_index is present and equals 0 (not omitted)
+	chunkIndex, exists := payload["chunk_index"]
+	if !exists {
+		t.Errorf("chunk_index should be present in JSON for chunk 0 undo, but was omitted")
+	} else if int(chunkIndex.(float64)) != 0 {
+		t.Errorf("expected chunk_index=0, got %v", chunkIndex)
+	}
+
+	// Verify content_hash is present
+	contentHash, exists := payload["content_hash"]
+	if !exists {
+		t.Errorf("content_hash should be present in JSON")
+	} else if contentHash != "hash-abc" {
+		t.Errorf("expected content_hash='hash-abc', got %v", contentHash)
+	}
+
+	// Verify card_id
+	cardID, exists := payload["card_id"]
+	if !exists || cardID != "card-123" {
+		t.Errorf("expected card_id='card-123', got %v", cardID)
+	}
+
+	// Verify success
+	success, exists := payload["success"]
+	if !exists || success != true {
+		t.Errorf("expected success=true, got %v", success)
+	}
+}
+
+// TestUndoResultMessageFileLevelOmitsChunkIndex verifies that file-level undo
+// (chunkIndex=-1) omits chunk_index from JSON.
+func TestUndoResultMessageFileLevelOmitsChunkIndex(t *testing.T) {
+	msg := NewUndoResultMessageWithHash("card-456", -1, "", true, "", "")
+
+	// Marshal to JSON
+	jsonBytes, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("failed to marshal message: %v", err)
+	}
+
+	// Parse JSON to check fields
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	payload, ok := parsed["payload"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected payload to be a map, got %T", parsed["payload"])
+	}
+
+	// Verify chunk_index is NOT present for file-level undo
+	if _, exists := payload["chunk_index"]; exists {
+		t.Errorf("chunk_index should be omitted for file-level undo (chunkIndex=-1)")
+	}
+
+	// Verify content_hash is NOT present (empty string)
+	if _, exists := payload["content_hash"]; exists {
+		t.Errorf("content_hash should be omitted when empty")
+	}
+}
+
+// TestUndoResultMessageErrorIncludesContentHash verifies that error responses
+// include content_hash so clients can clear hash-keyed pending state.
+func TestUndoResultMessageErrorIncludesContentHash(t *testing.T) {
+	msg := NewUndoResultMessageWithHash("card-789", 2, "hash-xyz", false, "undo.conflict", "patch conflict")
+
+	// Marshal to JSON
+	jsonBytes, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("failed to marshal message: %v", err)
+	}
+
+	// Parse JSON to check fields
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	payload, ok := parsed["payload"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected payload to be a map, got %T", parsed["payload"])
+	}
+
+	// Verify content_hash is present even for error responses
+	contentHash, exists := payload["content_hash"]
+	if !exists {
+		t.Errorf("content_hash should be present in error response for chunk undo")
+	} else if contentHash != "hash-xyz" {
+		t.Errorf("expected content_hash='hash-xyz', got %v", contentHash)
+	}
+
+	// Verify chunk_index is present
+	chunkIndex, exists := payload["chunk_index"]
+	if !exists {
+		t.Errorf("chunk_index should be present in error response")
+	} else if int(chunkIndex.(float64)) != 2 {
+		t.Errorf("expected chunk_index=2, got %v", chunkIndex)
+	}
+
+	// Verify error fields
+	if payload["success"] != false {
+		t.Errorf("expected success=false, got %v", payload["success"])
+	}
+	if payload["error_code"] != "undo.conflict" {
+		t.Errorf("expected error_code='undo.conflict', got %v", payload["error_code"])
+	}
+	if payload["error"] != "patch conflict" {
+		t.Errorf("expected error='patch conflict', got %v", payload["error"])
+	}
+}
+
 // TestChunkInfoSerialization verifies ChunkInfo JSON serialization.
 func TestChunkInfoSerialization(t *testing.T) {
 	chunks := []ChunkInfo{

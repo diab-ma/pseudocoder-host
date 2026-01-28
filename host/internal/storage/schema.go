@@ -10,7 +10,7 @@ import (
 
 // currentSchemaVersion is the current database schema version.
 // Increment this when making schema changes and add migration logic.
-const currentSchemaVersion = 6
+const currentSchemaVersion = 8
 
 // initSchema creates the required tables if they don't exist.
 // Uses IF NOT EXISTS to make the operation idempotent.
@@ -69,6 +69,18 @@ func (s *SQLiteStore) initSchema() error {
 	if version < 6 {
 		if err := s.migrateToV6(); err != nil {
 			return fmt.Errorf("migrate to v6: %w", err)
+		}
+	}
+
+	if version < 7 {
+		if err := s.migrateToV7(); err != nil {
+			return fmt.Errorf("migrate to v7: %w", err)
+		}
+	}
+
+	if version < 8 {
+		if err := s.migrateToV8(); err != nil {
+			return fmt.Errorf("migrate to v8: %w", err)
 		}
 	}
 
@@ -446,4 +458,157 @@ func (s *SQLiteStore) SchemaVersion() (int, error) {
 		return 0, fmt.Errorf("get schema version: %w", err)
 	}
 	return version, nil
+}
+
+// migrateToV7 adds content_hash column to decided_chunks for stable chunk identity.
+// Chunk indices can change when the diff is refreshed after staging; content_hash
+// provides a stable identifier for undo operations.
+func (s *SQLiteStore) migrateToV7() error {
+	log.Printf("storage: applying migration to schema version 7")
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Add content_hash column to decided_chunks table.
+	// This column stores the SHA256 hash (first 16 hex chars) of the chunk content.
+	// Nullable because existing rows won't have this value until a new decision.
+	const addColumn = `ALTER TABLE decided_chunks ADD COLUMN content_hash TEXT`
+	if _, err := tx.Exec(addColumn); err != nil {
+		// SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check for error
+		// If the column already exists, we continue
+		if err.Error() != "duplicate column name: content_hash" {
+			return fmt.Errorf("add content_hash column: %w", err)
+		}
+		log.Printf("storage: content_hash column already exists, skipping")
+	}
+
+	// Create unique index on (card_id, content_hash) for efficient hash-based lookups.
+	// This index allows looking up chunks by their stable content hash instead of
+	// the potentially shifting chunk_index.
+	const createIndex = `
+		CREATE INDEX IF NOT EXISTS idx_decided_chunks_content_hash
+		ON decided_chunks(card_id, content_hash)
+	`
+	if _, err := tx.Exec(createIndex); err != nil {
+		return fmt.Errorf("create content_hash index: %w", err)
+	}
+
+	// Record the migration
+	_, err = tx.Exec(
+		"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+		7,
+		time.Now().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// migrateToV8 restructures decided_chunks to use content_hash as primary identity.
+// The old schema used (card_id, chunk_index) as PRIMARY KEY, which prevented storing
+// two chunks with the same index but different content_hash (happens when indices
+// shift after staging). The new schema uses auto-increment id with UNIQUE constraint
+// on (card_id, content_hash).
+func (s *SQLiteStore) migrateToV8() error {
+	log.Printf("storage: applying migration to schema version 8")
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Create new table with auto-increment id as primary key.
+	// This allows multiple rows per (card_id, chunk_index) when content_hash differs.
+	const createNewTable = `
+		CREATE TABLE IF NOT EXISTS decided_chunks_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			card_id TEXT NOT NULL,
+			chunk_index INTEGER NOT NULL,
+			content_hash TEXT,
+			patch TEXT NOT NULL,
+			status TEXT NOT NULL,
+			decided_at TEXT NOT NULL,
+			commit_hash TEXT,
+			committed_at TEXT
+		)
+	`
+	if _, err := tx.Exec(createNewTable); err != nil {
+		return fmt.Errorf("create decided_chunks_new table: %w", err)
+	}
+
+	// Copy existing data from old table
+	const copyData = `
+		INSERT INTO decided_chunks_new
+			(card_id, chunk_index, content_hash, patch, status, decided_at, commit_hash, committed_at)
+		SELECT card_id, chunk_index, content_hash, patch, status, decided_at, commit_hash, committed_at
+		FROM decided_chunks
+	`
+	if _, err := tx.Exec(copyData); err != nil {
+		return fmt.Errorf("copy data to decided_chunks_new: %w", err)
+	}
+
+	// Drop old table
+	if _, err := tx.Exec("DROP TABLE decided_chunks"); err != nil {
+		return fmt.Errorf("drop old decided_chunks table: %w", err)
+	}
+
+	// Rename new table to old name
+	if _, err := tx.Exec("ALTER TABLE decided_chunks_new RENAME TO decided_chunks"); err != nil {
+		return fmt.Errorf("rename decided_chunks_new: %w", err)
+	}
+
+	// Create unique index on (card_id, content_hash) for stable identity lookups.
+	// This allows efficient lookup by content_hash and prevents duplicate hashes per card.
+	const createHashIndex = `
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_decided_chunks_card_hash
+		ON decided_chunks(card_id, content_hash) WHERE content_hash IS NOT NULL
+	`
+	if _, err := tx.Exec(createHashIndex); err != nil {
+		return fmt.Errorf("create unique hash index: %w", err)
+	}
+
+	// Create index on (card_id, chunk_index) for backward-compatible lookups
+	// when content_hash is not available.
+	const createIndexIndex = `
+		CREATE INDEX IF NOT EXISTS idx_decided_chunks_card_index
+		ON decided_chunks(card_id, chunk_index)
+	`
+	if _, err := tx.Exec(createIndexIndex); err != nil {
+		return fmt.Errorf("create chunk index index: %w", err)
+	}
+
+	// Recreate status and commit indexes
+	const createStatusIndex = `
+		CREATE INDEX IF NOT EXISTS idx_decided_chunks_status
+		ON decided_chunks(status)
+	`
+	if _, err := tx.Exec(createStatusIndex); err != nil {
+		return fmt.Errorf("create status index: %w", err)
+	}
+
+	const createCommitIndex = `
+		CREATE INDEX IF NOT EXISTS idx_decided_chunks_commit
+		ON decided_chunks(commit_hash)
+	`
+	if _, err := tx.Exec(createCommitIndex); err != nil {
+		return fmt.Errorf("create commit index: %w", err)
+	}
+
+	// Record the migration
+	_, err = tx.Exec(
+		"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+		8,
+		time.Now().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+
+	return tx.Commit()
 }
