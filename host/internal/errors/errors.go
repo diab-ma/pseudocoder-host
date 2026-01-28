@@ -11,28 +11,35 @@ package errors
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Error codes by domain.
 // These are stable identifiers that mobile clients can rely on for error handling.
 const (
 	// Storage domain - database and persistence errors
-	CodeStorageNotFound      = "storage.not_found"      // Card or resource not found
-	CodeStorageAlreadyExists = "storage.already_exists" // Resource already exists
+	CodeStorageNotFound       = "storage.not_found"       // Card or resource not found
+	CodeStorageAlreadyExists  = "storage.already_exists"  // Resource already exists
 	CodeStorageAlreadyDecided = "storage.already_decided" // Card already has a decision
-	CodeStorageOpenFailed    = "storage.open_failed"    // Database open failed
-	CodeStorageQueryFailed   = "storage.query_failed"   // Database query failed
-	CodeStorageSaveFailed    = "storage.save_failed"    // Failed to save data
+	CodeStorageOpenFailed     = "storage.open_failed"     // Database open failed
+	CodeStorageQueryFailed    = "storage.query_failed"    // Database query failed
+	CodeStorageSaveFailed     = "storage.save_failed"     // Failed to save data
 
 	// Action domain - git operations and decision processing
 	CodeActionInvalid        = "action.invalid"         // Invalid action (not accept/reject)
 	CodeActionGitFailed      = "action.git_failed"      // Git operation failed
 	CodeActionCardNotFound   = "action.card_not_found"  // Card not found for action
 	CodeActionAlreadyDecided = "action.already_decided" // Card already has a decision
-	CodeActionChunkStale      = "action.chunk_stale"      // Chunk content has changed since viewed
+	CodeActionChunkStale     = "action.chunk_stale"     // Chunk content has changed since viewed
 	CodeActionUntrackedFile  = "action.untracked_file"  // File is untracked (cannot restore)
 	CodeActionFileDeleted    = "action.file_deleted"    // File was deleted from disk
 	CodeActionBinaryFile     = "action.binary_file"     // Cannot apply per-chunk actions to binary files
+
+	// Decision reliability domain - validation/verification and divergence
+	CodeValidationFailed   = "validation.failed"   // Pre-apply validation failed
+	CodeVerificationFailed = "verification.failed" // Post-apply verification failed
+	CodeStateDiverged      = "state.diverged"      // Storage and git state diverged
+	CodeConflictDetected   = "conflict.detected"   // Conflict detected during apply/verify
 
 	// Server domain - WebSocket and network errors
 	CodeServerUpgradeFailed  = "server.upgrade_failed"  // WebSocket upgrade failed
@@ -62,9 +69,9 @@ const (
 	CodeDiffPollFailed  = "diff.poll_failed"  // Diff polling failed
 
 	// Auth domain - authentication and authorization (for Phase 3)
-	CodeAuthRequired     = "auth.required"     // Authentication required
-	CodeAuthInvalid      = "auth.invalid"      // Invalid token or credentials
-	CodeAuthExpired      = "auth.expired"      // Token or session expired
+	CodeAuthRequired      = "auth.required"       // Authentication required
+	CodeAuthInvalid       = "auth.invalid"        // Invalid token or credentials
+	CodeAuthExpired       = "auth.expired"        // Token or session expired
 	CodeAuthDeviceRevoked = "auth.device_revoked" // Device has been revoked
 
 	// Approval domain - CLI command approval broker (Phase 6)
@@ -81,11 +88,11 @@ const (
 	CodeCommitGitError        = "commit.git_error"         // General git commit error
 
 	// Push domain - git push errors (Phase 6.6)
-	CodePushNoUpstream     = "push.no_upstream"   // No upstream configured and remote/branch not provided
-	CodePushNonFastForward = "push.non_ff"        // Push rejected, not fast-forward
-	CodePushAuthFailed     = "push.auth_failed"   // SSH key or credential failure
-	CodePushGitError       = "push.git_error"     // General git push error
-	CodePushInvalidArgs    = "push.invalid_args"  // Remote or branch contains invalid characters (Unit 7.7)
+	CodePushNoUpstream     = "push.no_upstream"  // No upstream configured and remote/branch not provided
+	CodePushNonFastForward = "push.non_ff"       // Push rejected, not fast-forward
+	CodePushAuthFailed     = "push.auth_failed"  // SSH key or credential failure
+	CodePushGitError       = "push.git_error"    // General git push error
+	CodePushInvalidArgs    = "push.invalid_args" // Remote or branch contains invalid characters (Unit 7.7)
 
 	// tmux domain - tmux session integration errors (Phase 12)
 	CodeTmuxNotInstalled    = "tmux.not_installed"     // tmux command not found on host
@@ -263,6 +270,46 @@ func FileDeleted(file string) *CodedError {
 func BinaryFile(file string) *CodedError {
 	msg := fmt.Sprintf("file %s is binary - use file-level accept/reject instead of per-chunk actions", file)
 	return New(CodeActionBinaryFile, msg)
+}
+
+// ValidationFailed creates a "validation.failed" error.
+// This indicates a pre-apply validation step failed and no changes were applied.
+func ValidationFailed(message string) *CodedError {
+	msg := "validation failed"
+	if message != "" {
+		msg = fmt.Sprintf("%s: %s", msg, message)
+	}
+	return New(CodeValidationFailed, msg)
+}
+
+// VerificationFailed creates a "verification.failed" error.
+// This indicates a post-apply verification step failed.
+func VerificationFailed(message string) *CodedError {
+	msg := "verification failed"
+	if message != "" {
+		msg = fmt.Sprintf("%s: %s", msg, message)
+	}
+	return New(CodeVerificationFailed, msg)
+}
+
+// StateDiverged creates a "state.diverged" error.
+// This indicates storage state and git state are inconsistent.
+func StateDiverged(files []string) *CodedError {
+	msg := "state diverged"
+	if len(files) > 0 {
+		msg = fmt.Sprintf("%s for files: %s", msg, strings.Join(files, ", "))
+	}
+	return New(CodeStateDiverged, msg)
+}
+
+// ConflictDetected creates a "conflict.detected" error.
+// This indicates a patch could not be applied cleanly due to conflicts.
+func ConflictDetected(message string) *CodedError {
+	msg := "conflict detected"
+	if message != "" {
+		msg = fmt.Sprintf("%s: %s", msg, message)
+	}
+	return New(CodeConflictDetected, msg)
 }
 
 // ApprovalTimeout creates an "approval.timeout" error.

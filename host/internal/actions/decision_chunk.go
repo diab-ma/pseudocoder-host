@@ -3,6 +3,7 @@ package actions
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -115,66 +116,120 @@ func (p *Processor) ProcessChunkDecision(cardID string, chunkIndex int, action s
 		return apperrors.FileDeleted(card.File)
 	}
 
-	// Apply the git operation FIRST.
-	// Unlike file-level decisions, chunk operations are more likely to fail
-	// (patch conflicts, modified working tree), so we defer the status update
-	// until after git succeeds. This allows retry on failure.
-	var gitErr error
-	if action == "accept" {
-		gitErr = p.StageChunk(card.File, chunk.Content)
-	} else {
-		gitErr = p.RestoreChunk(card.File, chunk.Content)
+	// Build patch for validation and application.
+	isNew, err := p.isNewFile(card.File)
+	if err != nil {
+		log.Printf("actions: failed to check if file is new for chunk decision: %v", err)
+		isNew = false
+	}
+	useNewFile := isNew && action == "accept"
+	patch := BuildPatch(card.File, chunk.Content, useNewFile)
+	cached := action == "accept"
+	reverse := action == "reject"
+
+	// Pre-apply validation.
+	if err := p.checkPatch(patch, cached, reverse); err != nil {
+		if p.checkPatch(patch, cached, !reverse) == nil {
+			return apperrors.StateDiverged([]string{card.File})
+		}
+		return classifyPatchCheckError(err)
 	}
 
-	if gitErr != nil {
-		log.Printf("actions: git operation failed for chunk %s:%d: %v", cardID, chunkIndex, gitErr)
-		return apperrors.GitFailed(action, card.File, gitErr)
+	storeTx, ok := p.store.(interface {
+		WithTransaction(func(tx storage.Transaction) error) error
+	})
+	if !ok {
+		return apperrors.Internal("transactional store not configured", nil)
 	}
 
-	// Record the decision in storage AFTER git succeeds.
-	// This ensures failed git operations remain retryable.
 	status := storage.CardAccepted
 	if action == "reject" {
 		status = storage.CardRejected
 	}
 
-	decision := &storage.ChunkDecision{
-		CardID:     cardID,
-		ChunkIndex: chunkIndex,
-		Status:     status,
-		Timestamp:  time.Now(),
+	applied := false
+	rolledBack := false
+	cardRemoved := false
+
+	tryRollback := func(context string) {
+		if rolledBack {
+			return
+		}
+		if rbErr := p.applyPatch(patch, cached, !reverse); rbErr != nil {
+			log.Printf("actions: rollback failed (%s): %v", context, rbErr)
+		} else {
+			rolledBack = true
+		}
 	}
 
-	if err := p.chunkStore.RecordChunkDecision(decision); err != nil {
-		// Git succeeded but storage failed. We return an error to inform the user
-		// that something went wrong. The chunk will remain "pending" in storage
-		// but the git state reflects the decision. Retry will fail at git apply
-		// level (duplicate change) rather than with "already decided".
-		log.Printf("actions: failed to record chunk decision after git success: %v", err)
-		return apperrors.Wrap(apperrors.CodeStorageSaveFailed, "failed to record chunk decision", err)
+	txErr := storeTx.WithTransaction(func(tx storage.Transaction) error {
+		if err := p.applyPatch(patch, cached, reverse); err != nil {
+			return classifyPatchApplyError(action, card.File, err)
+		}
+		applied = true
+
+		if err := p.verifyPatchApplied(patch, cached, reverse); err != nil {
+			tryRollback("verification failure")
+			return apperrors.VerificationFailed(err.Error())
+		}
+
+		decision := &storage.ChunkDecision{
+			CardID:     cardID,
+			ChunkIndex: chunkIndex,
+			Status:     status,
+			Timestamp:  time.Now(),
+		}
+
+		if err := tx.RecordChunkDecision(decision); err != nil {
+			tryRollback("storage failure")
+			return mapChunkDecisionStorageError(err, cardID, chunkIndex)
+		}
+
+		pendingCount, err := tx.CountPendingChunks(cardID)
+		if err != nil {
+			tryRollback("count failure")
+			return apperrors.Wrap(apperrors.CodeStorageSaveFailed, "failed to count pending chunks", err)
+		}
+
+		if pendingCount == 0 {
+			if err := tx.DeleteCard(cardID); err != nil {
+				tryRollback("delete card failure")
+				return apperrors.Wrap(apperrors.CodeStorageSaveFailed, "failed to delete card", err)
+			}
+			if err := tx.DeleteChunks(cardID); err != nil {
+				tryRollback("delete chunks failure")
+				return apperrors.Wrap(apperrors.CodeStorageSaveFailed, "failed to delete chunks", err)
+			}
+			cardRemoved = true
+		}
+
+		return nil
+	})
+
+	if txErr != nil {
+		if applied && !rolledBack {
+			tryRollback("transaction failure")
+		}
+		if apperrors.GetCode(txErr) == apperrors.CodeUnknown {
+			return apperrors.Wrap(apperrors.CodeStorageSaveFailed, "chunk decision transaction failed", txErr)
+		}
+		return txErr
 	}
 
 	// Archive the decided chunk for undo support.
 	// Build the patch that was applied so we can reverse it on undo.
 	if p.decidedStore != nil {
-		isNew, _ := p.isNewFile(card.File)
-		patch := BuildPatch(card.File, chunk.Content, isNew)
+		patch := BuildPatch(card.File, chunk.Content, useNewFile)
 
 		// First, ensure a parent DecidedCard exists for this chunk.
-		// The DecidedCard stores the file path and original diff needed for undo.
-		// We check if one exists first to avoid overwriting on subsequent chunk decisions.
 		existingDecidedCard, _ := p.decidedStore.GetDecidedCard(cardID)
 		if existingDecidedCard == nil {
-			// Create the parent DecidedCard to store file info and original diff.
-			// Status is set to "accepted" as a placeholder - individual chunk statuses
-			// are tracked in DecidedChunk records. The Patch field stores the full
-			// original diff since chunk-level patches are in DecidedChunk.
 			decidedCard := &storage.DecidedCard{
 				ID:           cardID,
 				SessionID:    card.SessionID,
 				File:         card.File,
-				Patch:        card.Diff, // Store full diff as reference
-				Status:       status,    // Initial status from first chunk
+				Patch:        card.Diff,
+				Status:       status,
 				DecidedAt:    time.Now(),
 				OriginalDiff: card.Diff,
 			}
@@ -184,7 +239,6 @@ func (p *Processor) ProcessChunkDecision(cardID string, chunkIndex int, action s
 		}
 
 		// Use the contentHash passed to the function for stable identity.
-		// If not provided, compute it from chunk content for consistency.
 		chunkContentHash := contentHash
 		if chunkContentHash == "" && chunk != nil {
 			chunkContentHash = hashChunkContent(chunk.Content)
@@ -193,33 +247,19 @@ func (p *Processor) ProcessChunkDecision(cardID string, chunkIndex int, action s
 		decidedChunk := &storage.DecidedChunk{
 			CardID:      cardID,
 			ChunkIndex:  chunkIndex,
-			ContentHash: chunkContentHash, // Stable identity for undo operations
+			ContentHash: chunkContentHash,
 			Patch:       patch,
 			Status:      status,
 			DecidedAt:   time.Now(),
 		}
 
 		if err := p.decidedStore.SaveDecidedChunk(decidedChunk); err != nil {
-			// Log but don't fail - the decision was processed successfully
 			log.Printf("actions: failed to archive decided chunk %s:%d: %v", cardID, chunkIndex, err)
 		}
 	}
 
-	// Check if all chunks are decided - if so, clean up the card
-	pendingCount, err := p.chunkStore.CountPendingChunks(cardID)
-	if err != nil {
-		log.Printf("actions: failed to count pending chunks for %s: %v", cardID, err)
-	} else if pendingCount == 0 {
-		// All chunks decided - delete the card and its chunks
-		if err := p.store.DeleteCard(cardID); err != nil {
-			log.Printf("actions: failed to delete card %s after all chunks decided: %v", cardID, err)
-		} else {
-			// Notify that card was removed so cached state can be cleared
-			p.notifyCardRemoved(card.File)
-		}
-		if err := p.chunkStore.DeleteChunks(cardID); err != nil {
-			log.Printf("actions: failed to delete chunks for card %s: %v", cardID, err)
-		}
+	if cardRemoved {
+		p.notifyCardRemoved(card.File)
 	}
 
 	return nil
@@ -263,6 +303,16 @@ func (p *Processor) RestoreChunk(file, chunkContent string) error {
 func hashChunkContent(content string) string {
 	hash := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(hash[:8])
+}
+
+func mapChunkDecisionStorageError(err error, cardID string, chunkIndex int) error {
+	if errors.Is(err, storage.ErrChunkNotFound) {
+		return apperrors.NotFound("chunk")
+	}
+	if errors.Is(err, storage.ErrAlreadyDecided) {
+		return apperrors.AlreadyDecided(fmt.Sprintf("%s:chunk%d", cardID, chunkIndex))
+	}
+	return apperrors.Wrap(apperrors.CodeStorageSaveFailed, "failed to record chunk decision", err)
 }
 
 // recreateCardAndChunksFromDecided recreates a card and its chunks from decided storage.

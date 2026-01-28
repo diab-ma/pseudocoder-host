@@ -94,7 +94,7 @@ func TestProcessDecisionAccept(t *testing.T) {
 	card := &storage.ReviewCard{
 		ID:        "card-123",
 		File:      "test.txt",
-		Diff:      "+added line",
+		Diff:      "@@ -1 +1,2 @@\n initial content\n+added line\n",
 		Status:    storage.CardPending,
 		CreatedAt: time.Now(),
 	}
@@ -148,7 +148,7 @@ func TestProcessDecisionReject(t *testing.T) {
 	card := &storage.ReviewCard{
 		ID:        "card-456",
 		File:      "test.txt",
-		Diff:      "-initial content\n+modified content",
+		Diff:      "@@ -1 +1 @@\n-initial content\n+modified content\n",
 		Status:    storage.CardPending,
 		CreatedAt: time.Now(),
 	}
@@ -175,6 +175,60 @@ func TestProcessDecisionReject(t *testing.T) {
 	}
 	if card != nil {
 		t.Error("expected card to be deleted after successful decision")
+	}
+}
+
+func TestProcessDecisionValidationFailureKeepsPending(t *testing.T) {
+	repoDir := setupGitRepo(t)
+	store, err := storage.NewSQLiteStore(filepath.Join(repoDir, "test.db"))
+	if err != nil {
+		t.Fatalf("create store failed: %v", err)
+	}
+	defer store.Close()
+
+	// Modify the file to create changes
+	testFile := filepath.Join(repoDir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("initial content\ninvalid patch\n"), 0644); err != nil {
+		t.Fatalf("write file failed: %v", err)
+	}
+
+	// Create a card with an invalid diff (missing @@ header)
+	card := &storage.ReviewCard{
+		ID:        "card-invalid",
+		File:      "test.txt",
+		Diff:      "+invalid patch line",
+		Status:    storage.CardPending,
+		CreatedAt: time.Now(),
+	}
+	if err := store.SaveCard(card); err != nil {
+		t.Fatalf("save card failed: %v", err)
+	}
+
+	processor := NewProcessor(store, repoDir)
+	err = processor.ProcessDecision("card-invalid", "accept", "")
+	if err == nil {
+		t.Fatal("expected validation error for invalid diff")
+	}
+	if !apperrors.IsCode(err, apperrors.CodeConflictDetected) &&
+		!apperrors.IsCode(err, apperrors.CodeValidationFailed) {
+		t.Errorf("expected validation/conflict error, got: %v", err)
+	}
+
+	// Verify no staged changes were created
+	cmd := exec.Command("git", "diff", "--cached")
+	cmd.Dir = repoDir
+	out, _ := cmd.CombinedOutput()
+	if string(out) != "" {
+		t.Errorf("expected no staged changes, got: %s", string(out))
+	}
+
+	// Card should remain pending
+	card, err = store.GetCard("card-invalid")
+	if err != nil {
+		t.Fatalf("get card failed: %v", err)
+	}
+	if card == nil || card.Status != storage.CardPending {
+		t.Errorf("expected card to remain pending, got: %+v", card)
 	}
 }
 
@@ -321,7 +375,7 @@ func TestProcessDecisionNewFile(t *testing.T) {
 	card := &storage.ReviewCard{
 		ID:        "card-new",
 		File:      "new.txt",
-		Diff:      "+new file content",
+		Diff:      "@@ -0,0 +1 @@\n+new file content\n",
 		Status:    storage.CardPending,
 		CreatedAt: time.Now(),
 	}
@@ -360,7 +414,7 @@ func TestProcessDecisionRejectNewFile(t *testing.T) {
 	card := &storage.ReviewCard{
 		ID:        "card-new-reject",
 		File:      "new.txt",
-		Diff:      "+new file content",
+		Diff:      "@@ -0,0 +1 @@\n+new file content\n",
 		Status:    storage.CardPending,
 		CreatedAt: time.Now(),
 	}
@@ -385,6 +439,66 @@ func TestProcessDecisionRejectNewFile(t *testing.T) {
 	card, _ = store.GetCard("card-new-reject")
 	if card.Status != storage.CardPending {
 		t.Errorf("expected card to remain pending for retry, got: %s", card.Status)
+	}
+}
+
+func TestRunDecisionTransactionVerificationFailureRollsBack(t *testing.T) {
+	repoDir := setupGitRepo(t)
+	store, err := storage.NewSQLiteStore(filepath.Join(repoDir, "test.db"))
+	if err != nil {
+		t.Fatalf("create store failed: %v", err)
+	}
+	defer store.Close()
+
+	card := &storage.ReviewCard{
+		ID:        "card-verify-fail",
+		File:      "test.txt",
+		Diff:      "@@ -1 +1 @@\n-initial content\n+changed\n",
+		Status:    storage.CardPending,
+		CreatedAt: time.Now(),
+	}
+	if err := store.SaveCard(card); err != nil {
+		t.Fatalf("save card failed: %v", err)
+	}
+
+	processor := NewProcessor(store, repoDir)
+
+	applyCalled := false
+	rollbackCalled := false
+
+	apply := func() error {
+		applyCalled = true
+		return nil
+	}
+	verify := func() error {
+		return fmt.Errorf("verification failed")
+	}
+	rollback := func() error {
+		rollbackCalled = true
+		return nil
+	}
+
+	err = processor.runDecisionTransaction(card, "accept", "", apply, verify, rollback)
+	if err == nil {
+		t.Fatal("expected verification error")
+	}
+	if !apperrors.IsCode(err, apperrors.CodeVerificationFailed) {
+		t.Errorf("expected verification.failed error, got: %v", err)
+	}
+	if !applyCalled {
+		t.Error("expected apply to be called")
+	}
+	if !rollbackCalled {
+		t.Error("expected rollback to be called")
+	}
+
+	// Card should remain pending after verification failure.
+	updated, err := store.GetCard("card-verify-fail")
+	if err != nil {
+		t.Fatalf("get card failed: %v", err)
+	}
+	if updated == nil || updated.Status != storage.CardPending {
+		t.Errorf("expected card to remain pending, got: %+v", updated)
 	}
 }
 
@@ -664,10 +778,10 @@ func TestDeleteUntrackedFileDeletesChunks(t *testing.T) {
 	// Save chunks for the card
 	chunks := []*storage.ChunkStatus{
 		{
-			CardID:    "card-delete-chunks",
+			CardID:     "card-delete-chunks",
 			ChunkIndex: 0,
-			Content:   "@@ -0,0 +1 @@\n+delete me",
-			Status:    storage.CardPending,
+			Content:    "@@ -0,0 +1 @@\n+delete me",
+			Status:     storage.CardPending,
 		},
 	}
 	if err := store.SaveChunks("card-delete-chunks", chunks); err != nil {
@@ -1429,10 +1543,11 @@ func TestProcessChunkDecisionGitFailureAllowsRetry(t *testing.T) {
 	// First attempt - should fail because the chunk content is invalid
 	err = processor.ProcessChunkDecision("fc-retry", 0, "accept", "")
 	if err == nil {
-		t.Fatal("expected git error for invalid chunk")
+		t.Fatal("expected validation error for invalid chunk")
 	}
-	if !apperrors.IsCode(err, apperrors.CodeActionGitFailed) {
-		t.Errorf("expected action.git_failed error, got: %v", err)
+	if !apperrors.IsCode(err, apperrors.CodeConflictDetected) &&
+		!apperrors.IsCode(err, apperrors.CodeValidationFailed) {
+		t.Errorf("expected validation/conflict error, got: %v", err)
 	}
 
 	// Verify chunk is still pending (not marked as decided)
@@ -1444,17 +1559,18 @@ func TestProcessChunkDecisionGitFailureAllowsRetry(t *testing.T) {
 		t.Errorf("expected chunk to remain pending after git failure, got: %s", chunk.Status)
 	}
 
-	// Second attempt - should also fail with git error (NOT AlreadyDecided)
-	// This proves the chunk is retryable after git failure
+	// Second attempt - should also fail with validation/conflict (NOT AlreadyDecided)
+	// This proves the chunk is retryable after validation failure
 	err = processor.ProcessChunkDecision("fc-retry", 0, "accept", "")
 	if err == nil {
-		t.Fatal("expected git error on retry")
+		t.Fatal("expected validation error on retry")
 	}
 	if apperrors.IsCode(err, apperrors.CodeStorageAlreadyDecided) {
-		t.Error("chunk should be retryable after git failure, but got AlreadyDecided")
+		t.Error("chunk should be retryable after validation failure, but got AlreadyDecided")
 	}
-	if !apperrors.IsCode(err, apperrors.CodeActionGitFailed) {
-		t.Errorf("expected action.git_failed error on retry, got: %v", err)
+	if !apperrors.IsCode(err, apperrors.CodeConflictDetected) &&
+		!apperrors.IsCode(err, apperrors.CodeValidationFailed) {
+		t.Errorf("expected validation/conflict error on retry, got: %v", err)
 	}
 }
 
@@ -1521,42 +1637,50 @@ func TestProcessChunkDecisionStaleContentHash(t *testing.T) {
 	}
 }
 
-// failingChunkStore wraps a real ChunkStore but fails on RecordChunkDecision
-// after a specified number of successful calls to other methods.
-type failingChunkStore struct {
-	real               storage.ChunkStore
-	failOnRecordDecision bool
+// staticChunkStore returns a fixed chunk without persisting it.
+// This forces RecordChunkDecision (tx) to fail with ErrChunkNotFound.
+type staticChunkStore struct {
+	chunk *storage.ChunkStatus
 }
 
-func (f *failingChunkStore) SaveChunks(cardID string, chunks []*storage.ChunkStatus) error {
-	return f.real.SaveChunks(cardID, chunks)
+func (s *staticChunkStore) SaveChunks(cardID string, chunks []*storage.ChunkStatus) error {
+	return nil
 }
 
-func (f *failingChunkStore) GetChunks(cardID string) ([]*storage.ChunkStatus, error) {
-	return f.real.GetChunks(cardID)
-}
-
-func (f *failingChunkStore) GetChunk(cardID string, chunkIndex int) (*storage.ChunkStatus, error) {
-	return f.real.GetChunk(cardID, chunkIndex)
-}
-
-func (f *failingChunkStore) RecordChunkDecision(decision *storage.ChunkDecision) error {
-	if f.failOnRecordDecision {
-		return fmt.Errorf("simulated storage failure")
+func (s *staticChunkStore) GetChunks(cardID string) ([]*storage.ChunkStatus, error) {
+	if s.chunk == nil {
+		return []*storage.ChunkStatus{}, nil
 	}
-	return f.real.RecordChunkDecision(decision)
+	return []*storage.ChunkStatus{s.chunk}, nil
 }
 
-func (f *failingChunkStore) DeleteChunks(cardID string) error {
-	return f.real.DeleteChunks(cardID)
+func (s *staticChunkStore) GetChunk(cardID string, chunkIndex int) (*storage.ChunkStatus, error) {
+	if s.chunk == nil {
+		return nil, nil
+	}
+	if s.chunk.CardID == cardID && s.chunk.ChunkIndex == chunkIndex {
+		return s.chunk, nil
+	}
+	return nil, nil
 }
 
-func (f *failingChunkStore) CountPendingChunks(cardID string) (int, error) {
-	return f.real.CountPendingChunks(cardID)
+func (s *staticChunkStore) RecordChunkDecision(decision *storage.ChunkDecision) error {
+	return nil
+}
+
+func (s *staticChunkStore) DeleteChunks(cardID string) error {
+	return nil
+}
+
+func (s *staticChunkStore) CountPendingChunks(cardID string) (int, error) {
+	if s.chunk == nil {
+		return 0, nil
+	}
+	return 1, nil
 }
 
 func TestProcessChunkDecisionStorageFailureAfterGit(t *testing.T) {
-	dir, chunk1, chunk2, fileName := setupGitRepoWithMultipleChunks(t)
+	dir, chunk1, _, fileName := setupGitRepoWithMultipleChunks(t)
 	dbPath := filepath.Join(dir, "test.db")
 	store, err := storage.NewSQLiteStore(dbPath)
 	if err != nil {
@@ -1568,7 +1692,7 @@ func TestProcessChunkDecisionStorageFailureAfterGit(t *testing.T) {
 	card := &storage.ReviewCard{
 		ID:        "fc-storefail",
 		File:      fileName,
-		Diff:      chunk1 + "\n" + chunk2,
+		Diff:      chunk1,
 		Status:    storage.CardPending,
 		CreatedAt: time.Now(),
 	}
@@ -1576,25 +1700,20 @@ func TestProcessChunkDecisionStorageFailureAfterGit(t *testing.T) {
 		t.Fatalf("save card failed: %v", err)
 	}
 
-	// Save chunks for the card
-	chunks := []*storage.ChunkStatus{
-		{CardID: "fc-storefail", ChunkIndex: 0, Content: chunk1, Status: storage.CardPending},
-		{CardID: "fc-storefail", ChunkIndex: 1, Content: chunk2, Status: storage.CardPending},
-	}
-	if err := store.SaveChunks("fc-storefail", chunks); err != nil {
-		t.Fatalf("save chunks failed: %v", err)
-	}
-
-	// Create a failing store wrapper that fails on RecordChunkDecision
-	failStore := &failingChunkStore{
-		real:                 store,
-		failOnRecordDecision: true,
+	// Provide a chunk via a static store but do NOT persist it to DB.
+	staticStore := &staticChunkStore{
+		chunk: &storage.ChunkStatus{
+			CardID:     "fc-storefail",
+			ChunkIndex: 0,
+			Content:    chunk1,
+			Status:     storage.CardPending,
+		},
 	}
 
 	processor := NewProcessor(store, dir)
-	processor.SetChunkStore(failStore)
+	processor.SetChunkStore(staticStore)
 
-	// Attempt to decide - git will succeed, but RecordChunkDecision will fail
+	// Attempt to decide - git will succeed, but RecordChunkDecision will fail (chunk missing in DB)
 	err = processor.ProcessChunkDecision("fc-storefail", 0, "accept", "")
 
 	// Should return an error (storage failure after git success)
@@ -1602,28 +1721,18 @@ func TestProcessChunkDecisionStorageFailureAfterGit(t *testing.T) {
 		t.Fatal("expected error when storage fails after git success")
 	}
 
-	// The error should be storage.save_failed since RecordChunkDecision failed
-	if !apperrors.IsCode(err, apperrors.CodeStorageSaveFailed) {
-		t.Errorf("expected storage.save_failed error, got: %v", err)
+	// The error should be storage.not_found since the chunk isn't in DB
+	if !apperrors.IsCode(err, apperrors.CodeStorageNotFound) {
+		t.Errorf("expected storage.not_found error, got: %v", err)
 	}
 
-	// Git operation should have succeeded - verify chunk 0 is staged
+	// Rollback should undo staging after storage failure
 	cmd := exec.Command("git", "diff", "--cached")
 	cmd.Dir = dir
 	out, _ := cmd.CombinedOutput()
 	staged := string(out)
-	if !contains(staged, "line1-CHANGED") {
-		t.Error("expected chunk 0 to be staged (git succeeded before storage failed)")
-	}
-
-	// Verify the chunk is still pending in storage
-	// (RecordChunkDecision failed, so status wasn't changed)
-	chunk, err := store.GetChunk("fc-storefail", 0)
-	if err != nil {
-		t.Fatalf("get chunk failed: %v", err)
-	}
-	if chunk.Status != storage.CardPending {
-		t.Errorf("expected chunk to remain pending after storage failure, got: %s", chunk.Status)
+	if staged != "" {
+		t.Errorf("expected no staged changes after rollback, got: %s", staged)
 	}
 }
 
