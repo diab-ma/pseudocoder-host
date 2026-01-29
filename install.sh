@@ -68,7 +68,7 @@ info "Detected platform: ${OS}-${ARCH}"
 info "Fetching latest release..."
 RELEASE_JSON=$(curl -sSL \
     -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${REPO}/releases" | head -200)
+    "https://api.github.com/repos/${REPO}/releases")
 
 # Extract version and asset URL
 VERSION=$(echo "$RELEASE_JSON" | grep -o '"tag_name": "[^"]*' | head -1 | cut -d'"' -f4)
