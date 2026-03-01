@@ -34,7 +34,7 @@ var (
 // PairingConfig holds configuration for the pairing manager.
 type PairingConfig struct {
 	// CodeExpiry is how long a pairing code remains valid.
-	// Default: 5 minutes.
+	// Default: 2 minutes.
 	CodeExpiry time.Duration
 
 	// MaxAttemptsPerMinute is the rate limit for pairing attempts.
@@ -83,7 +83,7 @@ type pairingCode struct {
 func NewPairingManager(config PairingConfig) *PairingManager {
 	// Apply defaults
 	if config.CodeExpiry == 0 {
-		config.CodeExpiry = 5 * time.Minute
+		config.CodeExpiry = 2 * time.Minute
 	}
 	if config.MaxAttemptsPerMinute == 0 {
 		config.MaxAttemptsPerMinute = 5

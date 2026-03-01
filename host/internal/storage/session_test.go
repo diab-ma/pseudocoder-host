@@ -52,6 +52,9 @@ func TestSaveSession(t *testing.T) {
 	if got.Status != session.Status {
 		t.Errorf("Status = %q, want %q", got.Status, session.Status)
 	}
+	if got.IsSystem != session.IsSystem {
+		t.Errorf("IsSystem = %v, want %v", got.IsSystem, session.IsSystem)
+	}
 	// Compare times with tolerance for parsing roundtrip
 	if got.StartedAt.Sub(session.StartedAt).Abs() > time.Millisecond {
 		t.Errorf("StartedAt = %v, want %v", got.StartedAt, session.StartedAt)
@@ -91,6 +94,40 @@ func TestSaveSessionWithLastCommit(t *testing.T) {
 
 	if got.LastCommit != session.LastCommit {
 		t.Errorf("LastCommit = %q, want %q", got.LastCommit, session.LastCommit)
+	}
+}
+
+func TestSaveSessionWithSystemFlag(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().Truncate(time.Millisecond)
+	session := &Session{
+		ID:        "session-system",
+		Repo:      "/path/to/repo",
+		Branch:    "main",
+		StartedAt: now,
+		LastSeen:  now,
+		Status:    SessionStatusRunning,
+		IsSystem:  true,
+	}
+
+	if err := store.SaveSession(session); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+
+	got, err := store.GetSession("session-system")
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetSession returned nil")
+	}
+	if !got.IsSystem {
+		t.Fatalf("IsSystem = %v, want true", got.IsSystem)
 	}
 }
 
@@ -371,6 +408,100 @@ func TestUpdateSessionStatus(t *testing.T) {
 
 	if got.Status != SessionStatusError {
 		t.Errorf("Status = %q, want %q", got.Status, SessionStatusError)
+	}
+}
+
+// TestClearArchivedSessions verifies that only archived statuses are deleted.
+func TestClearArchivedSessions(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().Truncate(time.Millisecond)
+	input := []*Session{
+		{
+			ID:        "running-1",
+			Repo:      "/path/to/repo",
+			Branch:    "main",
+			StartedAt: now,
+			LastSeen:  now,
+			Status:    SessionStatusRunning,
+		},
+		{
+			ID:        "complete-1",
+			Repo:      "/path/to/repo",
+			Branch:    "main",
+			StartedAt: now.Add(time.Minute),
+			LastSeen:  now.Add(time.Minute),
+			Status:    SessionStatusComplete,
+		},
+		{
+			ID:        "error-1",
+			Repo:      "/path/to/repo",
+			Branch:    "main",
+			StartedAt: now.Add(2 * time.Minute),
+			LastSeen:  now.Add(2 * time.Minute),
+			Status:    SessionStatusError,
+		},
+		{
+			ID:        "system-complete",
+			Repo:      "/path/to/repo",
+			Branch:    "main",
+			StartedAt: now.Add(3 * time.Minute),
+			LastSeen:  now.Add(3 * time.Minute),
+			Status:    SessionStatusComplete,
+			IsSystem:  true,
+		},
+	}
+
+	for _, s := range input {
+		if err := store.SaveSession(s); err != nil {
+			t.Fatalf("SaveSession(%s) failed: %v", s.ID, err)
+		}
+	}
+
+	deleted, err := store.ClearArchivedSessions()
+	if err != nil {
+		t.Fatalf("ClearArchivedSessions failed: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+
+	remaining, err := store.ListSessions(0)
+	if err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("remaining sessions = %d, want 2", len(remaining))
+	}
+	if remaining[0].ID != "system-complete" {
+		t.Fatalf("remaining[0] session ID = %s, want system-complete", remaining[0].ID)
+	}
+	if remaining[1].ID != "running-1" {
+		t.Fatalf("remaining[1] session ID = %s, want running-1", remaining[1].ID)
+	}
+	if !remaining[0].IsSystem {
+		t.Fatal("remaining system session lost IsSystem=true")
+	}
+}
+
+// TestClearArchivedSessionsEmpty verifies idempotent zero-delete behavior.
+func TestClearArchivedSessionsEmpty(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	deleted, err := store.ClearArchivedSessions()
+	if err != nil {
+		t.Fatalf("ClearArchivedSessions failed: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("deleted = %d, want 0", deleted)
 	}
 }
 

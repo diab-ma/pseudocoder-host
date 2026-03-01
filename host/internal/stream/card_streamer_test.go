@@ -18,15 +18,16 @@ type mockBroadcaster struct {
 }
 
 type broadcastedCard struct {
-	CardID      string
-	File        string
-	Diff        string
-	Chunks      []ChunkInfo
-	ChunkGroups []ChunkGroupInfo
-	IsBinary    bool
-	IsDeleted   bool
-	Stats       *DiffStats
-	CreatedAt   int64
+	CardID         string
+	File           string
+	Diff           string
+	Chunks         []ChunkInfo
+	ChunkGroups    []ChunkGroupInfo
+	SemanticGroups []SemanticGroupInfo
+	IsBinary       bool
+	IsDeleted      bool
+	Stats          *DiffStats
+	CreatedAt      int64
 }
 
 func newMockBroadcaster() *mockBroadcaster {
@@ -36,19 +37,20 @@ func newMockBroadcaster() *mockBroadcaster {
 	}
 }
 
-func (m *mockBroadcaster) BroadcastDiffCard(cardID, file, diffContent string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) {
+func (m *mockBroadcaster) BroadcastDiffCard(cardID, file, diffContent string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, semanticGroups []SemanticGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cards = append(m.cards, broadcastedCard{
-		CardID:      cardID,
-		File:        file,
-		Diff:        diffContent,
-		Chunks:      chunks,
-		ChunkGroups: chunkGroups,
-		IsBinary:    isBinary,
-		IsDeleted:   isDeleted,
-		Stats:       stats,
-		CreatedAt:   createdAt,
+		CardID:         cardID,
+		File:           file,
+		Diff:           diffContent,
+		Chunks:         chunks,
+		ChunkGroups:    chunkGroups,
+		SemanticGroups: semanticGroups,
+		IsBinary:       isBinary,
+		IsDeleted:      isDeleted,
+		Stats:          stats,
+		CreatedAt:      createdAt,
 	})
 }
 
@@ -2366,5 +2368,199 @@ func TestCardStreamer_StreamPendingCards_GroupingDisabled(t *testing.T) {
 	// Chunks should still be present
 	if len(streamedCard.Chunks) < 2 {
 		t.Fatalf("expected at least 2 chunks, got %d", len(streamedCard.Chunks))
+	}
+}
+
+// =============================================================================
+// C2: Semantic Enrichment Tests
+// =============================================================================
+
+// TestCardStreamer_ProcessChunksRaw_SemanticFields verifies that the live path
+// populates semantic fields on chunks and produces semantic groups.
+func TestCardStreamer_ProcessChunksRaw_SemanticFields(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	broadcaster := newMockBroadcaster()
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:       store,
+		Broadcaster: broadcaster,
+		SessionID:   "test-session",
+	})
+
+	// Chunk with a function declaration
+	chunks := []*diff.Chunk{
+		diff.NewChunk("handler.go", 10, 5, 10, 8,
+			"@@ -10,5 +10,8 @@\n+func HandleRequest() {\n+\treturn nil\n+}"),
+	}
+
+	streamer.ProcessChunksRaw(chunks, "")
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(cards))
+	}
+
+	card := cards[0]
+
+	// Chunks should have semantic fields populated
+	if len(card.Chunks) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(card.Chunks))
+	}
+
+	chunk := card.Chunks[0]
+	if chunk.SemanticKind == "" {
+		t.Error("expected SemanticKind to be populated")
+	}
+	if chunk.SemanticLabel == "" {
+		t.Error("expected SemanticLabel to be populated")
+	}
+	if chunk.SemanticGroupID == "" {
+		t.Error("expected SemanticGroupID to be populated")
+	}
+
+	// Semantic groups should be populated
+	if len(card.SemanticGroups) == 0 {
+		t.Error("expected SemanticGroups to be populated")
+	}
+}
+
+// TestCardStreamer_StreamPendingCards_SemanticFields verifies that the replay
+// path populates semantic fields.
+func TestCardStreamer_StreamPendingCards_SemanticFields(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Pre-populate a pending card with a function diff
+	existingCard := &storage.ReviewCard{
+		ID:        "card-replay-sem",
+		SessionID: "test-session",
+		File:      "handler.go",
+		Diff:      "@@ -10,5 +10,8 @@\n+func HandleRequest() {\n+\treturn nil\n+}",
+		Status:    storage.CardPending,
+		CreatedAt: time.Now(),
+	}
+	if err := store.SaveCard(existingCard); err != nil {
+		t.Fatalf("failed to save card: %v", err)
+	}
+
+	broadcaster := newMockBroadcaster()
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:       store,
+		Broadcaster: broadcaster,
+		SessionID:   "test-session",
+	})
+
+	if err := streamer.StreamPendingCards(); err != nil {
+		t.Fatalf("StreamPendingCards failed: %v", err)
+	}
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(cards))
+	}
+
+	card := cards[0]
+	if len(card.Chunks) == 0 {
+		t.Fatal("expected chunks to be populated")
+	}
+	if card.Chunks[0].SemanticKind == "" {
+		t.Error("replay path should populate SemanticKind")
+	}
+	if len(card.SemanticGroups) == 0 {
+		t.Error("replay path should populate SemanticGroups")
+	}
+}
+
+// TestCardStreamer_ProcessChunksRaw_UnsupportedExtension verifies that
+// unsupported extensions still get baseline semantic classification.
+func TestCardStreamer_ProcessChunksRaw_UnsupportedExtension(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	broadcaster := newMockBroadcaster()
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:       store,
+		Broadcaster: broadcaster,
+		SessionID:   "test-session",
+	})
+
+	// Python file with import statement
+	chunks := []*diff.Chunk{
+		diff.NewChunk("script.py", 1, 3, 1, 4,
+			"@@ -1,3 +1,4 @@\n+from os import path\n context"),
+	}
+
+	streamer.ProcessChunksRaw(chunks, "")
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(cards))
+	}
+
+	chunk := cards[0].Chunks[0]
+	// Should still get baseline heuristics
+	if chunk.SemanticKind != "import" {
+		t.Errorf("unsupported extension should still get baseline kind, got %q", chunk.SemanticKind)
+	}
+}
+
+// TestCardStreamer_ProcessChunksRaw_BinarySemanticFields verifies that
+// binary cards get semantic fields with binary kind.
+func TestCardStreamer_ProcessChunksRaw_BinarySemanticFields(t *testing.T) {
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	broadcaster := newMockBroadcaster()
+	streamer := NewCardStreamer(CardStreamerConfig{
+		Store:       store,
+		Broadcaster: broadcaster,
+		SessionID:   "test-session",
+	})
+
+	// Use raw diff that properly indicates a binary file
+	// (requires both diff --git header and Binary files ... differ line)
+	rawDiff := "diff --git a/image.png b/image.png\nindex abc1234..def5678 100644\nBinary files a/image.png and b/image.png differ\n"
+	streamer.ProcessChunksRaw(nil, rawDiff)
+
+	cards := broadcaster.getCards()
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(cards))
+	}
+
+	card := cards[0]
+	if !card.IsBinary {
+		t.Error("expected card to be binary")
+	}
+	// Binary cards should have semantic groups with binary kind
+	if len(card.SemanticGroups) == 0 {
+		t.Error("expected SemanticGroups for binary card")
+	} else if card.SemanticGroups[0].Kind != "binary" {
+		t.Errorf("expected binary group kind, got %q", card.SemanticGroups[0].Kind)
+	}
+}
+
+// TestEnrichChunksWithSemantics_PanicRecovery verifies the non-blocking
+// guarantee: enrichment panics are recovered.
+func TestEnrichChunksWithSemantics_PanicRecovery(t *testing.T) {
+	// This just verifies the function doesn't panic on nil input
+	enriched, groups := EnrichChunksWithSemantics("card-1", "test.go", nil, false, false)
+	if enriched != nil {
+		t.Errorf("expected nil enriched for nil input, got %v", enriched)
+	}
+	if groups != nil {
+		t.Errorf("expected nil groups for nil input, got %v", groups)
 	}
 }

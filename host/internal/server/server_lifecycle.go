@@ -180,6 +180,7 @@ func (s *Server) Stop() error {
 	// This must happen after setting stopped=true to prevent panics
 	// from concurrent Broadcast() calls.
 	close(s.broadcast)
+	s.stopKeepAwake()
 
 	s.mu.Unlock()
 

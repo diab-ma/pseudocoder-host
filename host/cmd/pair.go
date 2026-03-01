@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ var (
 	errPairSocketNotFound    = errors.New("pairing socket not found")
 	errPairSocketPermission  = errors.New("pairing socket permission denied")
 	errPairSocketUnavailable = errors.New("pairing socket unavailable")
+	errPairSocketNonSocket   = errors.New("pairing socket path is not a socket")
 )
 
 var (
@@ -60,7 +62,7 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: pseudocoder pair [options]\n\nGenerate a short pairing code for mobile device.\n\nOptions:\n")
 		fs.PrintDefaults()
-		fmt.Fprintf(stderr, "\nThe pairing code is valid for 5 minutes and can only be used once.\n")
+		fmt.Fprintf(stderr, "\nThe pairing code is valid for 2 minutes and can only be used once.\n")
 		fmt.Fprintf(stderr, "The mobile app enters this code at the /pair endpoint to get an access token.\n")
 	}
 
@@ -125,8 +127,17 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 	code, expiry, fingerprint, err := requestPairingCode(cfg, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
-		fmt.Fprintf(stderr, "\nThe host must be running to generate a pairing code.\n")
-		fmt.Fprintf(stderr, "Start it with: pseudocoder host start --require-auth\n")
+
+		// A4: Print scenario-specific recovery guidance when the error
+		// matches a known failure pattern. Errors with structured host
+		// guidance ("\nNext: ") bypass local classification entirely.
+		scenario := classifyPairError(err)
+		if scenario != pairScenarioNone {
+			printRecoveryGuidance(stderr, scenario, cfg.PairSocket)
+		} else if !strings.Contains(err.Error(), "\nNext: ") {
+			fmt.Fprintf(stderr, "\nThe host must be running to generate a pairing code.\n")
+			fmt.Fprintf(stderr, "Start it with: pseudocoder host start --require-auth\n")
+		}
 		return 1
 	}
 
@@ -140,35 +151,51 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 }
 
 // requestPairingCode tries to get a pairing code from a running host daemon.
-// It attempts IPC first and falls back to loopback HTTP when the socket is missing.
-// Returns the pairing code, expiry time, and certificate fingerprint (empty if no TLS).
+// IPC-first: attempts Unix socket first. On success, optionally loads cert for
+// fingerprint display. On ENOENT, falls back to loopback HTTP with TLS.
+// All other IPC errors are hard-stops (no fallback).
 func requestPairingCode(cfg *PairConfig, stderr io.Writer) (code string, expiry time.Time, fingerprint string, err error) {
+	code, expiry, err = requestPairingCodeIPCFunc(cfg.PairSocket)
+	if err == nil {
+		// IPC succeeded. Load cert for fingerprint display only (not required).
+		if !cfg.NoTLS {
+			_, fp, loadErr := loadHostCertificate(cfg.TLSCert)
+			if loadErr == nil {
+				fingerprint = fp
+				fmt.Fprintf(stderr, "Using certificate: %s\n", cfg.TLSCert)
+				fmt.Fprintf(stderr, "Fingerprint: %s\n", fingerprint)
+			}
+			// Missing cert after IPC success is OK — fingerprint stays empty.
+		}
+		return code, expiry, fingerprint, nil
+	}
+
+	// Non-ENOENT IPC errors are hard-stops — no cert load, no fallback.
+	if errors.Is(err, errPairSocketPermission) {
+		return "", time.Time{}, "", fmt.Errorf("permission denied accessing pairing socket %s (run as the host user or fix permissions): %w", cfg.PairSocket, errPairSocketPermission)
+	}
+	if errors.Is(err, errPairSocketUnavailable) {
+		return "", time.Time{}, "", fmt.Errorf("pairing socket at %s is not accepting connections (restart the host): %w", cfg.PairSocket, errPairSocketUnavailable)
+	}
+	if errors.Is(err, errPairSocketNonSocket) {
+		return "", time.Time{}, "", fmt.Errorf("pairing socket path is not a socket: %s (remove it and restart host): %w", cfg.PairSocket, errPairSocketNonSocket)
+	}
+	if !errors.Is(err, errPairSocketNotFound) {
+		return "", time.Time{}, "", err
+	}
+
+	// ENOENT path: load cert before HTTP fallback.
+	fmt.Fprintf(stderr, "Warning: pairing IPC socket not found at %s; falling back to localhost HTTP\n", cfg.PairSocket)
+
 	var tlsConfig *tls.Config
-	if cfg.NoTLS {
-		fingerprint = ""
-	} else {
+	if !cfg.NoTLS {
 		var loadErr error
 		tlsConfig, fingerprint, loadErr = loadHostCertificate(cfg.TLSCert)
 		if loadErr != nil {
 			return "", time.Time{}, "", fmt.Errorf("failed to load host certificate: %w", loadErr)
 		}
-
 		fmt.Fprintf(stderr, "Using certificate: %s\n", cfg.TLSCert)
 		fmt.Fprintf(stderr, "Fingerprint: %s\n", fingerprint)
-	}
-
-	code, expiry, err = requestPairingCodeIPCFunc(cfg.PairSocket)
-	if err == nil {
-		return code, expiry, fingerprint, nil
-	}
-	if errors.Is(err, errPairSocketNotFound) {
-		fmt.Fprintf(stderr, "Warning: pairing IPC socket not found at %s; falling back to localhost HTTP\n", cfg.PairSocket)
-	} else if errors.Is(err, errPairSocketPermission) {
-		return "", time.Time{}, "", fmt.Errorf("permission denied accessing pairing socket %s (run as the host user or fix permissions)", cfg.PairSocket)
-	} else if errors.Is(err, errPairSocketUnavailable) {
-		return "", time.Time{}, "", fmt.Errorf("pairing socket at %s is not accepting connections (restart the host)", cfg.PairSocket)
-	} else {
-		return "", time.Time{}, "", err
 	}
 
 	code, expiry, err = requestPairingCodeHTTPFunc(cfg.Addrs, cfg.NoTLS, tlsConfig)
@@ -195,7 +222,7 @@ func requestPairingCodeIPC(socketPath string) (code string, expiry time.Time, er
 		return "", time.Time{}, fmt.Errorf("failed to stat pairing socket: %w", err)
 	}
 	if info.Mode()&os.ModeSocket == 0 {
-		return "", time.Time{}, fmt.Errorf("pairing socket path is not a socket: %s", socketPath)
+		return "", time.Time{}, fmt.Errorf("%w: %s", errPairSocketNonSocket, socketPath)
 	}
 
 	transport := &http.Transport{
@@ -274,11 +301,25 @@ func requestPairingCodeHTTP(addrs []string, noTLS bool, tlsConfig *tls.Config) (
 }
 
 func parsePairingCodeResponse(resp *http.Response) (code string, expiry time.Time, err error) {
-	if resp.StatusCode == http.StatusForbidden {
-		return "", time.Time{}, fmt.Errorf("pairing code generation is restricted to localhost")
-	}
-
 	if resp.StatusCode != http.StatusOK {
+		// Try to parse structured error response with error_code and next_action.
+		var errResp struct {
+			Error      string `json:"error"`
+			ErrorCode  string `json:"error_code"`
+			Message    string `json:"message"`
+			NextAction string `json:"next_action"`
+		}
+		if decErr := json.NewDecoder(resp.Body).Decode(&errResp); decErr == nil && errResp.Message != "" {
+			msg := errResp.Message
+			if errResp.NextAction != "" {
+				msg = fmt.Sprintf("%s\nNext: %s", msg, errResp.NextAction)
+			}
+			return "", time.Time{}, fmt.Errorf("%s", msg)
+		}
+		// Fallback for legacy hosts without structured error payloads.
+		if resp.StatusCode == http.StatusForbidden {
+			return "", time.Time{}, fmt.Errorf("pairing code generation is restricted to localhost")
+		}
 		return "", time.Time{}, fmt.Errorf("host returned status %d", resp.StatusCode)
 	}
 
@@ -291,6 +332,148 @@ func parsePairingCodeResponse(resp *http.Response) (code string, expiry time.Tim
 	}
 
 	return result.Code, result.Expiry, nil
+}
+
+// pairRecoveryScenario identifies the type of pairing failure for guided
+// recovery output.
+type pairRecoveryScenario int
+
+const (
+	pairScenarioNone pairRecoveryScenario = iota
+	pairScenarioStaleSocket
+	pairScenarioWrongPort
+	pairScenarioUnreachableHost
+	pairScenarioPermissionDenied
+	pairScenarioNonSocketPath
+	pairScenarioCertFailure
+)
+
+// classifyPairError determines the recovery scenario from an error returned
+// by requestPairingCode. Structured host guidance ("\nNext: " in error)
+// returns pairScenarioNone to preserve host-provided next_action. Then typed
+// sentinels, cert failure tokens, and finally wrong-port/unreachable tokens.
+func classifyPairError(err error) pairRecoveryScenario {
+	errText := err.Error()
+
+	// Structured host guidance takes precedence — preserve host next_action.
+	if strings.Contains(errText, "\nNext: ") {
+		return pairScenarioNone
+	}
+
+	// Typed sentinels.
+	if errors.Is(err, errPairSocketUnavailable) {
+		return pairScenarioStaleSocket
+	}
+	if errors.Is(err, errPairSocketPermission) {
+		return pairScenarioPermissionDenied
+	}
+	if errors.Is(err, errPairSocketNonSocket) {
+		return pairScenarioNonSocketPath
+	}
+
+	normalized := normalizeErrorText(errText)
+
+	// Cert failure tokens.
+	certTokens := []string{
+		"failed to load host certificate",
+		"certificate not found",
+		"failed to read certificate",
+		"failed to parse certificate",
+		"failed to compute fingerprint",
+	}
+	for _, token := range certTokens {
+		if strings.Contains(normalized, token) {
+			return pairScenarioCertFailure
+		}
+	}
+
+	// Wrong-port tokens (checked first per precedence rule).
+	wrongPortTokens := []string{
+		"connection refused",
+		"econnrefused",
+		"errno = 61",
+		"errno = 111",
+	}
+	for _, token := range wrongPortTokens {
+		if strings.Contains(normalized, token) {
+			return pairScenarioWrongPort
+		}
+	}
+
+	// Unreachable-host tokens.
+	unreachableTokens := []string{
+		"i/o timeout",
+		"no such host",
+		"network is unreachable",
+		"host is unreachable",
+	}
+	for _, token := range unreachableTokens {
+		if strings.Contains(normalized, token) {
+			return pairScenarioUnreachableHost
+		}
+	}
+
+	return pairScenarioNone
+}
+
+// normalizeErrorText trims whitespace, lowercases, and collapses repeated
+// internal spaces. Shared normalization for the canonical wrong-port matcher.
+func normalizeErrorText(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ToLower(s)
+	// Collapse repeated spaces.
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	return s
+}
+
+// printRecoveryGuidance prints scenario-specific recovery steps to stderr.
+func printRecoveryGuidance(w io.Writer, scenario pairRecoveryScenario, socketPath string) {
+	switch scenario {
+	case pairScenarioStaleSocket:
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Recovery: Stale Pairing Socket")
+		fmt.Fprintln(w, "  1. Check if the host process is running.")
+		fmt.Fprintf(w, "  2. If the host is stopped, remove the stale socket: rm %s\n", socketPath)
+		fmt.Fprintln(w, "  3. Restart the host and retry: pseudocoder host start --require-auth && pseudocoder pair")
+
+	case pairScenarioWrongPort:
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Recovery: Wrong Port")
+		fmt.Fprintln(w, "  1. Verify the active host bind address and port: pseudocoder host status")
+		fmt.Fprintln(w, "  2. Retry with the correct port: pseudocoder pair --port <port>")
+
+	case pairScenarioUnreachableHost:
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Recovery: Host Unreachable")
+		fmt.Fprintln(w, "  1. Verify the host process is running and reachable on LAN or Tailscale.")
+		fmt.Fprintln(w, "  2. Run diagnostics: pseudocoder doctor")
+		fmt.Fprintln(w, "  3. Retry: pseudocoder pair")
+
+	case pairScenarioPermissionDenied:
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Recovery: Permission Denied")
+		fmt.Fprintf(w, "  1. Check socket permissions: ls -l %s\n", socketPath)
+		fmt.Fprintln(w, "  2. Run as the host user or fix permissions on the socket file.")
+		fmt.Fprintln(w, "  3. Retry: pseudocoder pair")
+
+	case pairScenarioNonSocketPath:
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Recovery: Non-Socket Path")
+		fmt.Fprintf(w, "  1. Remove the non-socket file: rm %s\n", socketPath)
+		fmt.Fprintln(w, "  2. Restart the host: pseudocoder host start --require-auth")
+		fmt.Fprintln(w, "  3. Retry: pseudocoder pair")
+
+	case pairScenarioCertFailure:
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Recovery: Certificate Failure")
+		fmt.Fprintln(w, "  1. Regenerate certs: rm -rf ~/.pseudocoder/certs && pseudocoder host start --require-auth")
+		fmt.Fprintln(w, "  2. Or use insecure mode: pseudocoder pair --no-tls")
+
+	case pairScenarioNone:
+		// No specific guidance for unclassified errors.
+	}
 }
 
 // loadHostCertificate loads the host's TLS certificate and creates a TLS config

@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"log"
+	"time"
 
 	// Internal error codes package for standardized error handling.
 	apperrors "github.com/pseudocoder/host/internal/errors"
@@ -14,6 +15,7 @@ import (
 // Phase 5.5: Single session support.
 // Phase 9.3: Multi-session routing via SessionManager.
 func (c *Client) handleTerminalInput(data []byte) {
+	start := time.Now()
 	// Parse the full message with the typed payload
 	var msg struct {
 		Type    MessageType          `json:"type"`
@@ -56,7 +58,9 @@ func (c *Client) handleTerminalInput(data []byte) {
 			if _, err := session.Write([]byte(payload.Data)); err != nil {
 				log.Printf("Failed to write to session %s: %v", payload.SessionID, err)
 				c.sendError(apperrors.CodeInputWriteFailed, "failed to write to terminal")
+				return
 			}
+			c.recordTerminalLatency(start)
 			return
 		}
 		// Session not found in manager - return consistent error with other handlers.
@@ -93,6 +97,21 @@ func (c *Client) handleTerminalInput(data []byte) {
 		log.Printf("Failed to write to PTY: %v", err)
 		c.sendError(apperrors.CodeInputWriteFailed, "failed to write to terminal")
 		return
+	}
+	c.recordTerminalLatency(start)
+}
+
+// recordTerminalLatency records terminal input latency to the metrics store.
+func (c *Client) recordTerminalLatency(start time.Time) {
+	c.server.mu.RLock()
+	ms := c.server.metricsStore
+	c.server.mu.RUnlock()
+	if ms == nil {
+		return
+	}
+	elapsed := time.Since(start).Milliseconds()
+	if err := ms.RecordLatency("terminal_input", elapsed); err != nil {
+		log.Printf("metrics: failed to record terminal latency: %v", err)
 	}
 }
 

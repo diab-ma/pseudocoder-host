@@ -48,6 +48,13 @@ const (
 	CodeServerSendFailed     = "server.send_failed"     // Failed to send message
 	CodeServerConnectionLost = "server.connection_lost" // Connection unexpectedly closed
 
+	// Server domain - connection classification taxonomy (A3: mobile-side triggers)
+	CodeServerCertExpired   = "server.cert_expired"   // Certificate date invalid (expired or not-yet-valid)
+	CodeServerCertMismatch  = "server.cert_mismatch"  // Fingerprint mismatch (MITM or cert rotation)
+	CodeServerCertUntrusted = "server.cert_untrusted" // TLS handshake failed (unknown CA / self-signed)
+	CodeServerTimeout       = "server.timeout"        // Connection or operation timed out
+	CodeServerUnreachable   = "server.unreachable"    // DNS/socket/transport failure fallback
+
 	// Session domain - PTY and process errors
 	CodeSessionAlreadyRunning = "session.already_running" // Session already started
 	CodeSessionNotRunning     = "session.not_running"     // Session not started
@@ -74,6 +81,21 @@ const (
 	CodeAuthExpired       = "auth.expired"        // Token or session expired
 	CodeAuthDeviceRevoked = "auth.device_revoked" // Device has been revoked
 
+	// Auth domain - pairing endpoint taxonomy (A3: /pair)
+	CodeAuthPairMethodNotAllowed = "auth.pair_method_not_allowed" // POST-only endpoint
+	CodeAuthPairMissingCode      = "auth.pair_missing_code"       // No pairing code in request
+	CodeAuthPairInvalidRequest   = "auth.pair_invalid_request"    // Malformed request JSON
+	CodeAuthPairInvalidCode      = "auth.pair_invalid_code"       // Wrong pairing code
+	CodeAuthPairExpiredCode      = "auth.pair_expired_code"       // Pairing code expired
+	CodeAuthPairUsedCode         = "auth.pair_used_code"          // One-time code already used
+	CodeAuthPairRateLimited      = "auth.pair_rate_limited"       // Too many pairing attempts
+	CodeAuthPairInternal         = "auth.pair_internal"           // Unexpected host error during pairing
+
+	// Auth domain - pairing code generation endpoint taxonomy (A3: /pair/generate)
+	CodeAuthPairGenerateForbidden        = "auth.pair_generate_forbidden"          // Not from loopback/unix socket
+	CodeAuthPairGenerateMethodNotAllowed = "auth.pair_generate_method_not_allowed" // POST-only endpoint
+	CodeAuthPairGenerateInternal         = "auth.pair_generate_internal"           // Host failed to generate code
+
 	// Approval domain - CLI command approval broker (Phase 6)
 	CodeApprovalTimeout      = "approval.timeout"       // Approval request timed out
 	CodeApprovalDenied       = "approval.denied"        // Approval explicitly denied
@@ -82,10 +104,12 @@ const (
 	CodeApprovalInvalidToken = "approval.invalid_token" // Invalid or missing approval token
 
 	// Commit domain - git commit errors (Phase 6)
-	CodeCommitNoStagedChanges = "commit.no_staged_changes" // Nothing staged to commit
-	CodeCommitEmptyMessage    = "commit.empty_message"     // Commit message is empty
-	CodeCommitHookFailed      = "commit.hook_failed"       // Pre-commit or commit-msg hook failed
-	CodeCommitGitError        = "commit.git_error"         // General git commit error
+	CodeCommitNoStagedChanges  = "commit.no_staged_changes" // Nothing staged to commit
+	CodeCommitEmptyMessage     = "commit.empty_message"     // Commit message is empty
+	CodeCommitHookFailed       = "commit.hook_failed"       // Pre-commit or commit-msg hook failed
+	CodeCommitGitError         = "commit.git_error"         // General git commit error
+	CodeCommitReadinessBlocked = "commit.readiness_blocked" // Readiness blockers prevent commit
+	CodeCommitOverrideRequired = "commit.override_required" // Advisory warnings require explicit override
 
 	// Push domain - git push errors (Phase 6.6)
 	CodePushNoUpstream     = "push.no_upstream"  // No upstream configured and remote/branch not provided
@@ -100,6 +124,33 @@ const (
 	CodeTmuxSessionNotFound = "tmux.session_not_found" // Requested tmux session does not exist
 	CodeTmuxAttachFailed    = "tmux.attach_failed"     // Failed to attach to tmux session
 	CodeTmuxKillFailed      = "tmux.kill_failed"       // Failed to kill tmux session
+
+	// Sync domain - git fetch/pull errors (Phase 9 P9U3)
+	CodeSyncNonFF        = "sync.non_ff"        // Pull cannot fast-forward
+	CodeSyncAuthFailed   = "sync.auth_failed"   // SSH key or credential failure during fetch/pull
+	CodeSyncNetworkError = "sync.network_error" // Network unreachable during fetch/pull
+	CodeSyncTimeout      = "sync.timeout"       // Fetch/pull operation timed out
+	CodeSyncGitError     = "sync.git_error"     // General git fetch/pull error
+
+	// PR domain - GitHub PR operations via gh CLI (Phase 9 P9U4)
+	CodePrGhMissing            = "pr.gh_missing"             // gh CLI not found on host
+	CodePrAuthRequired         = "pr.auth_required"          // gh requires authentication
+	CodePrRepoUnsupported      = "pr.repo_unsupported"       // Repository not hosted on GitHub
+	CodePrNotFound             = "pr.not_found"              // PR number does not exist
+	CodePrValidationFailed     = "pr.validation_failed"      // Input validation failed (title, number, etc.)
+	CodePrCheckoutBlockedDirty = "pr.checkout_blocked_dirty" // Working tree dirty blocks checkout
+	CodePrCheckoutBlockedDraft = "pr.checkout_blocked_draft" // Mobile-local draft blocks checkout (never emitted by host)
+	CodePrNetworkError         = "pr.network_error"          // Network failure during gh operation
+	CodePrTimeout              = "pr.timeout"                // gh operation timed out
+	CodePrGhError              = "pr.gh_error"               // General gh CLI error
+
+	// Keep-awake domain - host runtime keep-awake lifecycle (Phase 17)
+	CodeKeepAwakePolicyDisabled         = "keep_awake.policy_disabled"         // Remote keep-awake policy is disabled
+	CodeKeepAwakeUnauthorized           = "keep_awake.unauthorized"            // Caller lacks permission for keep-awake mutation
+	CodeKeepAwakeUnsupportedEnvironment = "keep_awake.unsupported_environment" // Host environment cannot acquire inhibitor
+	CodeKeepAwakeAcquireFailed          = "keep_awake.acquire_failed"          // Host failed to acquire inhibitor
+	CodeKeepAwakeConflict               = "keep_awake.conflict"                // Keep-awake mutation conflict or fail-closed audit conflict
+	CodeKeepAwakeExpired                = "keep_awake.expired"                 // Lease expired before requested operation
 
 	// Undo domain - undo operation errors (Phase 20, 25)
 	CodeUndoConflict       = "undo.conflict"        // Patch apply failed during undo (conflicts)
@@ -205,6 +256,46 @@ func ToCodeAndMessage(err error) (code, message string) {
 // IsCode checks if an error has a specific error code.
 func IsCode(err error, code string) bool {
 	return GetCode(err) == code
+}
+
+// NextAction maps taxonomy error codes to their primary recovery guidance.
+// Each high-frequency failure has exactly one concrete next action.
+var NextAction = map[string]string{
+	// /pair endpoint
+	CodeAuthPairMethodNotAllowed: "Submit pairing from the mobile app (POST /pair with JSON body containing code).",
+	CodeAuthPairMissingCode:      "Enter the 6-digit code shown by `pseudocoder pair`.",
+	CodeAuthPairInvalidRequest:   "Retry pairing from mobile; if repeated, verify host and mobile are on compatible versions.",
+	CodeAuthPairInvalidCode:      "Run `pseudocoder pair` and enter the newest 6-digit code.",
+	CodeAuthPairExpiredCode:      "Run `pseudocoder pair` to generate a new code (valid for 2 minutes).",
+	CodeAuthPairUsedCode:         "Run `pseudocoder pair` to generate a new one-time code.",
+	CodeAuthPairRateLimited:      "Wait 60 seconds, then retry with a fresh code.",
+	CodeAuthPairInternal:         "Run `pseudocoder doctor`, then retry pairing.",
+	// /pair/generate endpoint
+	CodeAuthPairGenerateForbidden:        "Run `pseudocoder pair` on the host machine (local shell or SSH), then retry.",
+	CodeAuthPairGenerateMethodNotAllowed: "Use `pseudocoder pair`; do not call /pair/generate with non-POST methods.",
+	CodeAuthPairGenerateInternal:         "Run `pseudocoder doctor`, restart host with `pseudocoder host start --require-auth`, then retry `pseudocoder pair`.",
+	// Connection classification (mobile-side, for reference parity)
+	CodeServerCertExpired:   "Regenerate host certs under ~/.pseudocoder/certs and restart host.",
+	CodeServerCertMismatch:  "Compare fingerprints with host output and re-pair only if match is expected.",
+	CodeServerCertUntrusted: "Verify fingerprint from `pseudocoder pair --qr` and trust only if it matches.",
+	CodeServerTimeout:       "Check LAN/Tailscale reachability and rerun `pseudocoder doctor`.",
+	CodeServerUnreachable:   "Verify host/port and host process (`pseudocoder start`), then retry.",
+	// Commit readiness
+	CodeCommitReadinessBlocked: "Resolve commit blockers before retrying commit.",
+	CodeCommitOverrideRequired: "Review warnings and confirm commit override if intended.",
+	// Keep-awake
+	CodeKeepAwakePolicyDisabled:         "Enable keep-awake policy on the host before retrying.",
+	CodeKeepAwakeUnauthorized:           "Use an authorized device or request host admin approval.",
+	CodeKeepAwakeUnsupportedEnvironment: "This host cannot provide keep-awake in the current environment.",
+	CodeKeepAwakeAcquireFailed:          "Retry keep-awake; if repeated, run `pseudocoder doctor` and inspect host logs.",
+	CodeKeepAwakeConflict:               "Retry with a new request after host state refresh.",
+	CodeKeepAwakeExpired:                "Request a new keep-awake lease.",
+}
+
+// GetNextAction returns the primary recovery guidance for an error code.
+// Returns empty string if no next action is defined.
+func GetNextAction(code string) string {
+	return NextAction[code]
 }
 
 // Common error constructors for frequently used error types.
@@ -376,6 +467,26 @@ func CommitGitError(cause error) *CodedError {
 	return Wrap(CodeCommitGitError, "git commit failed", cause)
 }
 
+// CommitReadinessBlocked creates a "commit.readiness_blocked" error.
+// This indicates one or more hard readiness blockers prevent commit.
+func CommitReadinessBlocked(blockers []string) *CodedError {
+	msg := "commit blocked by readiness checks"
+	if len(blockers) > 0 {
+		msg = fmt.Sprintf("commit blocked by readiness checks: %s", strings.Join(blockers, ", "))
+	}
+	return New(CodeCommitReadinessBlocked, msg)
+}
+
+// CommitOverrideRequired creates a "commit.override_required" error.
+// This indicates advisory warnings require explicit user override before commit.
+func CommitOverrideRequired(warnings []string) *CodedError {
+	msg := "commit warnings require explicit override"
+	if len(warnings) > 0 {
+		msg = fmt.Sprintf("commit warnings require explicit override: %s", strings.Join(warnings, ", "))
+	}
+	return New(CodeCommitOverrideRequired, msg)
+}
+
 // PushNoUpstream creates a "push.no_upstream" error.
 // This indicates no upstream is configured and remote/branch must be specified.
 func PushNoUpstream() *CodedError {
@@ -414,6 +525,114 @@ func PushGitError(cause error) *CodedError {
 // (e.g., starts with '-' for option injection, or contains shell metacharacters).
 func PushInvalidArgs(reason string) *CodedError {
 	return New(CodePushInvalidArgs, fmt.Sprintf("invalid push argument: %s", reason))
+}
+
+// SyncNonFF creates a "sync.non_ff" error.
+// This indicates a pull cannot fast-forward and requires manual resolution.
+func SyncNonFF(output string) *CodedError {
+	msg := "pull cannot fast-forward - merge or rebase required"
+	if output != "" {
+		msg = fmt.Sprintf("%s: %s", msg, output)
+	}
+	return New(CodeSyncNonFF, msg)
+}
+
+// SyncAuthFailed creates a "sync.auth_failed" error.
+// This indicates authentication failed during fetch or pull.
+func SyncAuthFailed(output string) *CodedError {
+	msg := "fetch/pull failed - check SSH keys or credentials"
+	if output != "" {
+		msg = fmt.Sprintf("%s: %s", msg, output)
+	}
+	return New(CodeSyncAuthFailed, msg)
+}
+
+// SyncNetworkError creates a "sync.network_error" error.
+// This indicates a network error during fetch or pull.
+func SyncNetworkError(cause error) *CodedError {
+	return Wrap(CodeSyncNetworkError, "fetch/pull failed - network error", cause)
+}
+
+// SyncTimeout creates a "sync.timeout" error.
+// This indicates the fetch or pull operation timed out.
+func SyncTimeout(cause error) *CodedError {
+	return Wrap(CodeSyncTimeout, "fetch/pull timed out", cause)
+}
+
+// SyncGitError creates a "sync.git_error" error.
+// This wraps general git fetch/pull errors that don't fit other categories.
+func SyncGitError(cause error) *CodedError {
+	return Wrap(CodeSyncGitError, "git fetch/pull failed", cause)
+}
+
+// PrGhMissing creates a "pr.gh_missing" error.
+// This indicates the gh CLI is not installed on the host.
+func PrGhMissing() *CodedError {
+	return New(CodePrGhMissing, "gh CLI not found - install GitHub CLI to use PR features")
+}
+
+// PrAuthRequired creates a "pr.auth_required" error.
+// This indicates gh requires authentication before PR operations.
+func PrAuthRequired(output string) *CodedError {
+	msg := "gh authentication required - run 'gh auth login'"
+	if output != "" {
+		msg = fmt.Sprintf("%s: %s", msg, output)
+	}
+	return New(CodePrAuthRequired, msg)
+}
+
+// PrRepoUnsupported creates a "pr.repo_unsupported" error.
+// This indicates the repository is not hosted on GitHub.
+func PrRepoUnsupported(output string) *CodedError {
+	msg := "repository not hosted on GitHub"
+	if output != "" {
+		msg = fmt.Sprintf("%s: %s", msg, output)
+	}
+	return New(CodePrRepoUnsupported, msg)
+}
+
+// PrNotFound creates a "pr.not_found" error.
+// This indicates the specified PR number does not exist.
+func PrNotFound(number int) *CodedError {
+	return New(CodePrNotFound, fmt.Sprintf("pull request #%d not found", number))
+}
+
+// PrValidationFailed creates a "pr.validation_failed" error.
+// This indicates input validation failed for a PR operation.
+func PrValidationFailed(message string) *CodedError {
+	msg := "PR validation failed"
+	if message != "" {
+		msg = fmt.Sprintf("%s: %s", msg, message)
+	}
+	return New(CodePrValidationFailed, msg)
+}
+
+// PrCheckoutBlockedDirty creates a "pr.checkout_blocked_dirty" error.
+// This indicates the working tree has dirty state that blocks PR checkout.
+func PrCheckoutBlockedDirty(blockers []string) *CodedError {
+	msg := "PR checkout blocked by dirty working tree"
+	if len(blockers) > 0 {
+		msg = fmt.Sprintf("%s: %s", msg, strings.Join(blockers, ", "))
+	}
+	return New(CodePrCheckoutBlockedDirty, msg)
+}
+
+// PrNetworkError creates a "pr.network_error" error.
+// This indicates a network failure during a gh operation.
+func PrNetworkError(cause error) *CodedError {
+	return Wrap(CodePrNetworkError, "gh operation failed - network error", cause)
+}
+
+// PrTimeout creates a "pr.timeout" error.
+// This indicates a gh operation timed out.
+func PrTimeout(cause error) *CodedError {
+	return Wrap(CodePrTimeout, "gh operation timed out", cause)
+}
+
+// PrGhError creates a "pr.gh_error" error.
+// This wraps general gh CLI errors that don't fit other categories.
+func PrGhError(cause error) *CodedError {
+	return Wrap(CodePrGhError, "gh operation failed", cause)
 }
 
 // TmuxNotInstalled creates a "tmux.not_installed" error.

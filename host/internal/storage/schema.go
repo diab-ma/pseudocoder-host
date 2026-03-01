@@ -10,7 +10,7 @@ import (
 
 // currentSchemaVersion is the current database schema version.
 // Increment this when making schema changes and add migration logic.
-const currentSchemaVersion = 8
+const currentSchemaVersion = 10
 
 // initSchema creates the required tables if they don't exist.
 // Uses IF NOT EXISTS to make the operation idempotent.
@@ -81,6 +81,18 @@ func (s *SQLiteStore) initSchema() error {
 	if version < 8 {
 		if err := s.migrateToV8(); err != nil {
 			return fmt.Errorf("migrate to v8: %w", err)
+		}
+	}
+
+	if version < 9 {
+		if err := s.migrateToV9(); err != nil {
+			return fmt.Errorf("migrate to v9: %w", err)
+		}
+	}
+
+	if version < 10 {
+		if err := s.migrateToV10(); err != nil {
+			return fmt.Errorf("migrate to v10: %w", err)
 		}
 	}
 
@@ -604,6 +616,97 @@ func (s *SQLiteStore) migrateToV8() error {
 	_, err = tx.Exec(
 		"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
 		8,
+		time.Now().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// migrateToV9 adds system-session metadata to session history.
+// This enables mobile UI to hide host-managed internal sessions while keeping
+// runtime state intact.
+func (s *SQLiteStore) migrateToV9() error {
+	log.Printf("storage: applying migration to schema version 9")
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	const addColumn = `ALTER TABLE sessions ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0`
+	if _, err := tx.Exec(addColumn); err != nil {
+		// SQLite does not support IF NOT EXISTS for ALTER TABLE; tolerate duplicate.
+		if err.Error() != "duplicate column name: is_system" {
+			return fmt.Errorf("add sessions.is_system column: %w", err)
+		}
+		log.Printf("storage: sessions.is_system already exists, skipping")
+	}
+
+	// Backfill legacy host bootstrap sessions.
+	// Host-generated IDs follow "session-<digits>". Historically this was
+	// unix-seconds (10 digits), but we tolerate longer all-digit suffixes for
+	// backward compatibility with any legacy variants.
+	const backfillSystemSessions = `
+		UPDATE sessions
+		SET is_system = 1
+		WHERE id GLOB 'session-[0-9]*'
+		  AND id NOT GLOB 'session-*[^0-9]*'
+		  AND LENGTH(id) >= 18
+	`
+	if _, err := tx.Exec(backfillSystemSessions); err != nil {
+		return fmt.Errorf("backfill sessions.is_system: %w", err)
+	}
+
+	_, err = tx.Exec(
+		"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+		9,
+		time.Now().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// migrateToV10 adds the keep_awake_audit table for durable keep-awake audit logs.
+// This replaces log-only audit with persistent storage for compliance and debugging.
+func (s *SQLiteStore) migrateToV10() error {
+	log.Printf("storage: applying migration to schema version 10")
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	const auditTable = `
+		CREATE TABLE IF NOT EXISTS keep_awake_audit (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			operation TEXT NOT NULL,
+			request_id TEXT NOT NULL DEFAULT '',
+			actor_device_id TEXT NOT NULL DEFAULT '',
+			target_device_id TEXT NOT NULL DEFAULT '',
+			session_id TEXT NOT NULL DEFAULT '',
+			lease_id TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			at TEXT NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_keep_awake_audit_at ON keep_awake_audit(at);
+	`
+
+	if _, err := tx.Exec(auditTable); err != nil {
+		return fmt.Errorf("create keep_awake_audit table: %w", err)
+	}
+
+	_, err = tx.Exec(
+		"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+		10,
 		time.Now().Format(time.RFC3339),
 	)
 	if err != nil {

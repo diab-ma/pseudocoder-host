@@ -50,22 +50,29 @@ func (s *Server) BroadcastTerminalOutputWithID(sessionID, chunk string) {
 // The card is sent as a diff.card message per the WebSocket protocol.
 // The chunks parameter provides per-chunk metadata for granular decisions.
 // The chunkGroups parameter provides proximity grouping metadata (nil when disabled).
+// The semanticGroups parameter provides semantic grouping metadata (nil when disabled).
 // The isBinary flag indicates per-chunk actions should be disabled.
 // The isDeleted flag indicates this is a file deletion (use file-level actions).
 // The stats parameter provides size metrics for large diff warnings.
-func (s *Server) BroadcastDiffCard(cardID, file, diff string, chunks []stream.ChunkInfo, chunkGroups []stream.ChunkGroupInfo, isBinary, isDeleted bool, stats *stream.DiffStats, createdAt int64) {
+func (s *Server) BroadcastDiffCard(cardID, file, diff string, chunks []stream.ChunkInfo, chunkGroups []stream.ChunkGroupInfo, semanticGroups []stream.SemanticGroupInfo, isBinary, isDeleted bool, stats *stream.DiffStats, createdAt int64) {
 	// Convert stream types to server types using dedicated mappers
 	serverChunks := mapChunksToServer(chunks)
 	serverChunkGroups := mapChunkGroupsToServer(chunkGroups)
+	serverSemanticGroups := mapSemanticGroupsToServer(semanticGroups)
 	serverStats := mapStatsToServer(stats)
 
-	s.Broadcast(NewDiffCardMessage(cardID, file, diff, serverChunks, serverChunkGroups, isBinary, isDeleted, serverStats, createdAt))
+	s.Broadcast(NewDiffCardMessage(cardID, file, diff, serverChunks, serverChunkGroups, serverSemanticGroups, isBinary, isDeleted, serverStats, createdAt))
 }
 
 // BroadcastCardRemoved notifies clients that a card was removed.
 // This is called when changes are staged/reverted externally (e.g., VS Code).
 func (s *Server) BroadcastCardRemoved(cardID string) {
 	s.Broadcast(NewCardRemovedMessage(cardID))
+}
+
+// BroadcastFileWatch notifies clients that a file changed.
+func (s *Server) BroadcastFileWatch(path, change, version string) {
+	s.Broadcast(NewFileWatchMessage(path, change, version))
 }
 
 // runBroadcaster reads from the broadcast channel and sends to all clients.

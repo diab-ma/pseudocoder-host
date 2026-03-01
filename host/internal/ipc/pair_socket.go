@@ -92,8 +92,9 @@ func (s *PairSocketServer) Start() error {
 	s.listener = listener
 	s.server = &http.Server{Handler: s.handler}
 
+	srv := s.server // capture under lock to avoid race with Stop
 	go func() {
-		err := s.server.Serve(listener)
+		err := srv.Serve(listener)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.logger.Printf("pairing IPC server stopped: %v", err)
 		}

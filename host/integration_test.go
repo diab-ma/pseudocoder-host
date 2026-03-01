@@ -82,13 +82,17 @@ type hostProcess struct {
 
 func startHost(t *testing.T, addr, sessionCmd string) *hostProcess {
 	t.Helper()
+	return startHostWithRepo(t, addr, sessionCmd, "")
+}
+
+func startHostWithRepo(t *testing.T, addr, sessionCmd, repoPath string) *hostProcess {
+	t.Helper()
 
 	// Use unique pair socket per test to avoid IPC conflicts between tests.
 	// Use shortSocketDir() for short paths (Unix socket 104-byte limit).
 	pairSocket := filepath.Join(shortSocketDir(t), "pair.sock")
 
-	cmd := exec.Command(
-		binaryPath,
+	args := []string{
 		"host",
 		"start",
 		"--addr",
@@ -99,7 +103,12 @@ func startHost(t *testing.T, addr, sessionCmd string) *hostProcess {
 		"--require-auth=false", // Disable auth for tests
 		"--pair-socket",
 		pairSocket,
-	)
+	}
+	if repoPath != "" {
+		args = append(args, "--repo", repoPath)
+	}
+
+	cmd := exec.Command(binaryPath, args...)
 	cmd.Dir = moduleDir
 
 	hp := &hostProcess{
@@ -218,6 +227,48 @@ func readEnvelope(conn *websocket.Conn, timeout time.Duration) (messageEnvelope,
 		return messageEnvelope{}, err
 	}
 	return env, nil
+}
+
+func sendEnvelope(t *testing.T, conn *websocket.Conn, messageType string, payload map[string]interface{}) {
+	t.Helper()
+	msg, err := json.Marshal(map[string]interface{}{
+		"type":    messageType,
+		"payload": payload,
+	})
+	if err != nil {
+		t.Fatalf("marshal %s: %v", messageType, err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		t.Fatalf("write %s: %v", messageType, err)
+	}
+}
+
+func readPayloadByType(t *testing.T, conn *websocket.Conn, messageType string, timeout time.Duration) map[string]interface{} {
+	t.Helper()
+	// Set a single outer deadline.  gorilla/websocket considers the
+	// connection broken after any read error (including deadline exceeded),
+	// so we must NOT retry after a timeout.
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	defer conn.SetReadDeadline(time.Time{})
+
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read %s: %v", messageType, err)
+		}
+		var env messageEnvelope
+		if err := json.Unmarshal(data, &env); err != nil {
+			t.Fatalf("unmarshal envelope waiting for %s: %v", messageType, err)
+		}
+		if env.Type != messageType {
+			continue
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(env.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal %s payload: %v", messageType, err)
+		}
+		return payload
+	}
 }
 
 func normalizeNewlines(s string) string {
@@ -429,22 +480,22 @@ type chunkInfoPayload struct {
 
 // diffCardWithChunksPayload extends diffCardPayload with chunk info
 type diffCardWithChunksPayload struct {
-	CardID    string            `json:"card_id"`
-	File      string            `json:"file"`
-	Diff      string            `json:"diff"`
-	CreatedAt int64             `json:"created_at"`
-	Chunks     []chunkInfoPayload `json:"chunks,omitempty"`
+	CardID    string             `json:"card_id"`
+	File      string             `json:"file"`
+	Diff      string             `json:"diff"`
+	CreatedAt int64              `json:"created_at"`
+	Chunks    []chunkInfoPayload `json:"chunks,omitempty"`
 }
 
 // diffCardWithBinaryPayload includes binary file fields
 type diffCardWithBinaryPayload struct {
-	CardID    string                 `json:"card_id"`
-	File      string                 `json:"file"`
-	Diff      string                 `json:"diff"`
-	CreatedAt int64                  `json:"created_at"`
-	IsBinary  bool                   `json:"is_binary,omitempty"`
-	Stats     *diffStatsPayload      `json:"stats,omitempty"`
-	Chunks     []chunkInfoPayload      `json:"chunks,omitempty"`
+	CardID    string             `json:"card_id"`
+	File      string             `json:"file"`
+	Diff      string             `json:"diff"`
+	CreatedAt int64              `json:"created_at"`
+	IsBinary  bool               `json:"is_binary,omitempty"`
+	Stats     *diffStatsPayload  `json:"stats,omitempty"`
+	Chunks    []chunkInfoPayload `json:"chunks,omitempty"`
 }
 
 // diffStatsPayload matches the stats field in diff.card
@@ -457,12 +508,12 @@ type diffStatsPayload struct {
 
 // chunkDecisionResultPayload carries the result of a chunk.decision
 type chunkDecisionResultPayload struct {
-	CardID    string `json:"card_id"`
+	CardID     string `json:"card_id"`
 	ChunkIndex int    `json:"chunk_index"`
-	Action    string `json:"action"`
-	Success   bool   `json:"success"`
-	ErrorCode string `json:"error_code,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Action     string `json:"action"`
+	Success    bool   `json:"success"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // TestIntegrationCardStreaming tests the end-to-end flow:
@@ -978,7 +1029,7 @@ func startHostWithAuth(t *testing.T, addr, sessionCmd string) *hostProcess {
 		t.Fatalf("start host failed: %v", err)
 	}
 
-	waitForHealth(t, addr, 3*time.Second)
+	waitForHealth(t, addr, 5*time.Second)
 
 	t.Cleanup(func() {
 		hp.stop(t)
@@ -2824,10 +2875,10 @@ func TestIntegrationChunkDecisionRoundTrip(t *testing.T) {
 	chunkDecision := map[string]interface{}{
 		"type": "chunk.decision",
 		"payload": map[string]interface{}{
-			"card_id":    diffCard.CardID,
+			"card_id":     diffCard.CardID,
 			"chunk_index": 0,
-			"action":     "accept",
-			"comment":    "integration test accept chunk 0",
+			"action":      "accept",
+			"comment":     "integration test accept chunk 0",
 		},
 	}
 	decisionData, _ := json.Marshal(chunkDecision)
@@ -2896,10 +2947,10 @@ func TestIntegrationChunkDecisionRoundTrip(t *testing.T) {
 	chunkDecision2 := map[string]interface{}{
 		"type": "chunk.decision",
 		"payload": map[string]interface{}{
-			"card_id":    diffCard.CardID,
+			"card_id":     diffCard.CardID,
 			"chunk_index": 1,
-			"action":     "reject",
-			"comment":    "integration test reject chunk 1",
+			"action":      "reject",
+			"comment":     "integration test reject chunk 1",
 		},
 	}
 	decisionData2, _ := json.Marshal(chunkDecision2)
@@ -3052,7 +3103,7 @@ func TestIntegrationChunkDecisionStaleError(t *testing.T) {
 		"type": "chunk.decision",
 		"payload": map[string]interface{}{
 			"card_id":      diffCard.CardID,
-			"chunk_index":   0,
+			"chunk_index":  0,
 			"action":       "accept",
 			"content_hash": "wronghash1234567", // Wrong hash - 16 chars like a real one
 		},
@@ -3351,11 +3402,14 @@ func TestIntegrationCommitWorkflow(t *testing.T) {
 	}
 
 	var statusPayload struct {
-		Branch        string `json:"branch"`
-		Upstream      string `json:"upstream"`
-		StagedCount   int    `json:"staged_count"`
-		UnstagedCount int    `json:"unstaged_count"`
-		LastCommit    string `json:"last_commit"`
+		Branch            string   `json:"branch"`
+		Upstream          string   `json:"upstream"`
+		StagedCount       int      `json:"staged_count"`
+		UnstagedCount     int      `json:"unstaged_count"`
+		LastCommit        string   `json:"last_commit"`
+		ReadinessState    string   `json:"readiness_state"`
+		ReadinessBlockers []string `json:"readiness_blockers"`
+		ReadinessWarnings []string `json:"readiness_warnings"`
 	}
 	if err := json.Unmarshal(statusResp.Payload, &statusPayload); err != nil {
 		t.Fatalf("parse repo.status payload failed: %v", err)
@@ -3371,12 +3425,19 @@ func TestIntegrationCommitWorkflow(t *testing.T) {
 	if !strings.Contains(statusPayload.LastCommit, "Initial commit") {
 		t.Errorf("expected last commit to contain 'Initial commit', got %s", statusPayload.LastCommit)
 	}
+	if statusPayload.ReadinessState != "blocked" {
+		t.Errorf("expected readiness_state blocked with no staged changes, got %s", statusPayload.ReadinessState)
+	}
+	if !containsStringIntegration(statusPayload.ReadinessBlockers, "no_staged_changes") {
+		t.Errorf("expected readiness blocker no_staged_changes, got %v", statusPayload.ReadinessBlockers)
+	}
 
 	// === Test repo.commit with no staged changes (should fail) ===
 	commitReq := map[string]interface{}{
 		"type": "repo.commit",
 		"payload": map[string]interface{}{
-			"message": "Test commit (should fail)",
+			"request_id": "integ-commit-blocked",
+			"message":    "Test commit (should fail)",
 		},
 	}
 	commitData, _ := json.Marshal(commitReq)
@@ -3416,11 +3477,11 @@ func TestIntegrationCommitWorkflow(t *testing.T) {
 	if failedCommit.Success {
 		t.Error("expected commit to fail with no staged changes")
 	}
-	if failedCommit.ErrorCode != "commit.no_staged_changes" {
-		t.Errorf("expected error_code commit.no_staged_changes, got %s", failedCommit.ErrorCode)
+	if failedCommit.ErrorCode != "commit.readiness_blocked" {
+		t.Errorf("expected error_code commit.readiness_blocked, got %s", failedCommit.ErrorCode)
 	}
 
-	// === Stage a file and test successful commit ===
+	// === Stage a file and create unstaged changes ===
 	newFile := filepath.Join(repoDir, "feature.txt")
 	if err := os.WriteFile(newFile, []byte("new feature content"), 0644); err != nil {
 		t.Fatalf("write new file failed: %v", err)
@@ -3431,11 +3492,65 @@ func TestIntegrationCommitWorkflow(t *testing.T) {
 		t.Fatalf("git add feature.txt failed: %v\n%s", err, out)
 	}
 
-	// Send commit request
+	// Leave unstaged content to trigger readiness warning.
+	unstagedFile := filepath.Join(repoDir, "wip.txt")
+	if err := os.WriteFile(unstagedFile, []byte("unstaged content"), 0644); err != nil {
+		t.Fatalf("write unstaged file failed: %v", err)
+	}
+
+	// Commit without override should fail when readiness is risky.
+	commitReqRisky := map[string]interface{}{
+		"type": "repo.commit",
+		"payload": map[string]interface{}{
+			"request_id": "integ-commit-risky",
+			"message":    "Add feature.txt",
+		},
+	}
+	commitDataRisky, _ := json.Marshal(commitReqRisky)
+	if err := conn.WriteMessage(websocket.TextMessage, commitDataRisky); err != nil {
+		t.Fatalf("write repo.commit failed: %v", err)
+	}
+
+	var commitRespRisky *messageEnvelope
+	for i := 0; i < 10; i++ {
+		env, err := readEnvelope(conn, 2*time.Second)
+		if err != nil {
+			t.Fatalf("read repo.commit response failed: %v", err)
+		}
+		if env.Type == "repo.commit_result" {
+			commitRespRisky = &env
+			break
+		}
+		if env.Type != "diff.card" && env.Type != "diff.removed" && env.Type != "terminal.append" {
+			t.Fatalf("unexpected message while waiting for repo.commit_result: %s", env.Type)
+		}
+	}
+	if commitRespRisky == nil {
+		t.Fatal("did not receive repo.commit_result response for risky commit")
+	}
+
+	var riskyCommit struct {
+		Success   bool   `json:"success"`
+		ErrorCode string `json:"error_code"`
+		Error     string `json:"error"`
+	}
+	if err := json.Unmarshal(commitRespRisky.Payload, &riskyCommit); err != nil {
+		t.Fatalf("parse repo.commit_result payload failed: %v", err)
+	}
+	if riskyCommit.Success {
+		t.Error("expected risky commit to fail without override")
+	}
+	if riskyCommit.ErrorCode != "commit.override_required" {
+		t.Errorf("expected error_code commit.override_required, got %s", riskyCommit.ErrorCode)
+	}
+
+	// Send commit request with override and expect success.
 	commitReq2 := map[string]interface{}{
 		"type": "repo.commit",
 		"payload": map[string]interface{}{
-			"message": "Add feature.txt",
+			"request_id":        "integ-commit-success",
+			"message":           "Add feature.txt",
+			"override_warnings": true,
 		},
 	}
 	commitData2, _ := json.Marshal(commitReq2)
@@ -3464,9 +3579,10 @@ func TestIntegrationCommitWorkflow(t *testing.T) {
 	}
 
 	var successCommit struct {
-		Success bool   `json:"success"`
-		Hash    string `json:"hash"`
-		Summary string `json:"summary"`
+		RequestID string `json:"request_id"`
+		Success   bool   `json:"success"`
+		Hash      string `json:"hash"`
+		Summary   string `json:"summary"`
 	}
 	if err := json.Unmarshal(commitResp2.Payload, &successCommit); err != nil {
 		t.Fatalf("parse repo.commit_result payload failed: %v", err)
@@ -3474,6 +3590,9 @@ func TestIntegrationCommitWorkflow(t *testing.T) {
 
 	if !successCommit.Success {
 		t.Error("expected commit to succeed")
+	}
+	if successCommit.RequestID != "integ-commit-success" {
+		t.Errorf("expected request_id integ-commit-success, got %s", successCommit.RequestID)
 	}
 	if successCommit.Hash == "" {
 		t.Error("expected non-empty commit hash")
@@ -3494,4 +3613,1045 @@ func TestIntegrationCommitWorkflow(t *testing.T) {
 	}
 
 	hp.stop(t)
+}
+
+func containsStringIntegration(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+// TestIntegrationFileListRead exercises the file.list and file.read protocol
+// end-to-end through the host binary and a real WebSocket connection.
+func TestIntegrationFileListRead(t *testing.T) {
+	addr := getFreeAddr(t)
+	hp := startHost(t, addr, "sleep 30")
+
+	conn := dialWebSocket(t, addr)
+	defer conn.Close()
+
+	// --- file.list root ---
+	sendEnvelope(t, conn, "file.list", map[string]interface{}{
+		"request_id": "int-list-1",
+		"path":       "",
+	})
+	listResult := readPayloadByType(t, conn, "file.list_result", 8*time.Second)
+	if listResult["success"] != true {
+		t.Fatalf("file.list failed: %v", listResult["error"])
+	}
+	if listResult["request_id"] != "int-list-1" {
+		t.Errorf("request_id mismatch: %v", listResult["request_id"])
+	}
+
+	entriesRaw, ok := listResult["entries"].([]interface{})
+	if !ok || len(entriesRaw) == 0 {
+		t.Fatalf("expected non-empty entries array, got %T %v", listResult["entries"], listResult["entries"])
+	}
+	readPath := ""
+	textFallbackPath := ""
+	fallbackPath := ""
+	for _, raw := range entriesRaw {
+		entry, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if entry["kind"] == "file" {
+			if path, ok := entry["path"].(string); ok && path != "" {
+				// Prefer a known text file when available so encoding/content
+				// assertions remain deterministic across repositories.
+				if path == "README.md" {
+					readPath = path
+					break
+				}
+				ext := strings.ToLower(filepath.Ext(path))
+				switch ext {
+				case ".md", ".txt", ".go", ".json", ".yaml", ".yml", ".toml", ".sh":
+					if textFallbackPath == "" {
+						textFallbackPath = path
+					}
+				}
+				if fallbackPath == "" {
+					fallbackPath = path
+				}
+			}
+		}
+	}
+	if readPath == "" {
+		readPath = textFallbackPath
+	}
+	if readPath == "" {
+		readPath = fallbackPath
+	}
+	if readPath == "" {
+		t.Fatalf("did not find any file entry to read in file.list_result entries: %v", listResult["entries"])
+	}
+
+	// --- file.read text file ---
+	sendEnvelope(t, conn, "file.read", map[string]interface{}{
+		"request_id": "int-read-1",
+		"path":       readPath,
+	})
+	readResult := readPayloadByType(t, conn, "file.read_result", 8*time.Second)
+	if readResult["success"] != true {
+		t.Fatalf("file.read failed: %v", readResult["error"])
+	}
+	if readResult["request_id"] != "int-read-1" {
+		t.Errorf("file.read request_id mismatch: %v", readResult["request_id"])
+	}
+	if readResult["path"] != readPath {
+		t.Errorf("expected canonical path %s, got %v", readPath, readResult["path"])
+	}
+	if readResult["encoding"] != "utf-8" {
+		t.Errorf("expected utf-8 encoding, got %v", readResult["encoding"])
+	}
+	if content, ok := readResult["content"].(string); !ok || content == "" {
+		t.Errorf("expected non-empty file content, got %T %v", readResult["content"], readResult["content"])
+	}
+	if version, ok := readResult["version"].(string); !ok || !strings.HasPrefix(version, "sha256:") {
+		t.Errorf("expected sha256 version, got %v", readResult["version"])
+	}
+
+	// --- file.list traversal should fail ---
+	sendEnvelope(t, conn, "file.list", map[string]interface{}{
+		"request_id": "int-list-2",
+		"path":       "../../",
+	})
+	traversalResult := readPayloadByType(t, conn, "file.list_result", 6*time.Second)
+	if traversalResult["success"] != false {
+		t.Error("traversal should fail")
+	}
+	if traversalResult["error_code"] != "action.invalid" {
+		t.Errorf("expected action.invalid, got %v", traversalResult["error_code"])
+	}
+
+	// --- file.write validation: missing base_version should fail ---
+	sendEnvelope(t, conn, "file.write", map[string]interface{}{
+		"request_id": "int-write-1",
+		"path":       readPath,
+		"content":    "hello",
+	})
+	writeResult := readPayloadByType(t, conn, "file.write_result", 3*time.Second)
+	if writeResult["success"] != false {
+		t.Error("write without base_version should fail")
+	}
+	if writeResult["error_code"] != "server.invalid_message" {
+		t.Errorf("expected server.invalid_message, got %v", writeResult["error_code"])
+	}
+
+	hp.stop(t)
+}
+
+func TestIntegrationFileMutationContract(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Hello\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("write .git/HEAD: %v", err)
+	}
+	if err := os.Symlink(".git", filepath.Join(repoDir, "gitlink")); err != nil {
+		t.Fatalf("symlink gitlink: %v", err)
+	}
+
+	addr := getFreeAddr(t)
+	hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+	conn := dialWebSocket(t, addr)
+	defer conn.Close()
+
+	// Read initial README version.
+	sendEnvelope(t, conn, "file.read", map[string]interface{}{
+		"request_id": "m-read-1",
+		"path":       "README.md",
+	})
+	readResult := readPayloadByType(t, conn, "file.read_result", 4*time.Second)
+	if readResult["success"] != true {
+		t.Fatalf("file.read failed: %v", readResult["error"])
+	}
+	baseVersion, ok := readResult["version"].(string)
+	if !ok || baseVersion == "" {
+		t.Fatalf("expected non-empty read version, got %v", readResult["version"])
+	}
+
+	// Write success + in-flight idempotent replay + mismatch rejection.
+	sendEnvelope(t, conn, "file.write", map[string]interface{}{
+		"request_id":   "m-write-1",
+		"path":         "README.md",
+		"content":      "# Updated\n",
+		"base_version": baseVersion,
+	})
+	sendEnvelope(t, conn, "file.write", map[string]interface{}{
+		"request_id":   "m-write-1",
+		"path":         "README.md",
+		"content":      "# Updated\n",
+		"base_version": baseVersion,
+	})
+
+	writeResult1 := readPayloadByType(t, conn, "file.write_result", 4*time.Second)
+	if writeResult1["success"] != true {
+		t.Fatalf("file.write failed: %v %v", writeResult1["error_code"], writeResult1["error"])
+	}
+	writeVersion, ok := writeResult1["version"].(string)
+	if !ok || writeVersion == "" {
+		t.Fatalf("expected non-empty write version, got %v", writeResult1["version"])
+	}
+	writeResultReplay := readPayloadByType(t, conn, "file.write_result", 4*time.Second)
+	if writeResultReplay["success"] != true {
+		t.Fatalf("write replay failed: %v", writeResultReplay["error_code"])
+	}
+	if writeResultReplay["version"] != writeVersion {
+		t.Fatalf("write replay version mismatch: %v vs %v", writeResultReplay["version"], writeVersion)
+	}
+
+	sendEnvelope(t, conn, "file.write", map[string]interface{}{
+		"request_id":   "m-write-1",
+		"path":         "README.md",
+		"content":      "# Different\n",
+		"base_version": baseVersion,
+	})
+	writeResultMismatch := readPayloadByType(t, conn, "file.write_result", 4*time.Second)
+	if writeResultMismatch["success"] != false {
+		t.Fatal("expected write mismatch replay failure")
+	}
+	if writeResultMismatch["error_code"] != "server.invalid_message" {
+		t.Fatalf("expected server.invalid_message, got %v", writeResultMismatch["error_code"])
+	}
+
+	// Create success + idempotent replay + mismatch rejection.
+	sendEnvelope(t, conn, "file.create", map[string]interface{}{
+		"request_id": "m-create-1",
+		"path":       "src/new.txt",
+		"content":    "new content\n",
+	})
+	createResult1 := readPayloadByType(t, conn, "file.create_result", 4*time.Second)
+	if createResult1["success"] != true {
+		t.Fatalf("file.create failed: %v", createResult1["error_code"])
+	}
+	createVersion, ok := createResult1["version"].(string)
+	if !ok || createVersion == "" {
+		t.Fatalf("expected non-empty create version, got %v", createResult1["version"])
+	}
+
+	sendEnvelope(t, conn, "file.create", map[string]interface{}{
+		"request_id": "m-create-1",
+		"path":       "src/new.txt",
+		"content":    "new content\n",
+	})
+	createResultReplay := readPayloadByType(t, conn, "file.create_result", 4*time.Second)
+	if createResultReplay["success"] != true {
+		t.Fatalf("create replay failed: %v", createResultReplay["error_code"])
+	}
+	if createResultReplay["version"] != createVersion {
+		t.Fatalf("create replay version mismatch: %v vs %v", createResultReplay["version"], createVersion)
+	}
+
+	sendEnvelope(t, conn, "file.create", map[string]interface{}{
+		"request_id": "m-create-1",
+		"path":       "src/new.txt",
+		"content":    "different\n",
+	})
+	createResultMismatch := readPayloadByType(t, conn, "file.create_result", 4*time.Second)
+	if createResultMismatch["success"] != false {
+		t.Fatal("expected create mismatch replay failure")
+	}
+	if createResultMismatch["error_code"] != "server.invalid_message" {
+		t.Fatalf("expected server.invalid_message, got %v", createResultMismatch["error_code"])
+	}
+
+	// Delete success + idempotent replay + mismatch rejection.
+	sendEnvelope(t, conn, "file.delete", map[string]interface{}{
+		"request_id": "m-delete-1",
+		"path":       "src/new.txt",
+		"confirmed":  true,
+	})
+	deleteResult1 := readPayloadByType(t, conn, "file.delete_result", 4*time.Second)
+	if deleteResult1["success"] != true {
+		t.Fatalf("file.delete failed: %v", deleteResult1["error_code"])
+	}
+
+	sendEnvelope(t, conn, "file.delete", map[string]interface{}{
+		"request_id": "m-delete-1",
+		"path":       "src/new.txt",
+		"confirmed":  true,
+	})
+	deleteResultReplay := readPayloadByType(t, conn, "file.delete_result", 4*time.Second)
+	if deleteResultReplay["success"] != true {
+		t.Fatalf("delete replay failed: %v", deleteResultReplay["error_code"])
+	}
+
+	sendEnvelope(t, conn, "file.delete", map[string]interface{}{
+		"request_id": "m-delete-1",
+		"path":       "src/new.txt",
+		"confirmed":  false,
+	})
+	deleteResultMismatch := readPayloadByType(t, conn, "file.delete_result", 4*time.Second)
+	if deleteResultMismatch["success"] != false {
+		t.Fatal("expected delete mismatch replay failure")
+	}
+	if deleteResultMismatch["error_code"] != "server.invalid_message" {
+		t.Fatalf("expected server.invalid_message, got %v", deleteResultMismatch["error_code"])
+	}
+
+	// Block .git mutation through symlink alias (gitlink -> .git).
+	sendEnvelope(t, conn, "file.read", map[string]interface{}{
+		"request_id": "m-read-git",
+		"path":       "gitlink/HEAD",
+	})
+	readGitResult := readPayloadByType(t, conn, "file.read_result", 4*time.Second)
+	if readGitResult["success"] != true {
+		t.Fatalf("file.read gitlink/HEAD failed: %v", readGitResult["error"])
+	}
+	gitBaseVersion, ok := readGitResult["version"].(string)
+	if !ok || gitBaseVersion == "" {
+		t.Fatalf("expected non-empty gitlink/HEAD version, got %v", readGitResult["version"])
+	}
+
+	sendEnvelope(t, conn, "file.write", map[string]interface{}{
+		"request_id":   "m-git-write",
+		"path":         "gitlink/HEAD",
+		"content":      "MUTATED\n",
+		"base_version": gitBaseVersion,
+	})
+	gitWriteResult := readPayloadByType(t, conn, "file.write_result", 4*time.Second)
+	if gitWriteResult["success"] != false || gitWriteResult["error_code"] != "action.invalid" {
+		t.Fatalf("expected action.invalid for git alias write, got success=%v code=%v",
+			gitWriteResult["success"], gitWriteResult["error_code"])
+	}
+
+	sendEnvelope(t, conn, "file.create", map[string]interface{}{
+		"request_id": "m-git-create",
+		"path":       "gitlink/new-file",
+		"content":    "blocked\n",
+	})
+	gitCreateResult := readPayloadByType(t, conn, "file.create_result", 4*time.Second)
+	if gitCreateResult["success"] != false || gitCreateResult["error_code"] != "action.invalid" {
+		t.Fatalf("expected action.invalid for git alias create, got success=%v code=%v",
+			gitCreateResult["success"], gitCreateResult["error_code"])
+	}
+
+	sendEnvelope(t, conn, "file.delete", map[string]interface{}{
+		"request_id": "m-git-delete",
+		"path":       "gitlink/HEAD",
+		"confirmed":  true,
+	})
+	gitDeleteResult := readPayloadByType(t, conn, "file.delete_result", 4*time.Second)
+	if gitDeleteResult["success"] != false || gitDeleteResult["error_code"] != "action.invalid" {
+		t.Fatalf("expected action.invalid for git alias delete, got success=%v code=%v",
+			gitDeleteResult["success"], gitDeleteResult["error_code"])
+	}
+
+	headContent, err := os.ReadFile(filepath.Join(repoDir, ".git", "HEAD"))
+	if err != nil {
+		t.Fatalf("read .git/HEAD: %v", err)
+	}
+	if string(headContent) != "ref: refs/heads/main\n" {
+		t.Fatalf("expected .git/HEAD unchanged, got %q", string(headContent))
+	}
+
+	hp.stop(t)
+}
+
+// TestIntegrationFileMutationWatch verifies that file mutations broadcast
+// file.watch events to all connected clients.
+func TestIntegrationFileMutationWatch(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Hello\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("write .git/HEAD: %v", err)
+	}
+
+	addr := getFreeAddr(t)
+	hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+	connA := dialWebSocket(t, addr)
+	defer connA.Close()
+	connB := dialWebSocket(t, addr)
+	defer connB.Close()
+
+	// Read version for write.
+	sendEnvelope(t, connA, "file.read", map[string]interface{}{
+		"request_id": "mw-read",
+		"path":       "README.md",
+	})
+	readResult := readPayloadByType(t, connA, "file.read_result", 4*time.Second)
+	if readResult["success"] != true {
+		t.Fatalf("file.read failed: %v", readResult["error"])
+	}
+	baseVersion := readResult["version"].(string)
+
+	// Write on connA.
+	sendEnvelope(t, connA, "file.write", map[string]interface{}{
+		"request_id":   "mw-write",
+		"path":         "README.md",
+		"content":      "# Updated\n",
+		"base_version": baseVersion,
+	})
+	writeResult := readPayloadByType(t, connA, "file.write_result", 4*time.Second)
+	if writeResult["success"] != true {
+		t.Fatalf("file.write failed: %v", writeResult["error_code"])
+	}
+
+	// Both clients should receive file.watch.
+	watchA := readPayloadByType(t, connA, "file.watch", 4*time.Second)
+	if watchA["path"] != "README.md" || watchA["change"] != "modified" {
+		t.Fatalf("connA expected file.watch(README.md, modified), got path=%v change=%v",
+			watchA["path"], watchA["change"])
+	}
+
+	watchB := readPayloadByType(t, connB, "file.watch", 4*time.Second)
+	if watchB["path"] != "README.md" || watchB["change"] != "modified" {
+		t.Fatalf("connB expected file.watch(README.md, modified), got path=%v change=%v",
+			watchB["path"], watchB["change"])
+	}
+
+	hp.stop(t)
+}
+
+// TestIntegrationFileMutationDuplicateWatchAllowed verifies duplicate file.watch
+// events from mutation hook + poller are tolerated and non-fatal.
+func TestIntegrationFileMutationDuplicateWatchAllowed(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Hello\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("write .git/HEAD: %v", err)
+	}
+
+	addr := getFreeAddr(t)
+	hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+	conn := dialWebSocket(t, addr)
+	defer conn.Close()
+
+	// Ensure the poller baseline is established before mutation.
+	time.Sleep(3 * time.Second)
+
+	sendEnvelope(t, conn, "file.read", map[string]interface{}{
+		"request_id": "dup-read",
+		"path":       "README.md",
+	})
+	readResult := readPayloadByType(t, conn, "file.read_result", 4*time.Second)
+	if readResult["success"] != true {
+		t.Fatalf("file.read failed: %v", readResult["error"])
+	}
+	baseVersion := readResult["version"].(string)
+
+	sendEnvelope(t, conn, "file.write", map[string]interface{}{
+		"request_id":   "dup-write",
+		"path":         "README.md",
+		"content":      "# Updated Duplicate\n",
+		"base_version": baseVersion,
+	})
+	writeResult := readPayloadByType(t, conn, "file.write_result", 4*time.Second)
+	if writeResult["success"] != true {
+		t.Fatalf("file.write failed: %v", writeResult["error_code"])
+	}
+
+	// First watch comes from mutation hook.
+	firstWatch := readPayloadByType(t, conn, "file.watch", 4*time.Second)
+	if firstWatch["path"] != "README.md" || firstWatch["change"] != "modified" {
+		t.Fatalf("expected first file.watch(README.md, modified), got path=%v change=%v",
+			firstWatch["path"], firstWatch["change"])
+	}
+
+	// Second watch comes from poller detection of the same mutation.
+	secondWatch := readPayloadByType(t, conn, "file.watch", 6*time.Second)
+	if secondWatch["path"] != "README.md" || secondWatch["change"] != "modified" {
+		t.Fatalf("expected duplicate file.watch(README.md, modified), got path=%v change=%v",
+			secondWatch["path"], secondWatch["change"])
+	}
+
+	hp.stop(t)
+}
+
+// TestIntegrationExternalChangeWatch verifies that external filesystem changes
+// are detected by the poller and broadcast as file.watch events.
+func TestIntegrationExternalChangeWatch(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "hello.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write hello.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("write .git/HEAD: %v", err)
+	}
+
+	addr := getFreeAddr(t)
+	hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+	conn := dialWebSocket(t, addr)
+	defer conn.Close()
+
+	// Wait for the poller to build its baseline (needs > one poll interval).
+	time.Sleep(3 * time.Second)
+
+	// Modify a file externally.
+	if err := os.WriteFile(filepath.Join(repoDir, "hello.txt"), []byte("modified externally\n"), 0o644); err != nil {
+		t.Fatalf("external modify: %v", err)
+	}
+
+	// Should receive file.watch within a bounded window (poll interval + margin).
+	watch := readPayloadByType(t, conn, "file.watch", 6*time.Second)
+	if watch["path"] != "hello.txt" {
+		t.Fatalf("expected watch for hello.txt, got %v", watch["path"])
+	}
+	if watch["change"] != "modified" {
+		t.Fatalf("expected change=modified, got %v", watch["change"])
+	}
+
+	hp.stop(t)
+}
+
+// setupIntegrationGitRepo creates a proper git repo for integration tests.
+func setupIntegrationGitRepo(t *testing.T, commitCount int) string {
+	t.Helper()
+	dir := t.TempDir()
+
+	gitCmd := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	gitCmd("init")
+	gitCmd("config", "user.email", "test@example.com")
+	gitCmd("config", "user.name", "Test User")
+
+	f := filepath.Join(dir, "initial.txt")
+	if err := os.WriteFile(f, []byte("initial"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	gitCmd("add", "initial.txt")
+	gitCmd("commit", "-m", "Initial commit")
+
+	for i := 1; i < commitCount; i++ {
+		fname := fmt.Sprintf("file%d.txt", i)
+		if err := os.WriteFile(filepath.Join(dir, fname), []byte(fmt.Sprintf("content %d", i)), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		gitCmd("add", fname)
+		gitCmd("commit", "-m", fmt.Sprintf("Commit %d", i))
+	}
+
+	return dir
+}
+
+func TestIntegrationRepoHistoryBranches(t *testing.T) {
+	t.Run("history_result_shape", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 5)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		// Send repo.history
+		sendEnvelope(t, conn, "repo.history", map[string]interface{}{
+			"request_id": "hist-1",
+		})
+
+		payload := readPayloadByType(t, conn, "repo.history_result", 3*time.Second)
+		if payload["request_id"] != "hist-1" {
+			t.Errorf("expected request_id 'hist-1', got %v", payload["request_id"])
+		}
+		if payload["success"] != true {
+			t.Fatalf("expected success=true, got %v (error: %v)", payload["success"], payload["error"])
+		}
+
+		entries, ok := payload["entries"].([]interface{})
+		if !ok {
+			t.Fatalf("expected entries array, got %T", payload["entries"])
+		}
+		if len(entries) != 5 {
+			t.Fatalf("expected 5 entries, got %d", len(entries))
+		}
+
+		// Verify entry fields
+		first := entries[0].(map[string]interface{})
+		if first["hash"] == nil || first["hash"] == "" {
+			t.Error("expected non-empty hash")
+		}
+		if first["subject"] == nil || first["subject"] == "" {
+			t.Error("expected non-empty subject")
+		}
+		if first["author"] == nil || first["author"] == "" {
+			t.Error("expected non-empty author")
+		}
+		if first["authored_at"] == nil {
+			t.Error("expected non-nil authored_at")
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("history_pagination", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 8)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		// Page 1
+		sendEnvelope(t, conn, "repo.history", map[string]interface{}{
+			"request_id": "page-1",
+			"page_size":  3,
+		})
+		p1 := readPayloadByType(t, conn, "repo.history_result", 3*time.Second)
+		if p1["success"] != true {
+			t.Fatalf("page 1 failed: %v", p1["error"])
+		}
+		entries1 := p1["entries"].([]interface{})
+		if len(entries1) != 3 {
+			t.Fatalf("page 1: expected 3 entries, got %d", len(entries1))
+		}
+		cursor := p1["next_cursor"].(string)
+		if cursor == "" {
+			t.Fatal("expected non-empty next_cursor")
+		}
+
+		// Page 2
+		sendEnvelope(t, conn, "repo.history", map[string]interface{}{
+			"request_id": "page-2",
+			"cursor":     cursor,
+			"page_size":  3,
+		})
+		p2 := readPayloadByType(t, conn, "repo.history_result", 3*time.Second)
+		if p2["success"] != true {
+			t.Fatalf("page 2 failed: %v", p2["error"])
+		}
+		entries2 := p2["entries"].([]interface{})
+		if len(entries2) != 3 {
+			t.Fatalf("page 2: expected 3 entries, got %d", len(entries2))
+		}
+
+		// Verify no dup/skip
+		allHashes := make(map[string]bool)
+		for _, e := range entries1 {
+			h := e.(map[string]interface{})["hash"].(string)
+			allHashes[h] = true
+		}
+		for _, e := range entries2 {
+			h := e.(map[string]interface{})["hash"].(string)
+			if allHashes[h] {
+				t.Errorf("duplicate hash across pages: %s", h)
+			}
+			allHashes[h] = true
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("branches_result_shape", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		// Create extra branches
+		cmd := exec.Command("git", "-C", repoDir, "branch", "feature-x")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("create branch: %v\n%s", err, out)
+		}
+
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		sendEnvelope(t, conn, "repo.branches", map[string]interface{}{
+			"request_id": "br-1",
+		})
+
+		payload := readPayloadByType(t, conn, "repo.branches_result", 3*time.Second)
+		if payload["request_id"] != "br-1" {
+			t.Errorf("expected request_id 'br-1', got %v", payload["request_id"])
+		}
+		if payload["success"] != true {
+			t.Fatalf("expected success=true, got %v (error: %v)", payload["success"], payload["error"])
+		}
+		if payload["current_branch"] == nil || payload["current_branch"] == "" {
+			t.Error("expected non-empty current_branch")
+		}
+
+		local, ok := payload["local"].([]interface{})
+		if !ok {
+			t.Fatalf("expected local array, got %T", payload["local"])
+		}
+		if len(local) < 2 {
+			t.Errorf("expected at least 2 local branches, got %d", len(local))
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("requester_only", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn1 := dialWebSocket(t, addr)
+		defer conn1.Close()
+		conn2 := dialWebSocket(t, addr)
+		defer conn2.Close()
+
+		// Client 1 sends repo.history
+		sendEnvelope(t, conn1, "repo.history", map[string]interface{}{
+			"request_id": "requester-test",
+		})
+
+		// Client 1 gets result
+		p := readPayloadByType(t, conn1, "repo.history_result", 3*time.Second)
+		if p["success"] != true {
+			t.Fatalf("expected success, got error: %v", p["error"])
+		}
+
+		// Client 2 should NOT receive it
+		conn2.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		for {
+			_, data, err := conn2.ReadMessage()
+			if err != nil {
+				break // timeout expected
+			}
+			var env messageEnvelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				break
+			}
+			if env.Type == "repo.history_result" {
+				t.Error("client 2 should NOT receive repo.history_result")
+				break
+			}
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("backward_compat_no_unsolicited", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		// Just connect and wait — should NOT receive unsolicited repo.history_result or repo.branches_result
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				break // timeout expected
+			}
+			var env messageEnvelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				break
+			}
+			if env.Type == "repo.history_result" || env.Type == "repo.branches_result" {
+				t.Errorf("received unsolicited %s", env.Type)
+			}
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("repo_status_still_works", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		sendEnvelope(t, conn, "repo.status", map[string]interface{}{})
+
+		payload := readPayloadByType(t, conn, "repo.status", 3*time.Second)
+		if payload["branch"] == nil || payload["branch"] == "" {
+			t.Error("expected non-empty branch in repo.status")
+		}
+
+		hp.stop(t)
+	})
+}
+
+func TestIntegrationRepoBranchMutations(t *testing.T) {
+	t.Run("create_success", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		sendEnvelope(t, conn, "repo.branch_create", map[string]interface{}{
+			"request_id": "int-create-1",
+			"name":       "integration-branch",
+		})
+
+		payload := readPayloadByType(t, conn, "repo.branch_create_result", 3*time.Second)
+		if payload["request_id"] != "int-create-1" {
+			t.Errorf("expected request_id int-create-1, got %v", payload["request_id"])
+		}
+		if payload["success"] != true {
+			t.Fatalf("expected success=true, got error: %v", payload["error"])
+		}
+		if payload["name"] != "integration-branch" {
+			t.Errorf("expected name integration-branch, got %v", payload["name"])
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("create_duplicate_fails", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		// Create branch
+		sendEnvelope(t, conn, "repo.branch_create", map[string]interface{}{
+			"request_id": "int-dup-1",
+			"name":       "dup-branch",
+		})
+		p1 := readPayloadByType(t, conn, "repo.branch_create_result", 3*time.Second)
+		if p1["success"] != true {
+			t.Fatalf("first create failed: %v", p1["error"])
+		}
+
+		// Try to create same branch again (different request_id so not idempotent replay)
+		sendEnvelope(t, conn, "repo.branch_create", map[string]interface{}{
+			"request_id": "int-dup-2",
+			"name":       "dup-branch",
+		})
+		p2 := readPayloadByType(t, conn, "repo.branch_create_result", 3*time.Second)
+		if p2["success"] != false {
+			t.Error("expected success=false for duplicate create")
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("switch_success", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		// Create a target branch
+		cmd := exec.Command("git", "-C", repoDir, "branch", "switch-target")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("create branch: %v\n%s", err, out)
+		}
+
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		sendEnvelope(t, conn, "repo.branch_switch", map[string]interface{}{
+			"request_id": "int-switch-1",
+			"name":       "switch-target",
+		})
+
+		payload := readPayloadByType(t, conn, "repo.branch_switch_result", 3*time.Second)
+		if payload["success"] != true {
+			t.Fatalf("expected success=true, got error: %v", payload["error"])
+		}
+		if payload["name"] != "switch-target" {
+			t.Errorf("expected name switch-target, got %v", payload["name"])
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("switch_missing_fails", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		sendEnvelope(t, conn, "repo.branch_switch", map[string]interface{}{
+			"request_id": "int-switch-missing",
+			"name":       "nonexistent-branch",
+		})
+
+		payload := readPayloadByType(t, conn, "repo.branch_switch_result", 3*time.Second)
+		if payload["success"] != false {
+			t.Error("expected success=false for missing branch")
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("idempotent_replay", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		// First create
+		sendEnvelope(t, conn, "repo.branch_create", map[string]interface{}{
+			"request_id": "int-idem-1",
+			"name":       "idem-branch",
+		})
+		p1 := readPayloadByType(t, conn, "repo.branch_create_result", 3*time.Second)
+		if p1["success"] != true {
+			t.Fatalf("first create failed: %v", p1["error"])
+		}
+
+		// Replay same request_id + same name
+		sendEnvelope(t, conn, "repo.branch_create", map[string]interface{}{
+			"request_id": "int-idem-1",
+			"name":       "idem-branch",
+		})
+		p2 := readPayloadByType(t, conn, "repo.branch_create_result", 3*time.Second)
+		if p2["success"] != true {
+			t.Fatalf("replay should succeed: %v", p2["error"])
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("mismatch_rejection", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		sendEnvelope(t, conn, "repo.branch_create", map[string]interface{}{
+			"request_id": "int-mismatch",
+			"name":       "mismatch-a",
+		})
+		readPayloadByType(t, conn, "repo.branch_create_result", 3*time.Second)
+
+		// Same request_id, different name
+		sendEnvelope(t, conn, "repo.branch_create", map[string]interface{}{
+			"request_id": "int-mismatch",
+			"name":       "mismatch-b",
+		})
+		p := readPayloadByType(t, conn, "repo.branch_create_result", 3*time.Second)
+		if p["success"] != false {
+			t.Error("expected success=false for mismatch")
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("requester_isolation", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn1 := dialWebSocket(t, addr)
+		defer conn1.Close()
+		conn2 := dialWebSocket(t, addr)
+		defer conn2.Close()
+
+		// Client 1 creates branch
+		sendEnvelope(t, conn1, "repo.branch_create", map[string]interface{}{
+			"request_id": "int-iso-1",
+			"name":       "isolation-branch",
+		})
+		p := readPayloadByType(t, conn1, "repo.branch_create_result", 3*time.Second)
+		if p["success"] != true {
+			t.Fatalf("create failed: %v", p["error"])
+		}
+
+		// Client 2 should NOT receive it
+		conn2.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		for {
+			_, data, err := conn2.ReadMessage()
+			if err != nil {
+				break // timeout expected
+			}
+			var env messageEnvelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				break
+			}
+			if env.Type == "repo.branch_create_result" {
+				t.Error("client 2 should NOT receive repo.branch_create_result")
+				break
+			}
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("no_unsolicited_messages", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		// Just connect and wait - should NOT receive unsolicited branch mutation results
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				break // timeout expected
+			}
+			var env messageEnvelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				break
+			}
+			if env.Type == "repo.branch_create_result" || env.Type == "repo.branch_switch_result" {
+				t.Errorf("received unsolicited %s", env.Type)
+				break
+			}
+		}
+
+		hp.stop(t)
+	})
+
+	t.Run("backward_compat", func(t *testing.T) {
+		repoDir := setupIntegrationGitRepo(t, 2)
+		addr := getFreeAddr(t)
+		hp := startHostWithRepo(t, addr, "sleep 30", repoDir)
+
+		conn := dialWebSocket(t, addr)
+		defer conn.Close()
+
+		// Existing repo.status should still work
+		sendEnvelope(t, conn, "repo.status", map[string]interface{}{})
+		payload := readPayloadByType(t, conn, "repo.status", 3*time.Second)
+		if payload["branch"] == nil || payload["branch"] == "" {
+			t.Error("expected non-empty branch in repo.status (backward compat)")
+		}
+
+		// Existing repo.branches should still work
+		sendEnvelope(t, conn, "repo.branches", map[string]interface{}{
+			"request_id": "compat-branches",
+		})
+		bPayload := readPayloadByType(t, conn, "repo.branches_result", 3*time.Second)
+		if bPayload["success"] != true {
+			t.Fatalf("repo.branches failed: %v", bPayload["error"])
+		}
+
+		hp.stop(t)
+	})
 }

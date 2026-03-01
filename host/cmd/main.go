@@ -19,6 +19,7 @@ Commands:
   start         Start host with mobile-ready defaults (LAN + auth)
   host start    Start the host daemon (advanced)
   host status   Show host daemon status
+  doctor        Diagnose onboarding readiness and connectivity
   pair          Generate a pairing code for mobile
   devices list  List paired devices
   devices revoke <device-id>  Revoke a device token
@@ -29,7 +30,9 @@ Commands:
   session list-tmux    List available tmux sessions
   session attach-tmux <name>  Attach to a tmux session
   session detach <id> [--kill]  Detach from a tmux session
-
+  keep-awake enable-remote   Enable remote keep-awake policy
+  keep-awake disable-remote  Disable remote keep-awake policy
+  keep-awake status          Show keep-awake policy status
 Run 'pseudocoder <command> --help' for more information on a command.
 `
 
@@ -60,6 +63,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "Unknown host command: %s\n", args[2])
 			return 1
 		}
+	case "doctor":
+		return runDoctor(args[2:], stdout, stderr)
 	case "pair":
 		return runPair(args[2:], stdout, stderr)
 	case "devices":
@@ -78,6 +83,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	case "session":
 		return runSession(args[2:], stdout, stderr)
+	case "keep-awake":
+		return runKeepAwake(args[2:], stdout, stderr)
 	case "--help", "-h", "help":
 		fmt.Fprint(stdout, usage)
 		return 0

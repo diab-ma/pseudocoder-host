@@ -2218,3 +2218,275 @@ func TestProcessChunkUndo_AcceptedChunk(t *testing.T) {
 		t.Error("expected decided chunk to be deleted after undo")
 	}
 }
+
+// -----------------------------------------------------------------------------
+// State Divergence Detection Tests (G2 Gate Coverage)
+// -----------------------------------------------------------------------------
+
+// TestProcessDecisionStateDivergedAccept verifies the file-level text decision
+// divergence branch: when the change has already been staged externally, accept
+// returns state.diverged with no additional side effects and the card remains
+// retryable.
+func TestProcessDecisionStateDivergedAccept(t *testing.T) {
+	repoDir := setupGitRepo(t)
+	store, err := storage.NewSQLiteStore(filepath.Join(repoDir, "test.db"))
+	if err != nil {
+		t.Fatalf("create store failed: %v", err)
+	}
+	defer store.Close()
+
+	// Modify the file to create uncommitted changes
+	testFile := filepath.Join(repoDir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("initial content\nadded line\n"), 0644); err != nil {
+		t.Fatalf("write file failed: %v", err)
+	}
+
+	// Create a card representing the change
+	card := &storage.ReviewCard{
+		ID:        "card-diverge-accept",
+		File:      "test.txt",
+		Diff:      "@@ -1 +1,2 @@\n initial content\n+added line\n",
+		Status:    storage.CardPending,
+		CreatedAt: time.Now(),
+	}
+	if err := store.SaveCard(card); err != nil {
+		t.Fatalf("save card failed: %v", err)
+	}
+
+	// Externally stage the change before the processor sees it.
+	// This causes the forward patch (accept → git apply --cached) to fail
+	// because the index already contains the change, while the reverse check
+	// succeeds — triggering the divergence branch.
+	runGit(t, repoDir, "add", "test.txt")
+
+	processor := NewProcessor(store, repoDir)
+	err = processor.ProcessDecision("card-diverge-accept", "accept", "")
+	if err == nil {
+		t.Fatal("expected state.diverged error")
+	}
+	if !apperrors.IsCode(err, apperrors.CodeStateDiverged) {
+		t.Errorf("expected state.diverged error code, got: %v", err)
+	}
+
+	// Verify no unintended staging side effects (index should still contain
+	// only the externally staged change, no double-apply).
+	cmd := exec.Command("git", "diff", "--cached", "--stat")
+	cmd.Dir = repoDir
+	out, _ := cmd.CombinedOutput()
+	staged := strings.TrimSpace(string(out))
+	if staged == "" {
+		t.Error("expected the externally staged change to remain in the index")
+	}
+
+	// Card must remain pending (retryable after refresh).
+	card, err = store.GetCard("card-diverge-accept")
+	if err != nil {
+		t.Fatalf("get card failed: %v", err)
+	}
+	if card == nil || card.Status != storage.CardPending {
+		t.Errorf("expected card to remain pending, got: %+v", card)
+	}
+}
+
+// TestProcessDecisionStateDivergedReject verifies the file-level text decision
+// divergence branch on the reject path: when the working tree change has already
+// been reverted externally, reject returns state.diverged.
+func TestProcessDecisionStateDivergedReject(t *testing.T) {
+	repoDir := setupGitRepo(t)
+	store, err := storage.NewSQLiteStore(filepath.Join(repoDir, "test.db"))
+	if err != nil {
+		t.Fatalf("create store failed: %v", err)
+	}
+	defer store.Close()
+
+	// Modify the file to create uncommitted changes
+	testFile := filepath.Join(repoDir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("initial content\nadded line\n"), 0644); err != nil {
+		t.Fatalf("write file failed: %v", err)
+	}
+
+	// Create a card for the change
+	card := &storage.ReviewCard{
+		ID:        "card-diverge-reject",
+		File:      "test.txt",
+		Diff:      "@@ -1 +1,2 @@\n initial content\n+added line\n",
+		Status:    storage.CardPending,
+		CreatedAt: time.Now(),
+	}
+	if err := store.SaveCard(card); err != nil {
+		t.Fatalf("save card failed: %v", err)
+	}
+
+	// Externally restore the file before the processor sees it.
+	// This causes the reverse patch (reject → git apply --reverse) to fail
+	// because the working tree already matches HEAD, while the forward check
+	// succeeds — triggering the divergence branch.
+	runGit(t, repoDir, "restore", "test.txt")
+
+	processor := NewProcessor(store, repoDir)
+	err = processor.ProcessDecision("card-diverge-reject", "reject", "")
+	if err == nil {
+		t.Fatal("expected state.diverged error")
+	}
+	if !apperrors.IsCode(err, apperrors.CodeStateDiverged) {
+		t.Errorf("expected state.diverged error code, got: %v", err)
+	}
+
+	// Verify no staging side effects.
+	cmd := exec.Command("git", "diff", "--cached")
+	cmd.Dir = repoDir
+	out, _ := cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Errorf("expected no staged changes, got: %s", out)
+	}
+
+	// Card must remain pending.
+	card, err = store.GetCard("card-diverge-reject")
+	if err != nil {
+		t.Fatalf("get card failed: %v", err)
+	}
+	if card == nil || card.Status != storage.CardPending {
+		t.Errorf("expected card to remain pending, got: %+v", card)
+	}
+}
+
+// TestProcessDeletionDecisionDivergedReject verifies the deletion decision
+// divergence branch: when rejecting a tracked deletion but the file already
+// exists on disk (externally restored), returns state.diverged. This calls
+// processDeletionDecision directly because ProcessDecision's file-existence
+// check would route to processTextDecision when the file is present.
+func TestProcessDeletionDecisionDivergedReject(t *testing.T) {
+	repoDir := setupGitRepo(t)
+
+	store, err := storage.NewSQLiteStore(filepath.Join(repoDir, "test.db"))
+	if err != nil {
+		t.Fatalf("create store failed: %v", err)
+	}
+	defer store.Close()
+
+	// The card represents a deletion diff for a tracked file.
+	card := &storage.ReviewCard{
+		ID:        "card-del-diverge",
+		File:      "test.txt",
+		Diff:      "diff showing deletion",
+		Status:    storage.CardPending,
+		CreatedAt: time.Now(),
+	}
+	if err := store.SaveCard(card); err != nil {
+		t.Fatalf("save card failed: %v", err)
+	}
+
+	// File exists on disk (simulates external restore after deletion was
+	// detected). processDeletionDecision's reject path checks os.Stat and
+	// finds the file exists → state.diverged.
+	testFile := filepath.Join(repoDir, "test.txt")
+	content := getFileContent(t, testFile)
+	if !strings.Contains(content, "initial content") {
+		t.Fatalf("expected file to exist with initial content, got: %s", content)
+	}
+
+	processor := NewProcessor(store, repoDir)
+	err = processor.processDeletionDecision(card, "reject", "")
+	if err == nil {
+		t.Fatal("expected state.diverged error")
+	}
+	if !apperrors.IsCode(err, apperrors.CodeStateDiverged) {
+		t.Errorf("expected state.diverged error code, got: %v", err)
+	}
+
+	// Verify the file is untouched (no side effects from the rejection).
+	afterContent := getFileContent(t, testFile)
+	if afterContent != content {
+		t.Errorf("expected file unchanged, got: %s", afterContent)
+	}
+
+	// Verify no staging side effects.
+	cmd := exec.Command("git", "diff", "--cached")
+	cmd.Dir = repoDir
+	out, _ := cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Errorf("expected no staged changes, got: %s", out)
+	}
+
+	// Card must remain pending.
+	card, err = store.GetCard("card-del-diverge")
+	if err != nil {
+		t.Fatalf("get card failed: %v", err)
+	}
+	if card == nil || card.Status != storage.CardPending {
+		t.Errorf("expected card to remain pending, got: %+v", card)
+	}
+}
+
+// TestProcessChunkDecisionStateDivergedAccept verifies the chunk-level
+// divergence branch: when the chunk change has already been staged externally,
+// accept returns state.diverged with the chunk remaining retryable.
+func TestProcessChunkDecisionStateDivergedAccept(t *testing.T) {
+	dir, chunk1, chunk2, fileName := setupGitRepoWithMultipleChunks(t)
+	store, err := storage.NewSQLiteStore(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("create store failed: %v", err)
+	}
+	defer store.Close()
+
+	card := &storage.ReviewCard{
+		ID:        "fc-chunk-diverge",
+		File:      fileName,
+		Diff:      chunk1 + "\n" + chunk2,
+		Status:    storage.CardPending,
+		CreatedAt: time.Now(),
+	}
+	if err := store.SaveCard(card); err != nil {
+		t.Fatalf("save card failed: %v", err)
+	}
+
+	chunks := []*storage.ChunkStatus{
+		{CardID: "fc-chunk-diverge", ChunkIndex: 0, Content: chunk1, Status: storage.CardPending},
+		{CardID: "fc-chunk-diverge", ChunkIndex: 1, Content: chunk2, Status: storage.CardPending},
+	}
+	if err := store.SaveChunks("fc-chunk-diverge", chunks); err != nil {
+		t.Fatalf("save chunks failed: %v", err)
+	}
+
+	processor := NewProcessor(store, dir)
+	processor.SetChunkStore(store)
+
+	// Externally stage the entire file. This makes chunk 0's forward
+	// --cached apply fail (already in index) while reverse succeeds.
+	runGit(t, dir, "add", fileName)
+
+	err = processor.ProcessChunkDecision("fc-chunk-diverge", 0, "accept", "")
+	if err == nil {
+		t.Fatal("expected state.diverged error")
+	}
+	if !apperrors.IsCode(err, apperrors.CodeStateDiverged) {
+		t.Errorf("expected state.diverged error code, got: %v", err)
+	}
+
+	// Verify chunk 0 remains pending (retryable after refresh).
+	chunk, err := store.GetChunk("fc-chunk-diverge", 0)
+	if err != nil {
+		t.Fatalf("get chunk failed: %v", err)
+	}
+	if chunk.Status != storage.CardPending {
+		t.Errorf("expected chunk to remain pending, got: %s", chunk.Status)
+	}
+
+	// Verify chunk 1 is also still pending (no cross-contamination).
+	chunk, err = store.GetChunk("fc-chunk-diverge", 1)
+	if err != nil {
+		t.Fatalf("get chunk failed: %v", err)
+	}
+	if chunk.Status != storage.CardPending {
+		t.Errorf("expected chunk 1 to remain pending, got: %s", chunk.Status)
+	}
+
+	// Card must remain in storage.
+	c, err := store.GetCard("fc-chunk-diverge")
+	if err != nil {
+		t.Fatalf("get card failed: %v", err)
+	}
+	if c == nil {
+		t.Error("expected card to still exist after divergence")
+	}
+}

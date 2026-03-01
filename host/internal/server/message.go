@@ -4,7 +4,12 @@
 package server
 
 import (
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
+
+	"github.com/pseudocoder/host/internal/semantic"
 )
 
 // MessageType identifies the kind of message being sent over WebSocket.
@@ -111,6 +116,56 @@ const (
 	// Payload: RepoPushResultPayload
 	MessageTypeRepoPushResult MessageType = "repo.push_result"
 
+	// MessageTypeRepoFetch is sent by clients to request a git fetch.
+	// Payload: RepoFetchPayload
+	MessageTypeRepoFetch MessageType = "repo.fetch"
+
+	// MessageTypeRepoFetchResult is sent by the server after a fetch attempt.
+	// Payload: RepoFetchResultPayload
+	MessageTypeRepoFetchResult MessageType = "repo.fetch_result"
+
+	// MessageTypeRepoPull is sent by clients to request a git pull (ff-only).
+	// Payload: RepoPullPayload
+	MessageTypeRepoPull MessageType = "repo.pull"
+
+	// MessageTypeRepoPullResult is sent by the server after a pull attempt.
+	// Payload: RepoPullResultPayload
+	MessageTypeRepoPullResult MessageType = "repo.pull_result"
+
+	// PR sub-tab messages (Phase 9 P9U4)
+
+	// MessageTypeRepoPrList is sent by clients to list open PRs.
+	// Payload: RepoPrListPayload
+	MessageTypeRepoPrList MessageType = "repo.pr_list"
+
+	// MessageTypeRepoPrListResult is sent by the server with PR list results.
+	// Payload: RepoPrListResultPayload
+	MessageTypeRepoPrListResult MessageType = "repo.pr_list_result"
+
+	// MessageTypeRepoPrView is sent by clients to view a PR by number.
+	// Payload: RepoPrViewPayload
+	MessageTypeRepoPrView MessageType = "repo.pr_view"
+
+	// MessageTypeRepoPrViewResult is sent by the server with PR detail.
+	// Payload: RepoPrViewResultPayload
+	MessageTypeRepoPrViewResult MessageType = "repo.pr_view_result"
+
+	// MessageTypeRepoPrCreate is sent by clients to create a new PR.
+	// Payload: RepoPrCreatePayload
+	MessageTypeRepoPrCreate MessageType = "repo.pr_create"
+
+	// MessageTypeRepoPrCreateResult is sent by the server with PR create result.
+	// Payload: RepoPrCreateResultPayload
+	MessageTypeRepoPrCreateResult MessageType = "repo.pr_create_result"
+
+	// MessageTypeRepoPrCheckout is sent by clients to checkout a PR branch.
+	// Payload: RepoPrCheckoutPayload
+	MessageTypeRepoPrCheckout MessageType = "repo.pr_checkout"
+
+	// MessageTypeRepoPrCheckoutResult is sent by the server with PR checkout result.
+	// Payload: RepoPrCheckoutResultPayload
+	MessageTypeRepoPrCheckoutResult MessageType = "repo.pr_checkout_result"
+
 	// Multi-session PTY management messages (Phase 9)
 
 	// MessageTypeSessionCreate is sent by clients to request a new PTY session.
@@ -140,6 +195,14 @@ const (
 	// MessageTypeSessionBuffer is sent by the server to replay terminal buffer on switch.
 	// Payload: SessionBufferPayload
 	MessageTypeSessionBuffer MessageType = "session.buffer"
+
+	// MessageTypeSessionClearHistory is sent by clients to clear archived session history.
+	// Payload: SessionClearHistoryPayload
+	MessageTypeSessionClearHistory MessageType = "session.clear_history"
+
+	// MessageTypeSessionClearHistoryResult is sent by the server with clear-history results.
+	// Payload: SessionClearHistoryResultPayload
+	MessageTypeSessionClearHistoryResult MessageType = "session.clear_history_result"
 
 	// tmux session integration messages (Phase 12)
 
@@ -184,6 +247,125 @@ const (
 	// MessageTypeUndoResult is sent by the server to confirm an undo operation.
 	// Payload: UndoResultPayload
 	MessageTypeUndoResult MessageType = "undo.result"
+
+	// File explorer protocol messages (Phase 3)
+
+	// MessageTypeFileList is sent by clients to list directory contents.
+	// Payload: FileListPayload
+	MessageTypeFileList MessageType = "file.list"
+
+	// MessageTypeFileListResult is sent by the server with directory listing.
+	// Payload: FileListResultPayload
+	MessageTypeFileListResult MessageType = "file.list_result"
+
+	// MessageTypeFileRead is sent by clients to read file contents.
+	// Payload: FileReadPayload
+	MessageTypeFileRead MessageType = "file.read"
+
+	// MessageTypeFileReadResult is sent by the server with file contents.
+	// Payload: FileReadResultPayload
+	MessageTypeFileReadResult MessageType = "file.read_result"
+
+	// MessageTypeFileWrite is sent by clients to write file contents.
+	// Payload: FileWritePayload (schema only -- handler stubbed)
+	MessageTypeFileWrite MessageType = "file.write"
+
+	// MessageTypeFileWriteResult is sent by the server after a write attempt.
+	// Payload: FileWriteResultPayload (schema only)
+	MessageTypeFileWriteResult MessageType = "file.write_result"
+
+	// MessageTypeFileCreate is sent by clients to create a new file.
+	// Payload: FileCreatePayload (schema only -- handler stubbed)
+	MessageTypeFileCreate MessageType = "file.create"
+
+	// MessageTypeFileCreateResult is sent by the server after a create attempt.
+	// Payload: FileCreateResultPayload (schema only)
+	MessageTypeFileCreateResult MessageType = "file.create_result"
+
+	// MessageTypeFileDelete is sent by clients to delete a file.
+	// Payload: FileDeletePayload (schema only -- handler stubbed)
+	MessageTypeFileDelete MessageType = "file.delete"
+
+	// MessageTypeFileDeleteResult is sent by the server after a delete attempt.
+	// Payload: FileDeleteResultPayload (schema only)
+	MessageTypeFileDeleteResult MessageType = "file.delete_result"
+
+	// MessageTypeFileWatch is sent by the server when a watched file changes.
+	// Payload: FileWatchPayload (schema only -- no handler needed)
+	MessageTypeFileWatch MessageType = "file.watch"
+
+	// Git history and branch listing messages (Phase 4)
+
+	// MessageTypeRepoHistory is sent by clients to request commit history.
+	// Payload: RepoHistoryPayload
+	MessageTypeRepoHistory MessageType = "repo.history"
+
+	// MessageTypeRepoHistoryResult is sent by the server with commit history.
+	// Payload: RepoHistoryResultPayload
+	MessageTypeRepoHistoryResult MessageType = "repo.history_result"
+
+	// MessageTypeRepoBranches is sent by clients to request branch listing.
+	// Payload: RepoBranchesPayload
+	MessageTypeRepoBranches MessageType = "repo.branches"
+
+	// MessageTypeRepoBranchesResult is sent by the server with branch listing.
+	// Payload: RepoBranchesResultPayload
+	MessageTypeRepoBranchesResult MessageType = "repo.branches_result"
+
+	// MessageTypeRepoBranchCreate is sent by clients to create a new branch.
+	// Payload: RepoBranchCreatePayload
+	MessageTypeRepoBranchCreate MessageType = "repo.branch_create"
+
+	// MessageTypeRepoBranchCreateResult is sent by the server with branch creation result.
+	// Payload: RepoBranchCreateResultPayload
+	MessageTypeRepoBranchCreateResult MessageType = "repo.branch_create_result"
+
+	// MessageTypeRepoBranchSwitch is sent by clients to switch to a branch.
+	// Payload: RepoBranchSwitchPayload
+	MessageTypeRepoBranchSwitch MessageType = "repo.branch_switch"
+
+	// MessageTypeRepoBranchSwitchResult is sent by the server with branch switch result.
+	// Payload: RepoBranchSwitchResultPayload
+	MessageTypeRepoBranchSwitchResult MessageType = "repo.branch_switch_result"
+
+	// Keep-awake control-plane messages (Phase 17 P17U3)
+
+	// MessageTypeSessionKeepAwakeEnable requests a keep-awake lease enable mutation.
+	// Payload: KeepAwakeEnablePayload
+	MessageTypeSessionKeepAwakeEnable MessageType = "session.keep_awake_enable"
+
+	// MessageTypeSessionKeepAwakeEnableResult returns the enable mutation result.
+	// Payload: KeepAwakeMutationResultPayload
+	MessageTypeSessionKeepAwakeEnableResult MessageType = "session.keep_awake_enable_result"
+
+	// MessageTypeSessionKeepAwakeDisable requests a keep-awake lease disable mutation.
+	// Payload: KeepAwakeDisablePayload
+	MessageTypeSessionKeepAwakeDisable MessageType = "session.keep_awake_disable"
+
+	// MessageTypeSessionKeepAwakeDisableResult returns the disable mutation result.
+	// Payload: KeepAwakeMutationResultPayload
+	MessageTypeSessionKeepAwakeDisableResult MessageType = "session.keep_awake_disable_result"
+
+	// MessageTypeSessionKeepAwakeExtend requests a keep-awake lease extension mutation.
+	// Payload: KeepAwakeExtendPayload
+	MessageTypeSessionKeepAwakeExtend MessageType = "session.keep_awake_extend"
+
+	// MessageTypeSessionKeepAwakeExtendResult returns the extend mutation result.
+	// Payload: KeepAwakeMutationResultPayload
+	MessageTypeSessionKeepAwakeExtendResult MessageType = "session.keep_awake_extend_result"
+
+	// MessageTypeSessionKeepAwakeStatus requests an authoritative keep-awake status snapshot.
+	// Payload: KeepAwakeStatusRequestPayload
+	MessageTypeSessionKeepAwakeStatus MessageType = "session.keep_awake_status"
+
+	// MessageTypeSessionKeepAwakeStatusResult returns an authoritative keep-awake status snapshot.
+	// Payload: KeepAwakeStatusPayload
+	MessageTypeSessionKeepAwakeStatusResult MessageType = "session.keep_awake_status_result"
+
+	// MessageTypeSessionKeepAwakeChanged broadcasts a keep-awake status update.
+	// Payload: KeepAwakeStatusPayload
+	MessageTypeSessionKeepAwakeChanged MessageType = "session.keep_awake_changed"
+
 )
 
 // Message is the envelope for all WebSocket messages.
@@ -278,6 +460,18 @@ type ChunkInfo struct {
 	// Chunks within configurable proximity (default 20 lines) share the same group.
 	// Always included; clients check chunk_groups at card level to determine if grouping is active.
 	GroupIndex int `json:"group_index"`
+
+	// SemanticKind is the semantic classification of this chunk (e.g., "import", "function").
+	// Empty/omitted when semantic analysis has not been performed.
+	SemanticKind string `json:"semantic_kind,omitempty"`
+
+	// SemanticLabel is the display label for this chunk (e.g., "Import", "Function").
+	// Empty/omitted when semantic analysis has not been performed.
+	SemanticLabel string `json:"semantic_label,omitempty"`
+
+	// SemanticGroupID links this chunk to a SemanticGroupInfo entry.
+	// Empty/omitted when semantic analysis has not been performed.
+	SemanticGroupID string `json:"semantic_group_id,omitempty"`
 }
 
 // DiffStats provides size metrics for a diff to help mobile clients
@@ -296,6 +490,142 @@ type DiffStats struct {
 	DeletedLines int `json:"deleted_lines"`
 }
 
+// riskOrder maps risk level strings to numeric ordering for comparison.
+// Higher values mean higher risk.
+var riskOrder = map[string]int{
+	"low":      0,
+	"medium":   1,
+	"high":     2,
+	"critical": 3,
+}
+
+// computeDiffCardMeta returns triage metadata for a diff card.
+// The summary, riskLevel, and riskReasons are deterministic given the inputs.
+// When semanticGroups are present, the summary is derived from the primary
+// semantic group using deterministic selection criteria.
+func computeDiffCardMeta(file string, chunks []ChunkInfo, isBinary, isDeleted bool, stats *DiffStats, semanticGroups []SemanticGroupInfo) (summary, riskLevel string, riskReasons []string) {
+	// --- summary ---
+	summary = computeSummary(chunks, isBinary, isDeleted, stats, semanticGroups)
+
+	// --- risk reason detection ---
+	isSensitive := semantic.IsSensitivePath(file)
+
+	isLargeDiff := stats != nil && (stats.ByteSize > 1048576 || stats.LineCount > 2000)
+	isHighChurn := stats != nil && (stats.AddedLines+stats.DeletedLines >= 200)
+	isSourceChange := strings.HasPrefix(file, "host/") || strings.HasPrefix(file, "mobile/lib/")
+
+	// Collect reasons in deterministic order (max 3).
+	type reason struct {
+		key   string
+		match bool
+	}
+	orderedReasons := []reason{
+		{"sensitive_path", isSensitive},
+		{"file_deletion", isDeleted},
+		{"binary_file", isBinary},
+		{"large_diff", isLargeDiff},
+		{"high_churn", isHighChurn},
+		{"source_change", isSourceChange},
+	}
+	for _, r := range orderedReasons {
+		if r.match && len(riskReasons) < 3 {
+			riskReasons = append(riskReasons, r.key)
+		}
+	}
+
+	// --- risk level ---
+	switch {
+	case isSensitive && (isDeleted || isLargeDiff || isHighChurn):
+		riskLevel = "critical"
+	case isSensitive || isDeleted || isLargeDiff || isBinary:
+		riskLevel = "high"
+	case isHighChurn || isSourceChange:
+		riskLevel = "medium"
+	default:
+		riskLevel = "low"
+	}
+
+	// Omit reasons when none match (nil, not empty slice).
+	if len(riskReasons) == 0 {
+		riskReasons = nil
+	}
+	return summary, riskLevel, riskReasons
+}
+
+// computeSummary returns the summary string for a diff card.
+// When semantic groups are present, the summary is always derived from the
+// primary semantic group, including binary/deleted cards.
+func computeSummary(chunks []ChunkInfo, isBinary, isDeleted bool, stats *DiffStats, semanticGroups []SemanticGroupInfo) string {
+	chunkCount := len(chunks)
+
+	// If semantic groups exist, derive summary from primary group.
+	if len(semanticGroups) > 0 {
+		primary := selectPrimaryGroup(semanticGroups)
+		groupLabel := primary.Label
+		if groupLabel == "" {
+			groupLabel = semantic.GroupLabel(semantic.NormalizeKind(primary.Kind), "")
+		}
+		groupChunkCount := len(primary.ChunkIndexes)
+		if stats != nil {
+			return fmt.Sprintf("%s: %d chunk(s), +%d / -%d",
+				groupLabel, groupChunkCount, stats.AddedLines, stats.DeletedLines)
+		}
+		return fmt.Sprintf("%s: %d chunk(s)", groupLabel, groupChunkCount)
+	}
+
+	// Binary and deleted keep fixed legacy summaries when semantic groups
+	// are not available.
+	switch {
+	case isBinary:
+		return "Binary file changed"
+	case isDeleted:
+		return "File deleted"
+	}
+
+	// B1 fallback: no semantic groups.
+	switch {
+	case stats != nil && chunkCount > 0:
+		return fmt.Sprintf("%d chunks, +%d / -%d", chunkCount, stats.AddedLines, stats.DeletedLines)
+	case stats != nil:
+		return fmt.Sprintf("+%d / -%d", stats.AddedLines, stats.DeletedLines)
+	default:
+		return "File updated"
+	}
+}
+
+// selectPrimaryGroup selects the primary semantic group using deterministic
+// ordering: highest risk > largest chunk_indexes > smallest line_start >
+// lexicographically smallest group_id.
+func selectPrimaryGroup(groups []SemanticGroupInfo) SemanticGroupInfo {
+	if len(groups) == 1 {
+		return groups[0]
+	}
+
+	primary := groups[0]
+	for _, g := range groups[1:] {
+		if comparePrimary(g, primary) {
+			primary = g
+		}
+	}
+	return primary
+}
+
+// comparePrimary returns true if a should be preferred over b as primary group.
+func comparePrimary(a, b SemanticGroupInfo) bool {
+	aRisk := riskOrder[a.RiskLevel]
+	bRisk := riskOrder[b.RiskLevel]
+	if aRisk != bRisk {
+		return aRisk > bRisk
+	}
+	if len(a.ChunkIndexes) != len(b.ChunkIndexes) {
+		return len(a.ChunkIndexes) > len(b.ChunkIndexes)
+	}
+	if a.LineStart != b.LineStart {
+		return a.LineStart < b.LineStart
+	}
+	return a.GroupID < b.GroupID
+}
+
 // ChunkGroupInfo provides metadata about a group of proximity-related chunks.
 // Groups collect chunks within a configurable number of lines (default 20),
 // allowing mobile clients to display and act on related chunks together.
@@ -311,6 +641,31 @@ type ChunkGroupInfo struct {
 
 	// ChunkCount is the number of chunks in this group.
 	ChunkCount int `json:"chunk_count"`
+}
+
+// SemanticGroupInfo provides metadata about a semantically related group of chunks.
+// Semantic groups are determined by code analysis rather than line proximity.
+type SemanticGroupInfo struct {
+	// GroupID is the deterministic identifier (e.g., "sg-" + 12 hex).
+	GroupID string `json:"group_id"`
+
+	// Label is the display label for the group (e.g., "Imports").
+	Label string `json:"label"`
+
+	// Kind is the semantic classification (e.g., "import", "function").
+	Kind string `json:"kind"`
+
+	// LineStart is the starting line number of the group.
+	LineStart int `json:"line_start"`
+
+	// LineEnd is the ending line number of the group.
+	LineEnd int `json:"line_end"`
+
+	// ChunkIndexes lists the chunk indices belonging to this group.
+	ChunkIndexes []int `json:"chunk_indexes"`
+
+	// RiskLevel is an optional risk assessment for this group.
+	RiskLevel string `json:"risk_level,omitempty"`
 }
 
 // DiffCardPayload carries a review card for file changes.
@@ -337,6 +692,12 @@ type DiffCardPayload struct {
 	// Missing or empty means grouping is disabled; render chunks as flat list.
 	ChunkGroups []ChunkGroupInfo `json:"chunk_groups,omitempty"`
 
+	// SemanticGroups provides metadata about semantically related chunk groups.
+	// When present, chunks are grouped by code analysis (e.g., imports, functions).
+	// Each chunk's SemanticGroupID references a GroupID in this array.
+	// Missing or empty means semantic analysis has not been performed.
+	SemanticGroups []SemanticGroupInfo `json:"semantic_groups,omitempty"`
+
 	// IsBinary indicates the file is a binary file.
 	// Binary files cannot use per-chunk actions - only file-level accept/reject.
 	// The Diff field may be empty or contain a placeholder for binary files.
@@ -352,6 +713,15 @@ type DiffCardPayload struct {
 
 	// CreatedAt is when this card was created (Unix milliseconds).
 	CreatedAt int64 `json:"created_at"`
+
+	// Summary is a compact description of the change for triage display.
+	Summary string `json:"summary,omitempty"`
+
+	// RiskLevel is the computed risk: "low", "medium", "high", or "critical".
+	RiskLevel string `json:"risk_level,omitempty"`
+
+	// RiskReasons lists the first 3 matching risk reasons in deterministic order.
+	RiskReasons []string `json:"risk_reasons,omitempty"`
 }
 
 // CardRemovedPayload notifies that a card was removed externally.
@@ -574,6 +944,10 @@ type SessionInfo struct {
 
 	// Status is the session state: "running", "complete", or "error".
 	Status string `json:"status"`
+
+	// IsSystem marks host-managed internal sessions that should be hidden from
+	// user-facing session history surfaces.
+	IsSystem bool `json:"is_system,omitempty"`
 }
 
 // RepoStatusPayload carries git repository status information.
@@ -599,11 +973,29 @@ type RepoStatusPayload struct {
 	// LastCommit is the short hash and subject of the most recent commit.
 	// Format: "abc1234 Commit message subject"
 	LastCommit string `json:"last_commit,omitempty"`
+
+	// ReadinessState summarizes commit readiness.
+	// Values: "ready", "blocked", "risky".
+	ReadinessState string `json:"readiness_state,omitempty"`
+
+	// ReadinessBlockers lists hard blockers that prevent commit.
+	// Examples: "no_staged_changes", "merge_conflicts_present".
+	ReadinessBlockers []string `json:"readiness_blockers,omitempty"`
+
+	// ReadinessWarnings lists advisory issues that require explicit override.
+	// Examples: "unstaged_changes_present", "detached_head".
+	ReadinessWarnings []string `json:"readiness_warnings,omitempty"`
+
+	// ReadinessActions lists concrete next steps for the operator.
+	ReadinessActions []string `json:"readiness_actions,omitempty"`
 }
 
 // RepoCommitPayload carries a commit request from the mobile client.
 // The host will create a git commit with the specified message.
 type RepoCommitPayload struct {
+	// RequestID is the client-generated correlation ID for this request.
+	RequestID string `json:"request_id"`
+
 	// Message is the commit message. Must not be empty.
 	Message string `json:"message"`
 
@@ -614,12 +1006,19 @@ type RepoCommitPayload struct {
 	// NoGpgSign skips GPG signing of the commit.
 	// Only honored if the host allows it via --commit-allow-no-gpg-sign.
 	NoGpgSign bool `json:"no_gpg_sign,omitempty"`
+
+	// OverrideWarnings confirms the user explicitly accepts advisory warnings.
+	// This is required when readiness_state is "risky".
+	OverrideWarnings bool `json:"override_warnings,omitempty"`
 }
 
 // RepoCommitResultPayload carries the result of a commit attempt.
 // On success, includes the commit hash and summary.
 // On failure, includes error code and message.
 type RepoCommitResultPayload struct {
+	// RequestID echoes the client-generated correlation ID from the request.
+	RequestID string `json:"request_id"`
+
 	// Success indicates whether the commit was created successfully.
 	Success bool `json:"success"`
 
@@ -631,7 +1030,8 @@ type RepoCommitResultPayload struct {
 	Summary string `json:"summary,omitempty"`
 
 	// ErrorCode is a stable error code if Success is false.
-	// Codes: commit.no_staged_changes, commit.empty_message, commit.hook_failed, commit.git_error
+	// Codes: commit.no_staged_changes, commit.empty_message, commit.hook_failed,
+	// commit.git_error, commit.readiness_blocked, commit.override_required
 	ErrorCode string `json:"error_code,omitempty"`
 
 	// Error contains a human-readable error message if Success is false.
@@ -641,6 +1041,9 @@ type RepoCommitResultPayload struct {
 // RepoPushPayload carries a push request from the mobile client.
 // The host will push commits using the specified remote/branch or configured upstream.
 type RepoPushPayload struct {
+	// RequestID is the client-generated correlation ID for this request.
+	RequestID string `json:"request_id"`
+
 	// Remote is the remote name (e.g., "origin"). Optional if upstream is configured.
 	Remote string `json:"remote,omitempty"`
 
@@ -656,6 +1059,9 @@ type RepoPushPayload struct {
 // On success, includes the output summary.
 // On failure, includes error code and message.
 type RepoPushResultPayload struct {
+	// RequestID echoes the client-generated correlation ID from the request.
+	RequestID string `json:"request_id"`
+
 	// Success indicates whether the push succeeded.
 	Success bool `json:"success"`
 
@@ -668,6 +1074,340 @@ type RepoPushResultPayload struct {
 
 	// Error contains a human-readable error message if Success is false.
 	Error string `json:"error,omitempty"`
+}
+
+// RepoFetchPayload carries a fetch request from the mobile client.
+type RepoFetchPayload struct {
+	// RequestID is the client-generated correlation ID for this request.
+	RequestID string `json:"request_id"`
+}
+
+// RepoFetchResultPayload carries the result of a fetch attempt.
+type RepoFetchResultPayload struct {
+	// RequestID echoes the client-generated correlation ID from the request.
+	RequestID string `json:"request_id"`
+
+	// Success indicates whether the fetch succeeded.
+	Success bool `json:"success"`
+
+	// Output is the git fetch output on success.
+	Output string `json:"output,omitempty"`
+
+	// ErrorCode is a stable error code if Success is false.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error contains a human-readable error message if Success is false.
+	Error string `json:"error,omitempty"`
+}
+
+// RepoPullPayload carries a pull request from the mobile client.
+type RepoPullPayload struct {
+	// RequestID is the client-generated correlation ID for this request.
+	RequestID string `json:"request_id"`
+}
+
+// RepoPullResultPayload carries the result of a pull attempt.
+type RepoPullResultPayload struct {
+	// RequestID echoes the client-generated correlation ID from the request.
+	RequestID string `json:"request_id"`
+
+	// Success indicates whether the pull succeeded.
+	Success bool `json:"success"`
+
+	// Output is the git pull output on success.
+	Output string `json:"output,omitempty"`
+
+	// ErrorCode is a stable error code if Success is false.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error contains a human-readable error message if Success is false.
+	Error string `json:"error,omitempty"`
+}
+
+// KeepAwakeEnablePayload carries a keep-awake enable mutation request.
+type KeepAwakeEnablePayload struct {
+	RequestID  string `json:"request_id"`
+	SessionID  string `json:"session_id"`
+	DurationMs int64  `json:"duration_ms"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+// KeepAwakeDisablePayload carries a keep-awake disable mutation request.
+type KeepAwakeDisablePayload struct {
+	RequestID string `json:"request_id"`
+	SessionID string `json:"session_id"`
+	LeaseID   string `json:"lease_id"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// KeepAwakeExtendPayload carries a keep-awake extend mutation request.
+type KeepAwakeExtendPayload struct {
+	RequestID  string `json:"request_id"`
+	SessionID  string `json:"session_id"`
+	LeaseID    string `json:"lease_id"`
+	DurationMs int64  `json:"duration_ms"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+// KeepAwakeStatusRequestPayload carries a keep-awake status query request.
+type KeepAwakeStatusRequestPayload struct {
+	RequestID string `json:"request_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+// KeepAwakePolicyPayload carries control-plane policy flags needed by clients.
+type KeepAwakePolicyPayload struct {
+	RemoteEnabled             bool `json:"remote_enabled"`
+	AllowAdminRevoke          bool `json:"allow_admin_revoke"`
+	AllowOnBattery            bool `json:"allow_on_battery,omitempty"`
+	AutoDisableBatteryPercent int  `json:"auto_disable_battery_percent,omitempty"`
+}
+
+// KeepAwakePowerPayload carries host power state and policy evaluation.
+type KeepAwakePowerPayload struct {
+	OnBattery      *bool  `json:"on_battery,omitempty"`
+	BatteryPercent *int   `json:"battery_percent,omitempty"`
+	ExternalPower  *bool  `json:"external_power,omitempty"`
+	PolicyBlocked  bool   `json:"policy_blocked,omitempty"`
+	PolicyReason   string `json:"policy_reason,omitempty"`
+}
+
+// KeepAwakeLeasePayload summarizes an active keep-awake lease.
+type KeepAwakeLeasePayload struct {
+	SessionID       string `json:"session_id"`
+	LeaseID         string `json:"lease_id"`
+	OwnerDeviceID   string `json:"owner_device_id"`
+	ExpiresAtMs     int64  `json:"expires_at_ms"`
+	RemainingMs     int64  `json:"remaining_ms"`
+	Disconnected    bool   `json:"disconnected,omitempty"`
+	GraceDeadlineMs int64  `json:"grace_deadline_ms,omitempty"`
+}
+
+// KeepAwakeStatusPayload carries authoritative keep-awake status snapshots.
+type KeepAwakeStatusPayload struct {
+	State            string                  `json:"state"`
+	StatusRevision   int64                   `json:"status_revision"`
+	ServerBootID     string                  `json:"server_boot_id"`
+	ActiveLeaseCount int                     `json:"active_lease_count"`
+	Leases           []KeepAwakeLeasePayload `json:"leases"`
+	Policy           KeepAwakePolicyPayload  `json:"policy"`
+	DegradedReason   string                  `json:"degraded_reason,omitempty"`
+	NextExpiryMs     int64                   `json:"next_expiry_ms,omitempty"`
+	Power            *KeepAwakePowerPayload  `json:"power,omitempty"`
+	RecoveryHint     string                  `json:"recovery_hint,omitempty"`
+}
+
+// KeepAwakeMutationResultPayload carries requester-scoped mutation results.
+type KeepAwakeMutationResultPayload struct {
+	RequestID        string                  `json:"request_id"`
+	Success          bool                    `json:"success"`
+	LeaseID          string                  `json:"lease_id,omitempty"`
+	ErrorCode        string                  `json:"error_code,omitempty"`
+	Error            string                  `json:"error,omitempty"`
+	State            string                  `json:"state"`
+	StatusRevision   int64                   `json:"status_revision"`
+	ServerBootID     string                  `json:"server_boot_id"`
+	ActiveLeaseCount int                     `json:"active_lease_count"`
+	Leases           []KeepAwakeLeasePayload `json:"leases"`
+	Policy           KeepAwakePolicyPayload  `json:"policy"`
+	DegradedReason   string                  `json:"degraded_reason,omitempty"`
+	NextExpiryMs     int64                   `json:"next_expiry_ms,omitempty"`
+	Power            *KeepAwakePowerPayload  `json:"power,omitempty"`
+	RecoveryHint     string                  `json:"recovery_hint,omitempty"`
+}
+
+// KeepAwakePolicyMutationResponse is the HTTP-only response for POST /api/keep-awake/policy.
+// This is not a WebSocket message type; it is returned as JSON over HTTP.
+type KeepAwakePolicyMutationResponse struct {
+	RequestID      string                 `json:"request_id"`
+	Success        bool                   `json:"success"`
+	ErrorCode      string                 `json:"error_code,omitempty"`
+	Error          string                 `json:"error,omitempty"`
+	StatusRevision int64                  `json:"status_revision"`
+	KeepAwake      KeepAwakeStatusPayload `json:"keep_awake,omitempty"`
+	HotApplied     bool                   `json:"hot_applied"`
+	Persisted      bool                   `json:"persisted"`
+}
+
+// NewRepoFetchResultMessage creates a message with fetch result.
+// On success, include output. On failure, include error code and message.
+func NewRepoFetchResultMessage(requestID string, success bool, output, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoFetchResult,
+		Payload: RepoFetchResultPayload{
+			RequestID: requestID,
+			Success:   success,
+			Output:    output,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewRepoPullResultMessage creates a message with pull result.
+// On success, include output. On failure, include error code and message.
+func NewRepoPullResultMessage(requestID string, success bool, output, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoPullResult,
+		Payload: RepoPullResultPayload{
+			RequestID: requestID,
+			Success:   success,
+			Output:    output,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// PR sub-tab payloads (Phase 9 P9U4)
+
+// RepoPrListPayload carries a PR list request from the mobile client.
+type RepoPrListPayload struct {
+	RequestID string `json:"request_id"`
+}
+
+// RepoPrViewPayload carries a PR view request from the mobile client.
+type RepoPrViewPayload struct {
+	RequestID string `json:"request_id"`
+	Number    int    `json:"number"`
+}
+
+// RepoPrCreatePayload carries a PR create request from the mobile client.
+type RepoPrCreatePayload struct {
+	RequestID  string `json:"request_id"`
+	Title      string `json:"title"`
+	Body       string `json:"body,omitempty"`
+	BaseBranch string `json:"base_branch,omitempty"`
+	Draft      *bool  `json:"draft,omitempty"`
+}
+
+// RepoPrCheckoutPayload carries a PR checkout request from the mobile client.
+type RepoPrCheckoutPayload struct {
+	RequestID string `json:"request_id"`
+	Number    int    `json:"number"`
+}
+
+// RepoPrEntryPayload is a summary model for a single PR in a list.
+type RepoPrEntryPayload struct {
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	State      string `json:"state"`
+	IsDraft    bool   `json:"is_draft"`
+	HeadBranch string `json:"head_branch"`
+	BaseBranch string `json:"base_branch"`
+	Author     string `json:"author"`
+	URL        string `json:"url"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+// RepoPrDetailPayload is a detailed model for a single PR.
+type RepoPrDetailPayload struct {
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	State      string `json:"state"`
+	IsDraft    bool   `json:"is_draft"`
+	HeadBranch string `json:"head_branch"`
+	BaseBranch string `json:"base_branch"`
+	Author     string `json:"author"`
+	URL        string `json:"url"`
+	Body       string `json:"body,omitempty"`
+}
+
+// RepoPrListResultPayload carries the result of a PR list request.
+type RepoPrListResultPayload struct {
+	RequestID string               `json:"request_id"`
+	Success   bool                 `json:"success"`
+	Entries   []RepoPrEntryPayload `json:"entries,omitempty"`
+	ErrorCode string               `json:"error_code,omitempty"`
+	Error     string               `json:"error,omitempty"`
+}
+
+// RepoPrViewResultPayload carries the result of a PR view request.
+type RepoPrViewResultPayload struct {
+	RequestID string               `json:"request_id"`
+	Success   bool                 `json:"success"`
+	PR        *RepoPrDetailPayload `json:"pr,omitempty"`
+	ErrorCode string               `json:"error_code,omitempty"`
+	Error     string               `json:"error,omitempty"`
+}
+
+// RepoPrCreateResultPayload carries the result of a PR create request.
+type RepoPrCreateResultPayload struct {
+	RequestID string               `json:"request_id"`
+	Success   bool                 `json:"success"`
+	PR        *RepoPrDetailPayload `json:"pr,omitempty"`
+	ErrorCode string               `json:"error_code,omitempty"`
+	Error     string               `json:"error,omitempty"`
+}
+
+// RepoPrCheckoutResultPayload carries the result of a PR checkout request.
+type RepoPrCheckoutResultPayload struct {
+	RequestID     string `json:"request_id"`
+	Success       bool   `json:"success"`
+	BranchName    string `json:"branch_name,omitempty"`
+	ChangedBranch bool   `json:"changed_branch,omitempty"`
+	ErrorCode     string `json:"error_code,omitempty"`
+	Error         string `json:"error,omitempty"`
+	// Blockers lists dirty-state blockers that prevent checkout.
+	Blockers []string `json:"blockers,omitempty"`
+}
+
+// NewRepoPrListResultMessage creates a repo.pr_list_result message.
+func NewRepoPrListResultMessage(requestID string, success bool, entries []RepoPrEntryPayload, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoPrListResult,
+		Payload: RepoPrListResultPayload{
+			RequestID: requestID,
+			Success:   success,
+			Entries:   entries,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewRepoPrViewResultMessage creates a repo.pr_view_result message.
+func NewRepoPrViewResultMessage(requestID string, success bool, pr *RepoPrDetailPayload, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoPrViewResult,
+		Payload: RepoPrViewResultPayload{
+			RequestID: requestID,
+			Success:   success,
+			PR:        pr,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewRepoPrCreateResultMessage creates a repo.pr_create_result message.
+func NewRepoPrCreateResultMessage(requestID string, success bool, pr *RepoPrDetailPayload, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoPrCreateResult,
+		Payload: RepoPrCreateResultPayload{
+			RequestID: requestID,
+			Success:   success,
+			PR:        pr,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewRepoPrCheckoutResultMessage creates a repo.pr_checkout_result message.
+func NewRepoPrCheckoutResultMessage(requestID string, success bool, branchName string, changedBranch bool, blockers []string, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoPrCheckoutResult,
+		Payload: RepoPrCheckoutResultPayload{
+			RequestID:     requestID,
+			Success:       success,
+			BranchName:    branchName,
+			ChangedBranch: changedBranch,
+			Blockers:      blockers,
+			ErrorCode:     errCode,
+			Error:         errMsg,
+		},
+	}
 }
 
 // Multi-session PTY management payloads (Phase 9)
@@ -755,6 +1495,30 @@ type SessionBufferPayload struct {
 	CursorCol int `json:"cursor_col"`
 }
 
+// SessionClearHistoryPayload carries a request to clear archived session history.
+type SessionClearHistoryPayload struct {
+	// RequestID is the client-generated correlation ID for this operation.
+	RequestID string `json:"request_id"`
+}
+
+// SessionClearHistoryResultPayload carries the result of clear-history operation.
+type SessionClearHistoryResultPayload struct {
+	// RequestID echoes the request correlation ID.
+	RequestID string `json:"request_id"`
+
+	// Success indicates whether archived sessions were cleared.
+	Success bool `json:"success"`
+
+	// ClearedCount is the number of archived sessions deleted on success.
+	ClearedCount int `json:"cleared_count,omitempty"`
+
+	// ErrorCode is a stable machine-readable error code on failure.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error is a human-readable error message on failure.
+	Error string `json:"error,omitempty"`
+}
+
 // NewTerminalAppendMessage creates a message for terminal output.
 // This is a convenience function to ensure consistent message creation.
 func NewTerminalAppendMessage(sessionID, chunk string) Message {
@@ -802,20 +1566,26 @@ func NewHeartbeatMessage() Message {
 // NewDiffCardMessage creates a message for a review card.
 // The chunks parameter is optional; pass nil for backward compatibility.
 // The chunkGroups parameter provides proximity grouping metadata (nil when disabled).
+// The semanticGroups parameter provides semantic grouping metadata (nil when disabled).
 // The isBinary, isDeleted, and stats parameters are optional for backward compatibility.
-func NewDiffCardMessage(cardID, file, diff string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) Message {
+func NewDiffCardMessage(cardID, file, diff string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, semanticGroups []SemanticGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) Message {
+	summary, riskLevel, riskReasons := computeDiffCardMeta(file, chunks, isBinary, isDeleted, stats, semanticGroups)
 	return Message{
 		Type: MessageTypeDiffCard,
 		Payload: DiffCardPayload{
-			CardID:      cardID,
-			File:        file,
-			Diff:        diff,
-			Chunks:      chunks,
-			ChunkGroups: chunkGroups,
-			IsBinary:    isBinary,
-			IsDeleted:   isDeleted,
-			Stats:       stats,
-			CreatedAt:   createdAt,
+			CardID:         cardID,
+			File:           file,
+			Diff:           diff,
+			Chunks:         chunks,
+			ChunkGroups:    chunkGroups,
+			SemanticGroups: semanticGroups,
+			IsBinary:       isBinary,
+			IsDeleted:      isDeleted,
+			Stats:          stats,
+			CreatedAt:      createdAt,
+			Summary:        summary,
+			RiskLevel:      riskLevel,
+			RiskReasons:    riskReasons,
 		},
 	}
 }
@@ -922,6 +1692,7 @@ func SessionsToInfoList(sessions []*SessionData) []SessionInfo {
 			LastSeen:   s.LastSeen.UnixMilli(),
 			LastCommit: s.LastCommit,
 			Status:     s.Status,
+			IsSystem:   s.IsSystem,
 		}
 	}
 	return infos
@@ -937,30 +1708,44 @@ type SessionData struct {
 	LastSeen   time.Time
 	LastCommit string
 	Status     string
+	IsSystem   bool
 }
 
 // NewRepoStatusMessage creates a message with current repository status.
 // This is sent in response to a repo.status request from the client.
-func NewRepoStatusMessage(branch, upstream string, stagedCount int, stagedFiles []string, unstagedCount int, lastCommit string) Message {
+func NewRepoStatusMessage(
+	branch, upstream string,
+	stagedCount int,
+	stagedFiles []string,
+	unstagedCount int,
+	lastCommit string,
+	readinessState string,
+	readinessBlockers, readinessWarnings, readinessActions []string,
+) Message {
 	return Message{
 		Type: MessageTypeRepoStatus,
 		Payload: RepoStatusPayload{
-			Branch:        branch,
-			Upstream:      upstream,
-			StagedCount:   stagedCount,
-			StagedFiles:   stagedFiles,
-			UnstagedCount: unstagedCount,
-			LastCommit:    lastCommit,
+			Branch:            branch,
+			Upstream:          upstream,
+			StagedCount:       stagedCount,
+			StagedFiles:       stagedFiles,
+			UnstagedCount:     unstagedCount,
+			LastCommit:        lastCommit,
+			ReadinessState:    readinessState,
+			ReadinessBlockers: readinessBlockers,
+			ReadinessWarnings: readinessWarnings,
+			ReadinessActions:  readinessActions,
 		},
 	}
 }
 
 // NewRepoCommitResultMessage creates a message with commit result.
 // On success, include hash and summary. On failure, include error code and message.
-func NewRepoCommitResultMessage(success bool, hash, summary, errCode, errMsg string) Message {
+func NewRepoCommitResultMessage(requestID string, success bool, hash, summary, errCode, errMsg string) Message {
 	return Message{
 		Type: MessageTypeRepoCommitResult,
 		Payload: RepoCommitResultPayload{
+			RequestID: requestID,
 			Success:   success,
 			Hash:      hash,
 			Summary:   summary,
@@ -972,16 +1757,42 @@ func NewRepoCommitResultMessage(success bool, hash, summary, errCode, errMsg str
 
 // NewRepoPushResultMessage creates a message with push result.
 // On success, include output. On failure, include error code and message.
-func NewRepoPushResultMessage(success bool, output, errCode, errMsg string) Message {
+func NewRepoPushResultMessage(requestID string, success bool, output, errCode, errMsg string) Message {
 	return Message{
 		Type: MessageTypeRepoPushResult,
 		Payload: RepoPushResultPayload{
+			RequestID: requestID,
 			Success:   success,
 			Output:    output,
 			ErrorCode: errCode,
 			Error:     errMsg,
 		},
 	}
+}
+
+// NewKeepAwakeEnableResultMessage creates a keep-awake enable mutation result.
+func NewKeepAwakeEnableResultMessage(payload KeepAwakeMutationResultPayload) Message {
+	return Message{Type: MessageTypeSessionKeepAwakeEnableResult, Payload: payload}
+}
+
+// NewKeepAwakeDisableResultMessage creates a keep-awake disable mutation result.
+func NewKeepAwakeDisableResultMessage(payload KeepAwakeMutationResultPayload) Message {
+	return Message{Type: MessageTypeSessionKeepAwakeDisableResult, Payload: payload}
+}
+
+// NewKeepAwakeExtendResultMessage creates a keep-awake extend mutation result.
+func NewKeepAwakeExtendResultMessage(payload KeepAwakeMutationResultPayload) Message {
+	return Message{Type: MessageTypeSessionKeepAwakeExtendResult, Payload: payload}
+}
+
+// NewKeepAwakeStatusResultMessage creates a keep-awake status result.
+func NewKeepAwakeStatusResultMessage(payload KeepAwakeStatusPayload) Message {
+	return Message{Type: MessageTypeSessionKeepAwakeStatusResult, Payload: payload}
+}
+
+// NewKeepAwakeChangedMessage creates a keep-awake changed broadcast event.
+func NewKeepAwakeChangedMessage(payload KeepAwakeStatusPayload) Message {
+	return Message{Type: MessageTypeSessionKeepAwakeChanged, Payload: payload}
 }
 
 // Multi-session PTY message constructors (Phase 9)
@@ -1023,6 +1834,25 @@ func NewSessionBufferMessage(sessionID string, lines []string, cursorRow, cursor
 			Lines:     lines,
 			CursorRow: cursorRow,
 			CursorCol: cursorCol,
+		},
+	}
+}
+
+// NewSessionClearHistoryResultMessage creates a clear-history result message.
+func NewSessionClearHistoryResultMessage(
+	requestID string,
+	success bool,
+	clearedCount int,
+	errCode, errMsg string,
+) Message {
+	return Message{
+		Type: MessageTypeSessionClearHistoryResult,
+		Payload: SessionClearHistoryResultPayload{
+			RequestID:    requestID,
+			Success:      success,
+			ClearedCount: clearedCount,
+			ErrorCode:    errCode,
+			Error:        errMsg,
 		},
 	}
 }
@@ -1247,3 +2077,705 @@ func NewUndoResultMessageWithHash(cardID string, chunkIndex int, contentHash str
 		Payload: payload,
 	}
 }
+
+// -----------------------------------------------------------------------------
+// File Explorer Messages (Phase 3)
+// -----------------------------------------------------------------------------
+
+// FileListPayload carries a directory listing request.
+type FileListPayload struct {
+	// RequestID is a unique identifier for request/response correlation.
+	RequestID string `json:"request_id"`
+
+	// Path is the repo-relative directory path to list.
+	// Empty or "." means the repository root.
+	Path string `json:"path"`
+}
+
+// FileEntry describes a single entry in a directory listing.
+type FileEntry struct {
+	// Name is the entry's base name (e.g., "main.go").
+	Name string `json:"name"`
+
+	// Path is the repo-relative path (e.g., "cmd/main.go").
+	Path string `json:"path"`
+
+	// Kind is "file", "dir", or "symlink".
+	Kind string `json:"kind"`
+
+	// SizeBytes is the file size in bytes. Nil for directories.
+	SizeBytes *int64 `json:"size_bytes,omitempty"`
+
+	// ModifiedAt is the last modification time (Unix milliseconds). Nil for symlinks.
+	ModifiedAt *int64 `json:"modified_at,omitempty"`
+}
+
+// FileListResultPayload carries the result of a directory listing.
+type FileListResultPayload struct {
+	// RequestID echoes the request for correlation.
+	RequestID string `json:"request_id"`
+
+	// Path is the canonical repo-relative path that was listed.
+	Path string `json:"path"`
+
+	// Success indicates whether the listing succeeded.
+	Success bool `json:"success"`
+
+	// Entries is the list of directory entries (nil on failure).
+	Entries []FileEntry `json:"entries,omitempty"`
+
+	// ErrorCode is a stable error code if Success is false.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error contains a human-readable error message if Success is false.
+	Error string `json:"error,omitempty"`
+}
+
+// MarshalJSON keeps file.list_result payload shape deterministic:
+// success responses always include entries (empty array allowed),
+// while failure responses omit entries and include error fields.
+func (p FileListResultPayload) MarshalJSON() ([]byte, error) {
+	if p.Success {
+		entries := p.Entries
+		if entries == nil {
+			entries = []FileEntry{}
+		}
+		type successPayload struct {
+			RequestID string      `json:"request_id"`
+			Path      string      `json:"path"`
+			Success   bool        `json:"success"`
+			Entries   []FileEntry `json:"entries"`
+		}
+		return json.Marshal(successPayload{
+			RequestID: p.RequestID,
+			Path:      p.Path,
+			Success:   true,
+			Entries:   entries,
+		})
+	}
+
+	type failurePayload struct {
+		RequestID string `json:"request_id"`
+		Path      string `json:"path"`
+		Success   bool   `json:"success"`
+		ErrorCode string `json:"error_code,omitempty"`
+		Error     string `json:"error,omitempty"`
+	}
+	return json.Marshal(failurePayload{
+		RequestID: p.RequestID,
+		Path:      p.Path,
+		Success:   false,
+		ErrorCode: p.ErrorCode,
+		Error:     p.Error,
+	})
+}
+
+// FileReadPayload carries a file read request.
+type FileReadPayload struct {
+	// RequestID is a unique identifier for request/response correlation.
+	RequestID string `json:"request_id"`
+
+	// Path is the repo-relative file path to read.
+	Path string `json:"path"`
+}
+
+// FileReadResultPayload carries the result of a file read.
+type FileReadResultPayload struct {
+	// RequestID echoes the request for correlation.
+	RequestID string `json:"request_id"`
+
+	// Path is the canonical repo-relative path that was read.
+	Path string `json:"path"`
+
+	// Success indicates whether the read succeeded.
+	Success bool `json:"success"`
+
+	// Content is the file content (empty for binary/too-large files).
+	Content string `json:"content,omitempty"`
+
+	// Encoding is "utf-8" for text files, empty for binary.
+	Encoding string `json:"encoding,omitempty"`
+
+	// LineEnding is "lf" or "crlf" for text files.
+	LineEnding string `json:"line_ending,omitempty"`
+
+	// Version is "sha256:<hex>" content hash for optimistic concurrency.
+	Version string `json:"version,omitempty"`
+
+	// ReadOnlyReason is set when the file cannot be edited.
+	// Values: "binary", "too_large". Empty means editable.
+	ReadOnlyReason string `json:"read_only_reason,omitempty"`
+
+	// ErrorCode is a stable error code if Success is false.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error contains a human-readable error message if Success is false.
+	Error string `json:"error,omitempty"`
+}
+
+// MarshalJSON keeps file.read_result payload shape deterministic:
+// success responses always include content (empty string allowed),
+// while failure responses omit content and include error fields.
+func (p FileReadResultPayload) MarshalJSON() ([]byte, error) {
+	if p.Success {
+		type successPayload struct {
+			RequestID      string `json:"request_id"`
+			Path           string `json:"path"`
+			Success        bool   `json:"success"`
+			Content        string `json:"content"`
+			Encoding       string `json:"encoding,omitempty"`
+			LineEnding     string `json:"line_ending,omitempty"`
+			Version        string `json:"version,omitempty"`
+			ReadOnlyReason string `json:"read_only_reason,omitempty"`
+		}
+		return json.Marshal(successPayload{
+			RequestID:      p.RequestID,
+			Path:           p.Path,
+			Success:        true,
+			Content:        p.Content,
+			Encoding:       p.Encoding,
+			LineEnding:     p.LineEnding,
+			Version:        p.Version,
+			ReadOnlyReason: p.ReadOnlyReason,
+		})
+	}
+
+	type failurePayload struct {
+		RequestID string `json:"request_id"`
+		Path      string `json:"path"`
+		Success   bool   `json:"success"`
+		ErrorCode string `json:"error_code,omitempty"`
+		Error     string `json:"error,omitempty"`
+	}
+	return json.Marshal(failurePayload{
+		RequestID: p.RequestID,
+		Path:      p.Path,
+		Success:   false,
+		ErrorCode: p.ErrorCode,
+		Error:     p.Error,
+	})
+}
+
+// FileWritePayload carries a file write request (schema only).
+type FileWritePayload struct {
+	RequestID   string `json:"request_id"`
+	Path        string `json:"path"`
+	Content     string `json:"content"`
+	BaseVersion string `json:"base_version"`
+}
+
+// FileWriteResultPayload carries the result of a file write (schema only).
+type FileWriteResultPayload struct {
+	RequestID string `json:"request_id"`
+	Path      string `json:"path"`
+	Success   bool   `json:"success"`
+	Version   string `json:"version,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// FileCreatePayload carries a file create request (schema only).
+type FileCreatePayload struct {
+	RequestID string `json:"request_id"`
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+}
+
+// FileCreateResultPayload carries the result of a file create (schema only).
+type FileCreateResultPayload struct {
+	RequestID string `json:"request_id"`
+	Path      string `json:"path"`
+	Success   bool   `json:"success"`
+	Version   string `json:"version,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// FileDeletePayload carries a file delete request (schema only).
+type FileDeletePayload struct {
+	RequestID string `json:"request_id"`
+	Path      string `json:"path"`
+	// Confirmed must be present and true to proceed with deletion.
+	// Pointer type allows handler validation to distinguish missing/null from false.
+	Confirmed *bool `json:"confirmed"`
+}
+
+// FileDeleteResultPayload carries the result of a file delete (schema only).
+type FileDeleteResultPayload struct {
+	RequestID string `json:"request_id"`
+	Path      string `json:"path"`
+	Success   bool   `json:"success"`
+	ErrorCode string `json:"error_code,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// FileWatchPayload notifies that a watched file changed (schema only).
+type FileWatchPayload struct {
+	Path    string `json:"path"`
+	Change  string `json:"change"`
+	Version string `json:"version,omitempty"`
+}
+
+// NewFileListResultMessage creates a file.list_result message.
+func NewFileListResultMessage(requestID, path string, success bool, entries []FileEntry, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeFileListResult,
+		Payload: FileListResultPayload{
+			RequestID: requestID,
+			Path:      path,
+			Success:   success,
+			Entries:   entries,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewFileReadResultMessage creates a file.read_result message.
+func NewFileReadResultMessage(requestID, path string, success bool, content, encoding, lineEnding, version, readOnlyReason, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeFileReadResult,
+		Payload: FileReadResultPayload{
+			RequestID:      requestID,
+			Path:           path,
+			Success:        success,
+			Content:        content,
+			Encoding:       encoding,
+			LineEnding:     lineEnding,
+			Version:        version,
+			ReadOnlyReason: readOnlyReason,
+			ErrorCode:      errCode,
+			Error:          errMsg,
+		},
+	}
+}
+
+// NewFileWriteResultMessage creates a file.write_result message.
+func NewFileWriteResultMessage(requestID, path string, success bool, version, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeFileWriteResult,
+		Payload: FileWriteResultPayload{
+			RequestID: requestID,
+			Path:      path,
+			Success:   success,
+			Version:   version,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewFileCreateResultMessage creates a file.create_result message.
+func NewFileCreateResultMessage(requestID, path string, success bool, version, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeFileCreateResult,
+		Payload: FileCreateResultPayload{
+			RequestID: requestID,
+			Path:      path,
+			Success:   success,
+			Version:   version,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewFileDeleteResultMessage creates a file.delete_result message.
+func NewFileDeleteResultMessage(requestID, path string, success bool, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeFileDeleteResult,
+		Payload: FileDeleteResultPayload{
+			RequestID: requestID,
+			Path:      path,
+			Success:   success,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewFileWatchMessage creates a file.watch message.
+func NewFileWatchMessage(path, change, version string) Message {
+	return Message{
+		Type: MessageTypeFileWatch,
+		Payload: FileWatchPayload{
+			Path:    path,
+			Change:  change,
+			Version: version,
+		},
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Git History and Branch Listing Messages (Phase 4)
+// -----------------------------------------------------------------------------
+
+// RepoHistoryPayload carries a commit history request from the client.
+type RepoHistoryPayload struct {
+	// RequestID is a unique identifier for request/response correlation.
+	RequestID string `json:"request_id"`
+
+	// Cursor is the commit hash to start after (exclusive).
+	// Empty means start from HEAD.
+	Cursor string `json:"cursor,omitempty"`
+
+	// PageSize is the number of entries per page (1..200, default 50).
+	// Nil means the client omitted page_size and the server should apply defaulting.
+	PageSize *int `json:"page_size,omitempty"`
+}
+
+// RepoHistoryEntry represents a single commit in the history.
+type RepoHistoryEntry struct {
+	// Hash is the full commit hash (40 hex chars).
+	Hash string `json:"hash"`
+
+	// Subject is the first line of the commit message.
+	Subject string `json:"subject"`
+
+	// Author is the commit author name.
+	Author string `json:"author"`
+
+	// AuthoredAt is the author date as Unix milliseconds.
+	AuthoredAt int64 `json:"authored_at"`
+}
+
+// RepoHistoryResultPayload carries the result of a history request.
+type RepoHistoryResultPayload struct {
+	// RequestID echoes the request for correlation.
+	RequestID string `json:"request_id"`
+
+	// Success indicates whether the history request succeeded.
+	Success bool `json:"success"`
+
+	// Entries is the list of commit entries (newest first).
+	Entries []RepoHistoryEntry `json:"entries,omitempty"`
+
+	// NextCursor is the hash to pass as cursor for the next page.
+	// Empty when there are no more pages.
+	NextCursor string `json:"next_cursor,omitempty"`
+
+	// ErrorCode is a stable error code if Success is false.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error contains a human-readable error message if Success is false.
+	Error string `json:"error,omitempty"`
+}
+
+// MarshalJSON keeps repo.history_result payload shape deterministic:
+// success responses always include entries (empty array allowed),
+// while failure responses omit success-only fields and include error fields.
+func (p RepoHistoryResultPayload) MarshalJSON() ([]byte, error) {
+	if p.Success {
+		entries := p.Entries
+		if entries == nil {
+			entries = []RepoHistoryEntry{}
+		}
+		type successPayload struct {
+			RequestID  string             `json:"request_id"`
+			Success    bool               `json:"success"`
+			Entries    []RepoHistoryEntry `json:"entries"`
+			NextCursor string             `json:"next_cursor,omitempty"`
+		}
+		return json.Marshal(successPayload{
+			RequestID:  p.RequestID,
+			Success:    true,
+			Entries:    entries,
+			NextCursor: p.NextCursor,
+		})
+	}
+
+	type failurePayload struct {
+		RequestID string `json:"request_id"`
+		Success   bool   `json:"success"`
+		ErrorCode string `json:"error_code,omitempty"`
+		Error     string `json:"error,omitempty"`
+	}
+	return json.Marshal(failurePayload{
+		RequestID: p.RequestID,
+		Success:   false,
+		ErrorCode: p.ErrorCode,
+		Error:     p.Error,
+	})
+}
+
+// RepoBranchesPayload carries a branch listing request from the client.
+type RepoBranchesPayload struct {
+	// RequestID is a unique identifier for request/response correlation.
+	RequestID string `json:"request_id"`
+}
+
+// RepoBranchesResultPayload carries the result of a branch listing request.
+type RepoBranchesResultPayload struct {
+	// RequestID echoes the request for correlation.
+	RequestID string `json:"request_id"`
+
+	// Success indicates whether the branch listing succeeded.
+	Success bool `json:"success"`
+
+	// CurrentBranch is the current branch name, or "HEAD" if detached.
+	CurrentBranch string `json:"current_branch,omitempty"`
+
+	// Local is the list of local branch names, sorted alphabetically.
+	Local []string `json:"local,omitempty"`
+
+	// TrackedRemote is the list of remote-tracking branch names, sorted alphabetically.
+	// Remote HEAD aliases (e.g., "origin/HEAD") are filtered out.
+	TrackedRemote []string `json:"tracked_remote,omitempty"`
+
+	// ErrorCode is a stable error code if Success is false.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error contains a human-readable error message if Success is false.
+	Error string `json:"error,omitempty"`
+}
+
+// MarshalJSON keeps repo.branches_result payload shape deterministic:
+// success responses always include current_branch, local, and tracked_remote,
+// while failure responses omit success-only fields and include error fields.
+func (p RepoBranchesResultPayload) MarshalJSON() ([]byte, error) {
+	if p.Success {
+		local := p.Local
+		if local == nil {
+			local = []string{}
+		}
+		trackedRemote := p.TrackedRemote
+		if trackedRemote == nil {
+			trackedRemote = []string{}
+		}
+		type successPayload struct {
+			RequestID     string   `json:"request_id"`
+			Success       bool     `json:"success"`
+			CurrentBranch string   `json:"current_branch"`
+			Local         []string `json:"local"`
+			TrackedRemote []string `json:"tracked_remote"`
+		}
+		return json.Marshal(successPayload{
+			RequestID:     p.RequestID,
+			Success:       true,
+			CurrentBranch: p.CurrentBranch,
+			Local:         local,
+			TrackedRemote: trackedRemote,
+		})
+	}
+
+	type failurePayload struct {
+		RequestID string `json:"request_id"`
+		Success   bool   `json:"success"`
+		ErrorCode string `json:"error_code,omitempty"`
+		Error     string `json:"error,omitempty"`
+	}
+	return json.Marshal(failurePayload{
+		RequestID: p.RequestID,
+		Success:   false,
+		ErrorCode: p.ErrorCode,
+		Error:     p.Error,
+	})
+}
+
+// NewRepoHistoryResultMessage creates a repo.history_result message.
+func NewRepoHistoryResultMessage(requestID string, success bool, entries []RepoHistoryEntry, nextCursor, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoHistoryResult,
+		Payload: RepoHistoryResultPayload{
+			RequestID:  requestID,
+			Success:    success,
+			Entries:    entries,
+			NextCursor: nextCursor,
+			ErrorCode:  errCode,
+			Error:      errMsg,
+		},
+	}
+}
+
+// NewRepoBranchesResultMessage creates a repo.branches_result message.
+func NewRepoBranchesResultMessage(requestID string, success bool, currentBranch string, local, trackedRemote []string, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoBranchesResult,
+		Payload: RepoBranchesResultPayload{
+			RequestID:     requestID,
+			Success:       success,
+			CurrentBranch: currentBranch,
+			Local:         local,
+			TrackedRemote: trackedRemote,
+			ErrorCode:     errCode,
+			Error:         errMsg,
+		},
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Branch Mutation Messages (Phase 4 P4U2)
+// -----------------------------------------------------------------------------
+
+// RepoBranchCreatePayload carries a branch creation request from the client.
+type RepoBranchCreatePayload struct {
+	// RequestID is a unique identifier for request/response correlation.
+	RequestID string `json:"request_id"`
+
+	// Name is the branch name to create.
+	Name string `json:"name"`
+}
+
+// RepoBranchCreateResultPayload carries the result of a branch creation request.
+type RepoBranchCreateResultPayload struct {
+	// RequestID echoes the request for correlation.
+	RequestID string `json:"request_id"`
+
+	// Success indicates whether the branch creation succeeded.
+	Success bool `json:"success"`
+
+	// Name is the created branch name.
+	Name string `json:"name,omitempty"`
+
+	// ErrorCode is a stable error code if Success is false.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error contains a human-readable error message if Success is false.
+	Error string `json:"error,omitempty"`
+}
+
+// MarshalJSON keeps repo.branch_create_result payload shape deterministic:
+// success responses include request_id, success, and name,
+// while failure responses include error fields and name when available.
+func (p RepoBranchCreateResultPayload) MarshalJSON() ([]byte, error) {
+	if p.Success {
+		type successPayload struct {
+			RequestID string `json:"request_id"`
+			Success   bool   `json:"success"`
+			Name      string `json:"name"`
+		}
+		return json.Marshal(successPayload{
+			RequestID: p.RequestID,
+			Success:   true,
+			Name:      p.Name,
+		})
+	}
+
+	type failurePayload struct {
+		RequestID string `json:"request_id"`
+		Success   bool   `json:"success"`
+		Name      string `json:"name,omitempty"`
+		ErrorCode string `json:"error_code,omitempty"`
+		Error     string `json:"error,omitempty"`
+	}
+	return json.Marshal(failurePayload{
+		RequestID: p.RequestID,
+		Success:   false,
+		Name:      p.Name,
+		ErrorCode: p.ErrorCode,
+		Error:     p.Error,
+	})
+}
+
+// RepoBranchSwitchPayload carries a branch switch request from the client.
+type RepoBranchSwitchPayload struct {
+	// RequestID is a unique identifier for request/response correlation.
+	RequestID string `json:"request_id"`
+
+	// Name is the branch name to switch to.
+	Name string `json:"name"`
+}
+
+// RepoBranchSwitchResultPayload carries the result of a branch switch request.
+type RepoBranchSwitchResultPayload struct {
+	// RequestID echoes the request for correlation.
+	RequestID string `json:"request_id"`
+
+	// Success indicates whether the branch switch succeeded.
+	Success bool `json:"success"`
+
+	// Name is the target branch name.
+	Name string `json:"name,omitempty"`
+
+	// Blockers lists dirty-state blockers that prevent switching.
+	// Present and non-empty only when dirty-state blocking occurs.
+	Blockers []string `json:"blockers,omitempty"`
+
+	// ErrorCode is a stable error code if Success is false.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error contains a human-readable error message if Success is false.
+	Error string `json:"error,omitempty"`
+}
+
+// MarshalJSON keeps repo.branch_switch_result payload shape deterministic:
+// success responses include request_id, success, and name,
+// while failure responses include error fields, name, and blockers when present.
+func (p RepoBranchSwitchResultPayload) MarshalJSON() ([]byte, error) {
+	if p.Success {
+		type successPayload struct {
+			RequestID string `json:"request_id"`
+			Success   bool   `json:"success"`
+			Name      string `json:"name"`
+		}
+		return json.Marshal(successPayload{
+			RequestID: p.RequestID,
+			Success:   true,
+			Name:      p.Name,
+		})
+	}
+
+	if len(p.Blockers) > 0 {
+		type blockerPayload struct {
+			RequestID string   `json:"request_id"`
+			Success   bool     `json:"success"`
+			Name      string   `json:"name,omitempty"`
+			Blockers  []string `json:"blockers"`
+			ErrorCode string   `json:"error_code,omitempty"`
+			Error     string   `json:"error,omitempty"`
+		}
+		return json.Marshal(blockerPayload{
+			RequestID: p.RequestID,
+			Success:   false,
+			Name:      p.Name,
+			Blockers:  p.Blockers,
+			ErrorCode: p.ErrorCode,
+			Error:     p.Error,
+		})
+	}
+
+	type failurePayload struct {
+		RequestID string `json:"request_id"`
+		Success   bool   `json:"success"`
+		Name      string `json:"name,omitempty"`
+		ErrorCode string `json:"error_code,omitempty"`
+		Error     string `json:"error,omitempty"`
+	}
+	return json.Marshal(failurePayload{
+		RequestID: p.RequestID,
+		Success:   false,
+		Name:      p.Name,
+		ErrorCode: p.ErrorCode,
+		Error:     p.Error,
+	})
+}
+
+// NewRepoBranchCreateResultMessage creates a repo.branch_create_result message.
+func NewRepoBranchCreateResultMessage(requestID string, success bool, name, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoBranchCreateResult,
+		Payload: RepoBranchCreateResultPayload{
+			RequestID: requestID,
+			Success:   success,
+			Name:      name,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewRepoBranchSwitchResultMessage creates a repo.branch_switch_result message.
+func NewRepoBranchSwitchResultMessage(requestID string, success bool, name string, blockers []string, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeRepoBranchSwitchResult,
+		Payload: RepoBranchSwitchResultPayload{
+			RequestID: requestID,
+			Success:   success,
+			Name:      name,
+			Blockers:  blockers,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+

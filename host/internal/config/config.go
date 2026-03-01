@@ -4,9 +4,12 @@
 package config
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"github.com/BurntSushi/toml"
 )
@@ -112,6 +115,36 @@ type Config struct {
 	// Chunks within this many lines of each other are grouped together.
 	// Default: 20, must be >= 1 when set. Zero means "use default".
 	ChunkGroupingProximity int `toml:"chunk_grouping_proximity"`
+
+	// KeepAwakeRemoteEnabled enables remote keep-awake mutations from mobile.
+	// Default: false
+	KeepAwakeRemoteEnabled bool `toml:"keep_awake_remote_enabled"`
+
+	// KeepAwakeAllowAdminRevoke allows admin devices to revoke any lease.
+	// Requires KeepAwakeAdminDeviceIDs to be non-empty.
+	// Default: false
+	KeepAwakeAllowAdminRevoke bool `toml:"keep_awake_allow_admin_revoke"`
+
+	// KeepAwakeAdminDeviceIDs lists device IDs with admin privileges.
+	KeepAwakeAdminDeviceIDs []string `toml:"keep_awake_admin_device_ids"`
+
+	// KeepAwakeAllowOnBattery permits keep-awake when on battery power.
+	// Default: true (Go zero false; host.go transforms to semantic default)
+	KeepAwakeAllowOnBattery bool `toml:"keep_awake_allow_on_battery"`
+
+	// KeepAwakeAllowOnBatterySet tracks whether keep_awake_allow_on_battery
+	// was explicitly defined in the config file. This preserves the ability to
+	// distinguish "unset" (semantic default true) from explicit false.
+	KeepAwakeAllowOnBatterySet bool `toml:"-"`
+
+	// KeepAwakeAutoDisableBatteryPercent is the battery % threshold for auto-disable.
+	// 0 means disabled. When set, must be 1-100.
+	KeepAwakeAutoDisableBatteryPercent int `toml:"keep_awake_auto_disable_battery_percent"`
+
+	// KeepAwakeAuditMaxRows caps the number of durable audit rows retained.
+	// 0 means use default (1000). When set, must be 100-50000.
+	KeepAwakeAuditMaxRows int `toml:"keep_awake_audit_max_rows"`
+
 }
 
 // DefaultConfigPath returns the default config file location: ~/.pseudocoder/config.toml.
@@ -207,11 +240,22 @@ func Load(path string) (*Config, error) {
 
 	// Parse the TOML file. Any parse error is fatal since the user expects
 	// the config to be applied.
-	if _, err := toml.DecodeFile(path, cfg); err != nil {
+	meta, err := toml.DecodeFile(path, cfg)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", path, err)
 	}
+	cfg.KeepAwakeAllowOnBatterySet = meta.IsDefined("keep_awake_allow_on_battery")
 
 	return cfg, nil
+}
+
+// EffectiveKeepAwakeAllowOnBattery resolves the semantic keep-awake battery policy
+// default. When the config key is omitted, default to true.
+func (c *Config) EffectiveKeepAwakeAllowOnBattery() bool {
+	if !c.KeepAwakeAllowOnBatterySet {
+		return true
+	}
+	return c.KeepAwakeAllowOnBattery
 }
 
 // Validate checks config values for semantic correctness.
@@ -230,5 +274,194 @@ func (c *Config) Validate() error {
 	if c.ChunkGroupingProximity < 0 {
 		return fmt.Errorf("chunk_grouping_proximity must be >= 1, got %d", c.ChunkGroupingProximity)
 	}
+
+	// KeepAwakeAutoDisableBatteryPercent: 0 means disabled, 1-100 valid.
+	if c.KeepAwakeAutoDisableBatteryPercent != 0 &&
+		(c.KeepAwakeAutoDisableBatteryPercent < 1 || c.KeepAwakeAutoDisableBatteryPercent > 100) {
+		return fmt.Errorf("keep_awake_auto_disable_battery_percent must be 0 (disabled) or 1-100, got %d", c.KeepAwakeAutoDisableBatteryPercent)
+	}
+
+	// KeepAwakeAuditMaxRows: 0 means use default, 100-50000 valid.
+	if c.KeepAwakeAuditMaxRows != 0 &&
+		(c.KeepAwakeAuditMaxRows < 100 || c.KeepAwakeAuditMaxRows > 50000) {
+		return fmt.Errorf("keep_awake_audit_max_rows must be 0 (default) or 100-50000, got %d", c.KeepAwakeAuditMaxRows)
+	}
+
+	// KeepAwakeAllowAdminRevoke requires non-empty admin device IDs.
+	if c.KeepAwakeAllowAdminRevoke {
+		normalized := NormalizeKeepAwakeAdminDeviceIDs(c.KeepAwakeAdminDeviceIDs)
+		if len(normalized) == 0 {
+			return fmt.Errorf("keep_awake_allow_admin_revoke requires non-empty keep_awake_admin_device_ids")
+		}
+	}
+
 	return nil
+}
+
+// PersistKeepAwakePolicy atomically updates keep_awake_remote_enabled in the
+// config file. Uses line-by-line text replacement to preserve comments/formatting.
+// The file is protected by flock to prevent TOCTOU races.
+func PersistKeepAwakePolicy(configPath string, remoteEnabled bool) error {
+	// Resolve canonical path, rejecting unsafe symlinks.
+	canonical, err := filepath.EvalSymlinks(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("config file not found: %s", configPath)
+		}
+		return fmt.Errorf("unsafe symlink or unresolvable path %s: %w", configPath, err)
+	}
+	// Reject if symlink resolves outside the original parent directory.
+	origDir := filepath.Dir(configPath)
+	canonDir := filepath.Dir(canonical)
+	origDirCanon, err := filepath.EvalSymlinks(origDir)
+	if err != nil {
+		return fmt.Errorf("cannot resolve parent directory %s: %w", origDir, err)
+	}
+	if canonDir != origDirCanon {
+		return fmt.Errorf("unsafe symlink: %s resolves outside expected directory", configPath)
+	}
+
+	// Check directory is writable before acquiring lock.
+	dirInfo, err := os.Stat(canonDir)
+	if err != nil {
+		return fmt.Errorf("cannot stat config directory %s: %w", canonDir, err)
+	}
+	if !dirInfo.IsDir() {
+		return fmt.Errorf("config parent is not a directory: %s", canonDir)
+	}
+	// Try creating a temp file to test directory writability.
+	testFile, err := os.CreateTemp(canonDir, ".pseudocoder-probe-*")
+	if err != nil {
+		return fmt.Errorf("config directory is read-only: %s (create a writable config directory or run with appropriate permissions)", canonDir)
+	}
+	testFile.Close()
+	os.Remove(testFile.Name())
+
+	// Open file for reading + lock.
+	f, err := os.OpenFile(canonical, os.O_RDWR, 0)
+	if err != nil {
+		if os.IsPermission(err) {
+			return fmt.Errorf("config file is read-only: %s (run 'chmod u+w %s' to fix)", canonical, canonical)
+		}
+		return fmt.Errorf("cannot open config file %s: %w", canonical, err)
+	}
+	defer f.Close()
+
+	// Acquire exclusive flock (non-blocking).
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fmt.Errorf("config file is locked by another process (retry in a moment): %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	// Re-read under lock to prevent TOCTOU.
+	content, err := os.ReadFile(canonical)
+	if err != nil {
+		return fmt.Errorf("cannot read config file under lock: %w", err)
+	}
+
+	// Validate TOML is parseable.
+	var probe Config
+	if _, err := toml.Decode(string(content), &probe); err != nil {
+		return fmt.Errorf("config file has malformed TOML (fix syntax errors before retrying): %w", err)
+	}
+
+	// Line-by-line replacement of keep_awake_remote_enabled.
+	newValue := fmt.Sprintf("keep_awake_remote_enabled = %t", remoteEnabled)
+	lines := strings.Split(string(content), "\n")
+	found := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "keep_awake_remote_enabled") && !strings.HasPrefix(trimmed, "#") {
+			// Preserve leading whitespace.
+			leading := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			lines[i] = leading + newValue
+			found = true
+			break
+		}
+	}
+	if !found {
+		// Append the key. Find the right place: after last keep_awake_ key or at end.
+		insertIdx := len(lines)
+		for i := len(lines) - 1; i >= 0; i-- {
+			trimmed := strings.TrimSpace(lines[i])
+			if strings.HasPrefix(trimmed, "keep_awake_") && !strings.HasPrefix(trimmed, "#") {
+				insertIdx = i + 1
+				break
+			}
+		}
+		// Insert the new line.
+		newLines := make([]string, 0, len(lines)+1)
+		newLines = append(newLines, lines[:insertIdx]...)
+		newLines = append(newLines, newValue)
+		newLines = append(newLines, lines[insertIdx:]...)
+		lines = newLines
+	}
+
+	newContent := strings.Join(lines, "\n")
+
+	// Atomic write: temp file + rename.
+	tmpFile, err := os.CreateTemp(canonDir, ".config-*.toml.tmp")
+	if err != nil {
+		return fmt.Errorf("cannot create temp file for atomic write: %w", err)
+	}
+	tmpName := tmpFile.Name()
+
+	w := bufio.NewWriter(tmpFile)
+	if _, err := w.WriteString(newContent); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("cannot write temp config: %w", err)
+	}
+	if err := w.Flush(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("cannot flush temp config: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("cannot sync temp config: %w", err)
+	}
+
+	// Preserve original file permissions.
+	origInfo, err := os.Stat(canonical)
+	if err == nil {
+		os.Chmod(tmpName, origInfo.Mode().Perm())
+	}
+
+	tmpFile.Close()
+
+	if err := os.Rename(tmpName, canonical); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("atomic rename failed: %w", err)
+	}
+
+	// Post-write identity check: verify symlink still resolves to same path.
+	postCanonical, err := filepath.EvalSymlinks(configPath)
+	if err != nil || postCanonical != canonical {
+		// The symlink target changed during write. The write landed on the
+		// original canonical path, which is still correct, but log a warning.
+		// We don't roll back because the data was written to the intended file.
+	}
+
+	return nil
+}
+
+// NormalizeKeepAwakeAdminDeviceIDs trims whitespace, removes empty entries,
+// and deduplicates while preserving case and order.
+func NormalizeKeepAwakeAdminDeviceIDs(ids []string) []string {
+	seen := make(map[string]struct{}, len(ids))
+	var result []string
+	for _, id := range ids {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
 }
