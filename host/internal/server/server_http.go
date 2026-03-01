@@ -82,6 +82,24 @@ func (s *Server) createMux() *http.ServeMux {
 		log.Printf("Tmux API registered at /api/tmux/")
 	}
 
+	// Keep-awake policy API endpoint: /api/keep-awake/policy
+	// This allows the CLI to enable/disable keep-awake policy.
+	// Phase 18: Enables CLI keep-awake policy mutation.
+	keepAwakePolicyHandler := s.keepAwakePolicyHandler
+	if keepAwakePolicyHandler != nil {
+		mux.Handle("/api/keep-awake/policy", keepAwakePolicyHandler)
+		log.Printf("Keep-awake policy API registered at /api/keep-awake/policy")
+	}
+
+	// Flags API endpoint: /api/flags
+	// This allows the CLI to manage rollout flags (list, enable, disable, promote).
+	// Phase 7: Enables CLI flag management commands.
+	flagsAPIHandler := s.flagsAPIHandler
+	if flagsAPIHandler != nil {
+		mux.Handle("/api/flags", flagsAPIHandler)
+		log.Printf("Flags API registered at /api/flags")
+	}
+
 	return mux
 }
 
@@ -144,6 +162,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.clients[client] = true
 	s.mu.Unlock()
+	s.onKeepAwakeClientConnected(client)
 
 	log.Printf("Client connected (%d total)", s.ClientCount())
 

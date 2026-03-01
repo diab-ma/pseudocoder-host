@@ -2,13 +2,13 @@
 // It handles pairing codes, device tokens, and access control for WebSocket connections.
 //
 // The pairing flow works as follows:
-// 1. User runs `pseudocoder pair` to generate a 6-digit code (valid for 5 minutes)
+// 1. User runs `pseudocoder pair` to generate a 6-digit code (valid for 2 minutes)
 // 2. Mobile app enters the code and POSTs to /pair endpoint
 // 3. Host validates the code, generates a device token, and stores the device
 // 4. Mobile app uses the token for all subsequent WebSocket connections
 //
 // Security considerations:
-// - Pairing codes are short-lived (5 minute expiry)
+// - Pairing codes are short-lived (2 minute expiry)
 // - Codes can only be used once (replay prevention)
 // - Rate limiting prevents brute force attacks (max 5 attempts per minute)
 // - Tokens are hashed before storage (bcrypt)

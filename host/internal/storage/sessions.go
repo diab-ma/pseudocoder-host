@@ -40,9 +40,14 @@ func (s *SQLiteStore) SaveSession(session *Session) error {
 
 	const query = `
 		INSERT OR REPLACE INTO sessions
-			(id, repo, branch, started_at, last_seen, last_commit, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+			(id, repo, branch, started_at, last_seen, last_commit, status, is_system)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`
+
+	isSystem := 0
+	if session.IsSystem {
+		isSystem = 1
+	}
 
 	_, err := s.db.Exec(query,
 		session.ID,
@@ -52,6 +57,7 @@ func (s *SQLiteStore) SaveSession(session *Session) error {
 		lastSeen,
 		lastCommit,
 		string(session.Status),
+		isSystem,
 	)
 	if err != nil {
 		return fmt.Errorf("save session: %w", err)
@@ -79,7 +85,7 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	defer s.mu.RUnlock()
 
 	const query = `
-		SELECT id, repo, branch, started_at, last_seen, last_commit, status
+		SELECT id, repo, branch, started_at, last_seen, last_commit, status, is_system
 		FROM sessions
 		WHERE id = ?
 	`
@@ -107,7 +113,7 @@ func (s *SQLiteStore) ListSessions(limit int) ([]*Session, error) {
 	}
 
 	const query = `
-		SELECT id, repo, branch, started_at, last_seen, last_commit, status
+		SELECT id, repo, branch, started_at, last_seen, last_commit, status, is_system
 		FROM sessions
 		ORDER BY started_at DESC
 		LIMIT ?
@@ -162,6 +168,35 @@ func (s *SQLiteStore) UpdateSessionStatus(id string, status SessionStatus) error
 	return nil
 }
 
+// ClearArchivedSessions deletes archived session rows from storage.
+// Archived sessions are those with status "complete" or "error".
+// Returns the number of deleted rows.
+func (s *SQLiteStore) ClearArchivedSessions() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	const query = `
+		DELETE FROM sessions
+		WHERE status IN (?, ?)
+		  AND is_system = 0
+	`
+	result, err := s.db.Exec(
+		query,
+		string(SessionStatusComplete),
+		string(SessionStatusError),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("clear archived sessions: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("clear archived sessions rows affected: %w", err)
+	}
+
+	return int(rowsAffected), nil
+}
+
 // scanSessionRow scans a single row from sql.Row into a Session.
 func (s *SQLiteStore) scanSessionRow(row *sql.Row) (*Session, error) {
 	var (
@@ -170,6 +205,7 @@ func (s *SQLiteStore) scanSessionRow(row *sql.Row) (*Session, error) {
 		lastSeen   string
 		lastCommit sql.NullString
 		status     string
+		isSystem   int
 	)
 
 	err := row.Scan(
@@ -180,6 +216,7 @@ func (s *SQLiteStore) scanSessionRow(row *sql.Row) (*Session, error) {
 		&lastSeen,
 		&lastCommit,
 		&status,
+		&isSystem,
 	)
 	if err != nil {
 		return nil, err
@@ -202,6 +239,7 @@ func (s *SQLiteStore) scanSessionRow(row *sql.Row) (*Session, error) {
 	}
 
 	session.Status = SessionStatus(status)
+	session.IsSystem = isSystem == 1
 
 	return &session, nil
 }
@@ -214,6 +252,7 @@ func (s *SQLiteStore) scanSessionRows(rows *sql.Rows) (*Session, error) {
 		lastSeen   string
 		lastCommit sql.NullString
 		status     string
+		isSystem   int
 	)
 
 	err := rows.Scan(
@@ -224,6 +263,7 @@ func (s *SQLiteStore) scanSessionRows(rows *sql.Rows) (*Session, error) {
 		&lastSeen,
 		&lastCommit,
 		&status,
+		&isSystem,
 	)
 	if err != nil {
 		return nil, err
@@ -246,6 +286,7 @@ func (s *SQLiteStore) scanSessionRows(rows *sql.Rows) (*Session, error) {
 	}
 
 	session.Status = SessionStatus(status)
+	session.IsSystem = isSystem == 1
 
 	return &session, nil
 }

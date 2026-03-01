@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"github.com/pseudocoder/host/internal/config"
 	"github.com/pseudocoder/host/internal/diff"
 	"github.com/pseudocoder/host/internal/ipc"
+	"github.com/pseudocoder/host/internal/keepawake"
 	"github.com/pseudocoder/host/internal/mdns"
 	"github.com/pseudocoder/host/internal/pty"
 	"github.com/pseudocoder/host/internal/server"
@@ -59,6 +61,21 @@ type HostStartConfig struct {
 	QR                      bool
 	PairSocket              string
 }
+
+type keepAwakeController interface {
+	SetDesiredEnabled(ctx context.Context, enabled bool) keepawake.Status
+	Close(ctx context.Context) error
+}
+
+var newKeepAwakeController = func() keepAwakeController {
+	return keepawake.NewManager(keepawake.NewDefaultAdapter(), keepawake.Options{})
+}
+
+var probeKeepAwakeAuditWrite = func(store *storage.SQLiteStore) error {
+	return store.ProbeKeepAwakeAuditWrite()
+}
+
+const keepAwakeTestEnableEnv = "PSEUDOCODER_KEEP_AWAKE_TEST_ENABLE"
 
 func runHostStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("host start", flag.ContinueOnError)
@@ -356,12 +373,51 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "Repository path: %s\n", repoPath)
 	fmt.Fprintf(stdout, "Diff poll interval: %dms\n", diffPollMs)
 
+	// Phase 17 (P17U2): initialize keep-awake runtime manager.
+	// Runtime-only boundary in this unit: no protocol wiring yet.
+	keepAwakeManager := newKeepAwakeController()
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := keepAwakeManager.Close(closeCtx); err != nil {
+			fmt.Fprintf(stderr, "Warning: keep-awake cleanup failed: %v\n", err)
+		}
+	}()
+	if os.Getenv(keepAwakeTestEnableEnv) == "1" {
+		st := keepAwakeManager.SetDesiredEnabled(context.Background(), true)
+		if st.State == keepawake.StateDegraded {
+			fmt.Fprintf(stderr, "Warning: keep-awake test enable degraded: %s (%s)\n", st.Reason, st.LastError)
+		}
+	}
+
 	// Open SQLite storage for review cards and devices.
 	// This allows cards and device tokens to survive restarts.
 	store, err := storage.NewSQLiteStore(tokenStorePath)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: failed to open storage: %v\n", err)
 		return 1
+	}
+
+	// Phase 7: Open rollout metrics store (shared SQLite file) so rollout monitor,
+	// flags API, and instrumented handlers can record and query rollout evidence.
+	metricsStore, err := storage.NewSQLiteMetricsStore(tokenStorePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "Error: failed to open rollout metrics store: %v\n", err)
+		store.Close()
+		return 1
+	}
+	defer metricsStore.Close()
+
+	rolloutConfigPath := cfg.Config
+	if rolloutConfigPath == "" {
+		if p, err := config.DefaultConfigPath(); err == nil {
+			if _, err := os.Stat(p); err == nil {
+				rolloutConfigPath = p
+			}
+		}
+	}
+	loadRolloutConfig := func() (*config.Config, error) {
+		return config.Load(rolloutConfigPath)
 	}
 
 	// Create the pairing manager for device authentication.
@@ -403,6 +459,49 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 
 	// Create WebSocket server
 	wsServer := server.NewServer(addr)
+	wsServer.SetKeepAwakeRuntimeManager(keepAwakeManager)
+	wsServer.SetMetricsStore(metricsStore)
+
+	// Phase 7: monitor rollout metrics and auto-disable V2 flags on sustained
+	// threshold breaches (enabled only when we have a persisted config path).
+	var rolloutMonitor *server.RolloutMonitor
+	if rolloutConfigPath != "" {
+		rolloutMonitor = server.NewRolloutMonitor(metricsStore, rolloutConfigPath, loadRolloutConfig)
+	}
+
+	// P17U5: Wire durable audit adapter (replaces log-only keepAwakeAuditLogger).
+	auditMaxRows := fileCfg.KeepAwakeAuditMaxRows
+	if auditMaxRows == 0 {
+		auditMaxRows = 1000
+	}
+	wsServer.SetKeepAwakeAuditWriter(server.NewKeepAwakeAuditStoreAdapter(store, auditMaxRows))
+
+	// Fail-safe: if keep-awake audit storage is unavailable, force remote keep-awake disabled.
+	keepAwakeAuditUnavailable := false
+	if err := probeKeepAwakeAuditWrite(store); err != nil {
+		keepAwakeAuditUnavailable = true
+		wsServer.SetKeepAwakeMigrationFailed(true)
+		fmt.Fprintf(stderr, "Warning: keep-awake audit storage unavailable, remote keep-awake disabled: %v\n", err)
+	}
+
+	// P17U5: Wire power provider.
+	wsServer.SetKeepAwakePowerProvider(keepawake.NewDefaultPowerProvider())
+
+	// P17U5: Wire keep-awake policy from config with defaults.
+	wsServer.SetKeepAwakePolicy(server.KeepAwakePolicyConfig{
+		RemoteEnabled:             fileCfg.KeepAwakeRemoteEnabled && !keepAwakeAuditUnavailable,
+		AllowAdminRevoke:          fileCfg.KeepAwakeAllowAdminRevoke,
+		AdminDeviceIDs:            config.NormalizeKeepAwakeAdminDeviceIDs(fileCfg.KeepAwakeAdminDeviceIDs),
+		AllowOnBattery:            fileCfg.EffectiveKeepAwakeAllowOnBattery(),
+		AutoDisableBatteryPercent: fileCfg.KeepAwakeAutoDisableBatteryPercent,
+	})
+	if err := wsServer.SetKeepAwakeDisconnectGrace(45 * time.Second); err != nil {
+		fmt.Fprintf(stderr, "Error: invalid keep-awake disconnect grace: %v\n", err)
+		store.Close()
+		return 1
+	}
+
+	wsServer.SetSessionStore(store)
 
 	// Create and save the current session for history tracking (Unit 6.3a).
 	// This enables mobile clients to see session history and switch contexts.
@@ -413,6 +512,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		StartedAt: time.Now(),
 		LastSeen:  time.Now(),
 		Status:    storage.SessionStatusRunning,
+		IsSystem:  true,
 	}
 	if err := store.SaveSession(currentSession); err != nil {
 		// Log warning but don't fail - session history is nice-to-have
@@ -436,8 +536,14 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		return device.ID, nil
 	})
 
-	// Wire up pairing endpoints
-	wsServer.SetPairHandler(auth.NewPairHandler(pairingManager))
+	// Wire up pairing endpoints.
+	pairHandler := auth.NewPairHandler(pairingManager)
+	pairHandler.SetMetricsRecorder(func(deviceID string, success bool) {
+		if err := metricsStore.RecordPairingAttempt(deviceID, success); err != nil {
+			fmt.Fprintf(stderr, "Warning: failed to record pairing metrics: %v\n", err)
+		}
+	})
+	wsServer.SetPairHandler(pairHandler)
 	wsServer.SetGenerateCodeHandler(auth.NewGenerateCodeHandler(pairingManager))
 
 	// Wire up device revocation endpoint.
@@ -476,6 +582,32 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	// Create approval HTTP handler.
 	approveHandler := server.NewApproveHandler(wsServer, approvalTokenManager)
 	wsServer.SetApproveHandler(approveHandler)
+
+	// P18U2: Wire keep-awake policy HTTP endpoint.
+	// Resolve the config path for persistence (cfg.Config may be empty = default).
+	keepAwakeConfigPath := cfg.Config
+	if keepAwakeConfigPath == "" {
+		if p, err := config.DefaultConfigPath(); err == nil {
+			if _, err := os.Stat(p); err == nil {
+				keepAwakeConfigPath = p
+			}
+		}
+	}
+	keepAwakePolicyHandler := server.NewKeepAwakePolicyHandler(wsServer, approvalTokenManager, keepAwakeConfigPath)
+	wsServer.SetKeepAwakePolicyHandler(keepAwakePolicyHandler)
+
+	// Phase 7: wire /api/flags endpoint for rollout flag management.
+	// Endpoint is enabled only when a persisted config path is available.
+	var flagsAPIHandler *server.FlagsAPIHandler
+	if rolloutConfigPath != "" {
+		flagsAPIHandler = server.NewFlagsAPIHandler(rolloutConfigPath, loadRolloutConfig, metricsStore, rolloutMonitor)
+		flagsAPIHandler.SetOnChanged(func(payload server.ServerFlagsPayload) {
+			wsServer.BroadcastFlags(payload)
+		})
+		wsServer.SetFlagsAPIHandler(flagsAPIHandler)
+	} else {
+		fmt.Fprintf(stderr, "Warning: rollout flags API disabled (no writable config path found)\n")
+	}
 
 	// Wire up device activity tracking for last_seen updates.
 	// This is called when a message is received from an authenticated client.
@@ -594,8 +726,15 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	if err := <-wsErrCh; err != nil {
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		stopPairIPC()
+		if rolloutMonitor != nil {
+			rolloutMonitor.Stop()
+		}
 		store.Close()
 		return 1
+	}
+
+	if rolloutMonitor != nil {
+		rolloutMonitor.Start()
 	}
 
 	// Determine and write the PID file.
@@ -763,6 +902,24 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	// This allows marking accepted cards as committed when a commit is created.
 	wsServer.SetDecidedStore(store)
 
+	// Phase 3: Wire file operations for file explorer.
+	fileOps := server.NewFileOperations(repoPath, 1048576) // 1MB cap
+	wsServer.SetFileOperations(fileOps)
+
+	// Phase 3 (P3U3): File watch poller for external filesystem changes.
+	fileWatchPoller := server.NewFileWatchPoller(server.FileWatchPollerConfig{
+		RepoPath:     repoPath,
+		PollInterval: 2 * time.Second,
+		OnEvents: func(events []server.FileWatchEvent) {
+			for _, ev := range events {
+				wsServer.BroadcastFileWatch(ev.Path, ev.Change, "")
+			}
+		},
+		OnError: func(err error) {
+			fmt.Fprintf(stderr, "File watch poll error: %v\n", err)
+		},
+	})
+
 	// We'll set up the reconnect handler after creating the PTY session and card streamer,
 	// since we need access to the ring buffer and pending cards.
 	// For now, we defer this until after those are created.
@@ -842,6 +999,8 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	fileWatchPoller.Start()
+
 	fmt.Fprintln(stdout, "Review card streaming started.")
 
 	// Create PTY session with output going to WebSocket (and optionally stdout).
@@ -874,6 +1033,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		if pidFilePath != "" {
 			removePIDFile(pidFilePath, stderr)
 		}
+		fileWatchPoller.Stop()
 		cardStreamer.Stop()
 		stopPairIPC()
 		store.Close()
@@ -896,10 +1056,21 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 
 	// Set up the reconnect handler now that we have the PTY session and card store.
 	// This handler replays terminal history and pending cards when a client connects.
-	wsServer.SetReconnectHandler(func(sendToClient func(server.Message)) {
-		// Send session list (after session.status was already sent by the server).
-		// This gives mobile clients the session history for context switching.
-		sessions, err := store.ListSessions(20)
+		wsServer.SetReconnectHandler(func(sendToClient func(server.Message)) {
+			// Send current rollout flags so clients start with host-authoritative
+			// feature-gating state before processing subsequent updates.
+			if flagsAPIHandler != nil {
+				payload, err := flagsAPIHandler.CurrentPayload()
+				if err != nil {
+					fmt.Fprintf(stderr, "Warning: failed to load rollout flags for reconnect: %v\n", err)
+				} else {
+					sendToClient(server.NewServerFlagsMessage(payload))
+				}
+			}
+
+			// Send session list (after session.status was already sent by the server).
+			// This gives mobile clients the session history for context switching.
+			sessions, err := store.ListSessions(20)
 		if err != nil {
 			fmt.Fprintf(stderr, "Warning: failed to load sessions for reconnect: %v\n", err)
 		} else if len(sessions) > 0 {
@@ -914,6 +1085,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 					LastSeen:   s.LastSeen.UnixMilli(),
 					LastCommit: s.LastCommit,
 					Status:     string(s.Status),
+					IsSystem:   s.IsSystem,
 				}
 			}
 			sendToClient(server.NewSessionListMessage(sessionInfos))
@@ -939,82 +1111,11 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "Warning: failed to load pending cards for reconnect: %v\n", err)
 		} else {
 			for _, card := range pendingCards {
-				// Detect if card is for a binary file based on stored placeholder content
-				isBinary := card.Diff == diff.BinaryDiffPlaceholder
-
-				var serverChunks []server.ChunkInfo
-				var serverChunkGroups []server.ChunkGroupInfo
-				var stats *server.DiffStats
-
-				if !isBinary {
-					// Parse chunk boundaries from stored diff content
-					chunks := stream.ParseChunkInfoFromDiff(card.Diff)
-
-					// Apply proximity-based grouping if enabled
-					if fileCfg.ChunkGroupingEnabled && len(chunks) > 0 {
-						proximity := fileCfg.ChunkGroupingProximity
-						if proximity <= 0 {
-							proximity = 20 // Default proximity
-						}
-						groups, groupedChunks := stream.GroupChunksByProximity(chunks, proximity)
-						chunks = groupedChunks
-
-						// Convert stream.ChunkGroupInfo to server.ChunkGroupInfo
-						serverChunkGroups = make([]server.ChunkGroupInfo, len(groups))
-						for i, g := range groups {
-							serverChunkGroups[i] = server.ChunkGroupInfo{
-								GroupIndex: g.GroupIndex,
-								LineStart:  g.LineStart,
-								LineEnd:    g.LineEnd,
-								ChunkCount: g.ChunkCount,
-							}
-						}
-					}
-
-					// Reconcile chunks in storage to ensure per-chunk decisions work.
-					// This handles missing or stale chunk rows from older sessions.
-					cardStreamer.ReconcileChunksForCard(card.ID, chunks)
-
-					// Convert stream.ChunkInfo to server.ChunkInfo
-					serverChunks = make([]server.ChunkInfo, len(chunks))
-					for i, h := range chunks {
-						serverChunks[i] = server.ChunkInfo{
-							Index:       h.Index,
-							OldStart:    h.OldStart,
-							OldCount:    h.OldCount,
-							NewStart:    h.NewStart,
-							NewCount:    h.NewCount,
-							Offset:      h.Offset,
-							Length:      h.Length,
-							Content:     h.Content,
-							ContentHash: h.ContentHash,
-							GroupIndex:  h.GroupIndex,
-						}
-					}
-
-					// Calculate diff stats for large file warnings
-					diffStats := diff.CalculateDiffStats(card.Diff)
-					stats = &server.DiffStats{
-						ByteSize:     diffStats.ByteSize,
-						LineCount:    diffStats.LineCount,
-						AddedLines:   diffStats.AddedLines,
-						DeletedLines: diffStats.DeletedLines,
-					}
-				}
-
-				// Detect deletion from stats: no added lines but has deleted lines
-				isDeleted := stats != nil && stats.AddedLines == 0 && stats.DeletedLines > 0
-
-				sendToClient(server.NewDiffCardMessage(
-					card.ID,
-					card.File,
-					card.Diff,
-					serverChunks,
-					serverChunkGroups,
-					isBinary,
-					isDeleted,
-					stats,
-					card.CreatedAt.UnixMilli(),
+				sendToClient(buildReconnectDiffCardMessage(
+					card,
+					fileCfg.ChunkGroupingEnabled,
+					fileCfg.ChunkGroupingProximity,
+					cardStreamer.ReconcileChunksForCard,
 				))
 			}
 		}
@@ -1049,6 +1150,10 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	if mdnsAdvertiser != nil {
 		mdnsAdvertiser.Stop()
 	}
+	fileWatchPoller.Stop()
+	if rolloutMonitor != nil {
+		rolloutMonitor.Stop()
+	}
 	sessionManager.CloseAll() // Close all managed sessions (Unit 9.5)
 	cardStreamer.Stop()
 	store.Close()
@@ -1069,6 +1174,139 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	lines := ptySession.Lines()
 	fmt.Fprintf(stdout, "\nCaptured %d lines in ring buffer.\n", len(lines))
 	return 0
+}
+
+// buildReconnectDiffCardMessage rebuilds one pending card into a diff.card message
+// for reconnect replay, including semantic enrichment and summary metadata.
+// The reconcile callback is optional and is used to refresh chunk rows in storage.
+func buildReconnectDiffCardMessage(
+	card *storage.ReviewCard,
+	chunkGroupingEnabled bool,
+	chunkGroupingProximity int,
+	reconcile func(cardID string, chunks []stream.ChunkInfo),
+) server.Message {
+	isBinary := card.Diff == diff.BinaryDiffPlaceholder
+
+	var serverChunks []server.ChunkInfo
+	var serverChunkGroups []server.ChunkGroupInfo
+	var serverSemanticGroups []server.SemanticGroupInfo
+	var stats *server.DiffStats
+
+	if !isBinary {
+		chunks := stream.ParseChunkInfoFromDiff(card.Diff)
+
+		if chunkGroupingEnabled && len(chunks) > 0 {
+			proximity := chunkGroupingProximity
+			if proximity <= 0 {
+				proximity = 20
+			}
+			groups, groupedChunks := stream.GroupChunksByProximity(chunks, proximity)
+			chunks = groupedChunks
+			serverChunkGroups = mapStreamChunkGroupsToServer(groups)
+		}
+
+		if reconcile != nil {
+			reconcile(card.ID, chunks)
+		}
+
+		diffStats := diff.CalculateDiffStats(card.Diff)
+		stats = &server.DiffStats{
+			ByteSize:     diffStats.ByteSize,
+			LineCount:    diffStats.LineCount,
+			AddedLines:   diffStats.AddedLines,
+			DeletedLines: diffStats.DeletedLines,
+		}
+
+		// Deleted cards are represented by zero added lines and at least one deletion.
+		isDeletedLocal := stats.AddedLines == 0 && stats.DeletedLines > 0
+		enrichedChunks, semGroups := stream.EnrichChunksWithSemantics(card.ID, card.File, chunks, false, isDeletedLocal)
+
+		serverChunks = mapStreamChunksToServer(enrichedChunks)
+		serverSemanticGroups = mapStreamSemanticGroupsToServer(semGroups)
+	} else {
+		// Binary cards have no chunk list, but still need semantic_groups parity.
+		_, semGroups := stream.EnrichChunksWithSemantics(card.ID, card.File, nil, true, false)
+		serverSemanticGroups = mapStreamSemanticGroupsToServer(semGroups)
+	}
+
+	isDeleted := stats != nil && stats.AddedLines == 0 && stats.DeletedLines > 0
+	return server.NewDiffCardMessage(
+		card.ID,
+		card.File,
+		card.Diff,
+		serverChunks,
+		serverChunkGroups,
+		serverSemanticGroups,
+		isBinary,
+		isDeleted,
+		stats,
+		card.CreatedAt.UnixMilli(),
+	)
+}
+
+func mapStreamChunksToServer(chunks []stream.ChunkInfo) []server.ChunkInfo {
+	if len(chunks) == 0 {
+		return nil
+	}
+	serverChunks := make([]server.ChunkInfo, len(chunks))
+	for i, h := range chunks {
+		serverChunks[i] = server.ChunkInfo{
+			Index:           h.Index,
+			OldStart:        h.OldStart,
+			OldCount:        h.OldCount,
+			NewStart:        h.NewStart,
+			NewCount:        h.NewCount,
+			Offset:          h.Offset,
+			Length:          h.Length,
+			Content:         h.Content,
+			ContentHash:     h.ContentHash,
+			GroupIndex:      h.GroupIndex,
+			SemanticKind:    h.SemanticKind,
+			SemanticLabel:   h.SemanticLabel,
+			SemanticGroupID: h.SemanticGroupID,
+		}
+	}
+	return serverChunks
+}
+
+func mapStreamChunkGroupsToServer(groups []stream.ChunkGroupInfo) []server.ChunkGroupInfo {
+	if len(groups) == 0 {
+		return nil
+	}
+	serverGroups := make([]server.ChunkGroupInfo, len(groups))
+	for i, g := range groups {
+		serverGroups[i] = server.ChunkGroupInfo{
+			GroupIndex: g.GroupIndex,
+			LineStart:  g.LineStart,
+			LineEnd:    g.LineEnd,
+			ChunkCount: g.ChunkCount,
+		}
+	}
+	return serverGroups
+}
+
+func mapStreamSemanticGroupsToServer(groups []stream.SemanticGroupInfo) []server.SemanticGroupInfo {
+	if len(groups) == 0 {
+		return nil
+	}
+	serverGroups := make([]server.SemanticGroupInfo, len(groups))
+	for i, g := range groups {
+		var idxs []int
+		if g.ChunkIndexes != nil {
+			idxs = make([]int, len(g.ChunkIndexes))
+			copy(idxs, g.ChunkIndexes)
+		}
+		serverGroups[i] = server.SemanticGroupInfo{
+			GroupID:      g.GroupID,
+			Label:        g.Label,
+			Kind:         g.Kind,
+			LineStart:    g.LineStart,
+			LineEnd:      g.LineEnd,
+			ChunkIndexes: idxs,
+			RiskLevel:    g.RiskLevel,
+		}
+	}
+	return serverGroups
 }
 
 func runHostStatus(args []string, stdout, stderr io.Writer) int {
@@ -1116,22 +1354,7 @@ func runHostStatus(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Display status in human-readable format
-	fmt.Fprintf(stdout, "Host Status\n")
-	fmt.Fprintf(stdout, "===========\n")
-	fmt.Fprintf(stdout, "Listening:    %s\n", status.ListeningAddress)
-	fmt.Fprintf(stdout, "TLS:          %v\n", status.TLSEnabled)
-	fmt.Fprintf(stdout, "Auth:         %v\n", status.RequireAuth)
-	if status.PairSocketPath != "" {
-		fmt.Fprintf(stdout, "Pairing:      %s\n", status.PairSocketPath)
-	} else {
-		fmt.Fprintf(stdout, "Pairing:      disabled (IPC unavailable)\n")
-	}
-	fmt.Fprintf(stdout, "Clients:      %d connected\n", status.ConnectedClients)
-	fmt.Fprintf(stdout, "Session:      %s\n", status.SessionID)
-	fmt.Fprintf(stdout, "Repository:   %s\n", status.RepositoryPath)
-	fmt.Fprintf(stdout, "Branch:       %s\n", status.CurrentBranch)
-	fmt.Fprintf(stdout, "Uptime:       %s\n", formatUptime(status.UptimeSeconds))
+	writeHostStatusOutput(stdout, status)
 
 	// Query and display sessions (Unit 9.5)
 	sessions, err := queryHostSessions(*addr)
@@ -1151,6 +1374,63 @@ func runHostStatus(args []string, stdout, stderr io.Writer) int {
 	}
 
 	return 0
+}
+
+// writeHostStatusOutput renders human-readable host status output.
+func writeHostStatusOutput(stdout io.Writer, status *server.StatusResponse) {
+	fmt.Fprintf(stdout, "Host Status\n")
+	fmt.Fprintf(stdout, "===========\n")
+	fmt.Fprintf(stdout, "Listening:    %s\n", status.ListeningAddress)
+	fmt.Fprintf(stdout, "TLS:          %v\n", status.TLSEnabled)
+	fmt.Fprintf(stdout, "Auth:         %v\n", status.RequireAuth)
+	if status.PairSocketPath != "" {
+		fmt.Fprintf(stdout, "Pairing:      %s\n", status.PairSocketPath)
+	} else {
+		fmt.Fprintf(stdout, "Pairing:      disabled (IPC unavailable)\n")
+	}
+	fmt.Fprintf(stdout, "Clients:      %d connected\n", status.ConnectedClients)
+	fmt.Fprintf(stdout, "Session:      %s\n", status.SessionID)
+	fmt.Fprintf(stdout, "Repository:   %s\n", status.RepositoryPath)
+	fmt.Fprintf(stdout, "Branch:       %s\n", status.CurrentBranch)
+	fmt.Fprintf(stdout, "Uptime:       %s\n", formatUptime(status.UptimeSeconds))
+
+	if status.KeepAwake != nil {
+		ka := status.KeepAwake
+		fmt.Fprintf(stdout, "\nKeep-Awake\n")
+		fmt.Fprintf(stdout, "----------\n")
+		fmt.Fprintf(stdout, "State:        %s\n", ka.State)
+		fmt.Fprintf(stdout, "Remote:       %v\n", ka.RemoteEnabled)
+		fmt.Fprintf(stdout, "Admin Revoke: %v\n", ka.AllowAdminRevoke)
+		fmt.Fprintf(stdout, "Battery:      allow=%v", ka.AllowOnBattery)
+		if ka.AutoDisableBatteryPercent > 0 {
+			fmt.Fprintf(stdout, " threshold=%d%%", ka.AutoDisableBatteryPercent)
+		}
+		fmt.Fprintf(stdout, "\n")
+		if ka.OnBattery != nil {
+			fmt.Fprintf(stdout, "Power:        on_battery=%v", *ka.OnBattery)
+			if ka.BatteryPercent != nil {
+				fmt.Fprintf(stdout, " battery=%d%%", *ka.BatteryPercent)
+			}
+			fmt.Fprintf(stdout, "\n")
+		}
+		if ka.PolicyBlocked {
+			fmt.Fprintf(stdout, "Policy:       blocked (%s)\n", ka.PolicyReason)
+		}
+		fmt.Fprintf(stdout, "Leases:       %d active\n", ka.ActiveLeaseCount)
+		if ka.NextExpiryMs > 0 {
+			remainingMs := ka.NextExpiryMs - time.Now().UnixMilli()
+			if remainingMs < 0 {
+				remainingMs = 0
+			}
+			fmt.Fprintf(stdout, "Next Expiry:  %s\n", formatUptime(remainingMs/1000))
+		}
+		if ka.DegradedReason != "" {
+			fmt.Fprintf(stdout, "Degraded:     %s\n", ka.DegradedReason)
+		}
+		if ka.RecoveryHint != "" {
+			fmt.Fprintf(stdout, "Hint:         %s\n", ka.RecoveryHint)
+		}
+	}
 }
 
 // SessionListItem is the response format for session list API.

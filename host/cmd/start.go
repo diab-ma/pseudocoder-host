@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
@@ -31,6 +32,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	pair := fs.Bool("pair", false, "Generate and display pairing code during startup")
 	qr := fs.Bool("qr", false, "Display pairing code as QR code (requires --pair)")
 	pairSocket := fs.String("pair-socket", "", "Path to pairing IPC socket (default: ~/.pseudocoder/pair.sock)")
+	enableRemoteKA := fs.Bool("enable-remote-keep-awake", false, "Enable remote keep-awake policy (no prompt)")
+	noPrompt := fs.Bool("no-prompt", false, "Suppress onboarding prompts (preserves current policy)")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, `Usage: pseudocoder start [options]
@@ -78,7 +81,7 @@ Options:
 	}
 
 	// Get default config path
-	configPath, err := config.DefaultConfigPath()
+	configPath, err := startConfigPath()
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: failed to determine config path: %v\n", err)
 		return 1
@@ -94,6 +97,44 @@ Options:
 		}
 		configCreated = true
 		fmt.Fprintf(stdout, "Created config: %s\n", configPath)
+	}
+
+	// Load config to determine current keep-awake policy state (P18U4).
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "Error: failed to parse config: %v\n", err)
+		return 1
+	}
+
+	// Keep-awake onboarding flow (P18U4).
+	enableFlagSet := explicitFlags["enable-remote-keep-awake"]
+	noPromptSet := explicitFlags["no-prompt"]
+
+	if enableFlagSet && *enableRemoteKA {
+		// Explicit enable flag: persist policy, no prompt.
+		if err := startPersistPolicy(configPath, true); err != nil {
+			fmt.Fprintf(stderr, "Error: failed to persist keep-awake policy: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "Remote keep-awake policy enabled.")
+	} else if shouldShowKeepAwakePrompt(startIsTerminal(), cfg.KeepAwakeRemoteEnabled, enableFlagSet, noPromptSet) {
+		if promptKeepAwakeEnable(stdout, stderr) {
+			if err := startPersistPolicy(configPath, true); err != nil {
+				fmt.Fprintf(stderr, "Error: failed to persist keep-awake policy: %v\n", err)
+				return 1
+			}
+			fmt.Fprintln(stdout, "Remote keep-awake policy enabled.")
+		} else {
+			fmt.Fprintln(stdout, "Remote keep-awake policy unchanged (disabled).")
+		}
+	} else if *noPrompt && !enableFlagSet {
+		fmt.Fprintln(stdout, "Prompt suppressed. Remote keep-awake policy unchanged.")
+	} else {
+		if cfg.KeepAwakeRemoteEnabled {
+			fmt.Fprintln(stdout, "Remote keep-awake policy: enabled.")
+		} else {
+			fmt.Fprintln(stdout, "Remote keep-awake policy: disabled.")
+		}
 	}
 
 	bindAddr := selectBindAddr(*addr, *port, explicitFlags["port"], stderr)
@@ -156,7 +197,63 @@ Options:
 	}
 
 	// Call the main host start function
-	return runHostStart(hostArgs, stdout, stderr)
+	return startHostDispatch(hostArgs, stdout, stderr)
+}
+
+// shouldShowKeepAwakePrompt returns true only when all conditions are met:
+// interactive TTY, policy not already enabled, and neither flag is set.
+func shouldShowKeepAwakePrompt(isTTY, policyEnabled, enableFlagSet, noPromptSet bool) bool {
+	return isTTY && !policyEnabled && !enableFlagSet && !noPromptSet
+}
+
+// parsePromptAnswer normalizes user input to a yes/no decision.
+// Returns (enable, valid). Empty input is treated as no.
+func parsePromptAnswer(input string) (enable bool, valid bool) {
+	switch strings.ToLower(strings.TrimSpace(input)) {
+	case "y", "yes":
+		return true, true
+	case "n", "no", "":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// promptKeepAwakeEnable shows the keep-awake onboarding prompt and reads
+// user input. Returns true if the user chose to enable, false otherwise.
+// EOF/empty defaults to no. Invalid input gets one retry, then defaults to no.
+func promptKeepAwakeEnable(stdout, stderr io.Writer) bool {
+	fmt.Fprintln(stdout, "")
+	fmt.Fprintln(stdout, "Enable remote keep-awake? This allows connected mobile devices")
+	fmt.Fprintln(stdout, "to prevent your machine from sleeping during active sessions.")
+	fmt.Fprint(stdout, "Enable remote keep-awake? [y/N] ")
+
+	line, err := startReadLine()
+	if err != nil {
+		fmt.Fprintln(stdout, "No input received. Defaulting to No.")
+		return false
+	}
+
+	enable, valid := parsePromptAnswer(line)
+	if valid {
+		return enable
+	}
+
+	// One retry on invalid input.
+	fmt.Fprint(stdout, "Unrecognized input. Please enter y or n [y/N] ")
+	line, err = startReadLine()
+	if err != nil {
+		fmt.Fprintln(stdout, "No input received. Defaulting to No.")
+		return false
+	}
+
+	enable, valid = parsePromptAnswer(line)
+	if valid {
+		return enable
+	}
+
+	fmt.Fprintln(stdout, "Unrecognized input. Defaulting to No.")
+	return false
 }
 
 func validatePort(port int) error {
@@ -167,8 +264,29 @@ func validatePort(port int) error {
 }
 
 var (
-	getTailscaleIP        = GetTailscaleIP
+	getTailscaleIP         = GetTailscaleIP
 	getPreferredOutboundIP = GetPreferredOutboundIP
+
+	// Testability seams for onboarding prompt (P18U4).
+	startIsTerminal = func() bool {
+		fi, _ := os.Stdin.Stat()
+		return fi != nil && fi.Mode()&os.ModeCharDevice != 0
+	}
+	startReadLine = func() (string, error) {
+		s := bufio.NewScanner(os.Stdin)
+		if s.Scan() {
+			return s.Text(), nil
+		}
+		if s.Err() != nil {
+			return "", s.Err()
+		}
+		return "", io.EOF
+	}
+	startPersistPolicy = config.PersistKeepAwakePolicy
+	startHostDispatch  = func(args []string, stdout, stderr io.Writer) int {
+		return runHostStart(args, stdout, stderr)
+	}
+	startConfigPath = config.DefaultConfigPath
 )
 
 func selectBindAddr(addr string, port int, explicitPort bool, stderr io.Writer) string {

@@ -83,10 +83,14 @@ func (c *Client) handleSessionCreate(data []byte) {
 		return
 	}
 
+	// Reserve the next creation sequence only after successful start.
+	// This keeps numbering stable and gap-free for successful user creates.
+	sessionNumber := c.server.NextCreatedSessionSequence()
+
 	// Determine display name
 	name := payload.Name
 	if name == "" {
-		name = fmt.Sprintf("Session %d", mgr.Count())
+		name = fmt.Sprintf("Session %d", sessionNumber)
 	}
 
 	// Broadcast session.created to all clients
@@ -277,4 +281,101 @@ func (c *Client) handleSessionRename(data []byte) {
 
 	log.Printf("Session renamed: id=%s name=%s", payload.SessionID, payload.Name)
 	// No response message - client updates name locally
+}
+
+// handleSessionClearHistory processes a session.clear_history message.
+// It deletes archived sessions from persistent history and returns a
+// requester-scoped session.clear_history_result envelope.
+func (c *Client) handleSessionClearHistory(data []byte) {
+	var msg struct {
+		Type    MessageType                `json:"type"`
+		ID      string                     `json:"id,omitempty"`
+		Payload SessionClearHistoryPayload `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		log.Printf("Failed to parse session.clear_history payload: %v", err)
+		c.sendError(apperrors.CodeServerInvalidMessage, "invalid message format")
+		return
+	}
+
+	requestID := msg.Payload.RequestID
+	if requestID == "" {
+		log.Printf("session.clear_history missing request_id")
+		c.sendError(apperrors.CodeServerInvalidMessage, "request_id is required")
+		return
+	}
+
+	c.server.mu.RLock()
+	store := c.server.sessionStore
+	c.server.mu.RUnlock()
+	if store == nil {
+		log.Printf("No session store configured, ignoring session.clear_history request")
+		c.sendResult(
+			NewSessionClearHistoryResultMessage(
+				requestID,
+				false,
+				0,
+				apperrors.CodeServerHandlerMissing,
+				"session history not configured",
+			),
+		)
+		return
+	}
+
+	clearedCount, err := store.ClearArchivedSessions()
+	if err != nil {
+		log.Printf("Failed to clear archived sessions: %v", err)
+		c.sendResult(
+			NewSessionClearHistoryResultMessage(
+				requestID,
+				false,
+				0,
+				apperrors.CodeStorageQueryFailed,
+				"failed to clear archived sessions",
+			),
+		)
+		return
+	}
+
+	c.sendResult(
+		NewSessionClearHistoryResultMessage(
+			requestID,
+			true,
+			clearedCount,
+			"",
+			"",
+		),
+	)
+
+	// Broadcast refreshed session.list to all clients so all UIs converge.
+	sessions, err := store.ListSessions(20)
+	if err != nil {
+		log.Printf("Warning: failed to list sessions after clear_history: %v", err)
+		return
+	}
+	infos := make([]SessionInfo, len(sessions))
+	for i, s := range sessions {
+		infos[i] = SessionInfo{
+			ID:         s.ID,
+			Repo:       s.Repo,
+			Branch:     s.Branch,
+			StartedAt:  s.StartedAt.UnixMilli(),
+			LastSeen:   s.LastSeen.UnixMilli(),
+			LastCommit: s.LastCommit,
+			Status:     string(s.Status),
+			IsSystem:   s.IsSystem,
+		}
+	}
+	c.server.Broadcast(NewSessionListMessage(infos))
+}
+
+// sendResult sends a requester-scoped result message to this client.
+func (c *Client) sendResult(msg Message) {
+	select {
+	case <-c.done:
+		return
+	case c.send <- msg:
+	case <-time.After(5 * time.Second):
+		log.Printf("Warning: timeout sending requester-scoped message %s", msg.Type)
+	}
 }

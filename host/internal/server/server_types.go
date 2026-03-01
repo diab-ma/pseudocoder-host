@@ -1,8 +1,12 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -73,6 +77,24 @@ type UndoHandler func(cardID string, confirmed bool) (*UndoResult, error)
 // Phase 20.2: Enables per-chunk undo flow from mobile.
 // contentHash is preferred over chunkIndex for stable identity (indices can shift after staging).
 type ChunkUndoHandler func(cardID string, chunkIndex int, contentHash string, confirmed bool) (*UndoResult, error)
+
+// FileReadData holds the metadata returned by a file read operation.
+type FileReadData struct {
+	Content        string
+	Encoding       string
+	LineEnding     string
+	Version        string
+	ReadOnlyReason string
+}
+
+// FileOperations provides file listing, reading, and mutation within the repo boundary.
+type FileOperations interface {
+	List(path string) (entries []FileEntry, canonPath string, err error)
+	Read(path string) (data *FileReadData, canonPath string, err error)
+	Write(path, content, baseVersion string) (canonPath, newVersion string, err error)
+	Create(path, content string) (canonPath, version string, err error)
+	Delete(path string, confirmed bool) (canonPath string, err error)
+}
 
 // UndoResult carries the restored card/chunk information after a successful undo.
 // This is used to re-emit the card to connected clients.
@@ -204,6 +226,20 @@ type Server struct {
 	// Phase 9.3: Enables multi-session PTY support from mobile.
 	sessionManager *pty.SessionManager
 
+	// sessionStore persists session history for session.list and clear-history operations.
+	// Set via SetSessionStore. If nil, history mutation handlers are rejected.
+	sessionStore storage.SessionStore
+
+	// metricsStore records rollout metrics (crashes, latency, pairing).
+	// Set via SetMetricsStore. If nil, metrics recording is silently skipped.
+	// Phase 7: Rollout metrics collection.
+	metricsStore storage.MetricsStore
+
+	// createdSessionSequence tracks successful session.create operations.
+	// This provides stable auto-name numbering independent of manager size,
+	// pre-registered legacy sessions, close/reopen churn, and tmux attachments.
+	createdSessionSequence int
+
 	// sessionAPIHandler handles the /api/session/ endpoints for CLI session management.
 	// Set via SetSessionAPIHandler.
 	// Phase 9.5: Enables CLI session commands (new, list, kill, rename).
@@ -218,6 +254,293 @@ type Server struct {
 	// Set via SetTmuxAPIHandler.
 	// Phase 12.9: Enables CLI tmux commands (list-tmux, attach-tmux, detach).
 	tmuxAPIHandler http.Handler
+
+	// fileOps handles file listing and reading for the file explorer.
+	// Set via SetFileOperations. If nil, file messages return handler_missing.
+	// Phase 3: Enables file explorer protocol.
+	fileOps FileOperations
+
+	// repoMutationMu is a process-wide repo mutation gate.
+	// Uses TryLock() for non-blocking reject of concurrent mutations.
+	// P4U2: Shared across repo.commit, repo.push, repo.branch_create, repo.branch_switch.
+	repoMutationMu sync.Mutex
+
+	// keepAwake stores Phase 17 keep-awake control-plane state.
+	// It is process-scoped and intentionally non-persistent.
+	keepAwake *keepAwakeControlPlane
+
+	// keepAwakePolicyHandler handles the /api/keep-awake/policy endpoint.
+	// Set via SetKeepAwakePolicyHandler. Phase 18: CLI-driven policy mutation.
+	keepAwakePolicyHandler http.Handler
+
+	// flagsAPIHandler handles the /api/flags endpoint for rollout flag management.
+	// Set via SetFlagsAPIHandler. Phase 7: CLI-driven flag mutation.
+	flagsAPIHandler http.Handler
+}
+
+// maxIdempotencyEntries is the maximum number of cached mutation results per client.
+const maxIdempotencyEntries = 256
+
+// idempotencyCacheKey uniquely identifies a mutation request.
+type idempotencyCacheKey struct {
+	OpType    MessageType
+	RequestID string
+}
+
+// idempotencyCacheEntry stores the fingerprint and result for a cached mutation.
+type idempotencyCacheEntry struct {
+	Fingerprint string
+	Result      Message
+}
+
+// inFlightMutation tracks a currently executing mutation request.
+// Exact duplicates with the same fingerprint wait for done and reuse Result.
+type inFlightMutation struct {
+	Fingerprint string
+	Result      Message
+	done        chan struct{}
+}
+
+// idempotencyCache stores recent mutation results per client for replay.
+type idempotencyCache struct {
+	entries map[idempotencyCacheKey]*idempotencyCacheEntry
+	order   []idempotencyCacheKey
+	maxSize int
+}
+
+// newIdempotencyCache creates a new idempotency cache.
+func newIdempotencyCache() *idempotencyCache {
+	return &idempotencyCache{
+		entries: make(map[idempotencyCacheKey]*idempotencyCacheEntry),
+		maxSize: maxIdempotencyEntries,
+	}
+}
+
+// get returns a cached entry if it exists.
+func (c *idempotencyCache) get(key idempotencyCacheKey) (*idempotencyCacheEntry, bool) {
+	entry, ok := c.entries[key]
+	return entry, ok
+}
+
+// store adds or replaces an entry with FIFO eviction.
+func (c *idempotencyCache) store(key idempotencyCacheKey, entry *idempotencyCacheEntry) {
+	if _, exists := c.entries[key]; !exists {
+		if len(c.order) >= c.maxSize {
+			oldest := c.order[0]
+			c.order = c.order[1:]
+			delete(c.entries, oldest)
+		}
+		c.order = append(c.order, key)
+	}
+	c.entries[key] = entry
+}
+
+// computeFingerprint returns a SHA256 hex digest of null-separated fields.
+func computeFingerprint(fields ...string) string {
+	h := sha256.New()
+	for i, f := range fields {
+		if i > 0 {
+			h.Write([]byte{0})
+		}
+		h.Write([]byte(f))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// writeFingerprint creates a fingerprint for a file write operation.
+func writeFingerprint(canonPath, content, baseVersion string) string {
+	return computeFingerprint("write", canonPath, content, baseVersion)
+}
+
+// createFingerprint creates a fingerprint for a file create operation.
+func createFingerprint(canonPath, content string) string {
+	return computeFingerprint("create", canonPath, content)
+}
+
+// deleteFingerprint creates a fingerprint for a file delete operation.
+func deleteFingerprint(canonPath string, confirmed *bool) string {
+	c := "<missing>"
+	if confirmed != nil {
+		c = "false"
+		if *confirmed {
+			c = "true"
+		}
+	}
+	return computeFingerprint("delete", canonPath, c)
+}
+
+// branchCreateFingerprint creates a fingerprint for a branch create operation.
+// Normalizes name to lowercase for case-insensitive dedup.
+func branchCreateFingerprint(name string) string {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	return computeFingerprint("branch_create", normalized)
+}
+
+// branchSwitchFingerprint creates a fingerprint for a branch switch operation.
+// Normalizes name to lowercase for case-insensitive dedup.
+func branchSwitchFingerprint(name string) string {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	return computeFingerprint("branch_switch", normalized)
+}
+
+// commitFingerprint creates a fingerprint for a commit operation.
+// Includes all mutation-affecting fields.
+func commitFingerprint(message string, noVerify, noGpgSign, overrideWarnings bool) string {
+	return computeFingerprint("commit", message,
+		fmt.Sprintf("%t", noVerify),
+		fmt.Sprintf("%t", noGpgSign),
+		fmt.Sprintf("%t", overrideWarnings))
+}
+
+// pushFingerprint creates a fingerprint for a push operation.
+func pushFingerprint(remote, branch string, forceWithLease bool) string {
+	return computeFingerprint("push", remote, branch,
+		fmt.Sprintf("%t", forceWithLease))
+}
+
+// fetchFingerprint creates a fingerprint for a fetch operation.
+// Constant: no payload fields beyond request_id.
+func fetchFingerprint() string {
+	return computeFingerprint("fetch")
+}
+
+// pullFingerprint creates a fingerprint for a pull operation.
+// Constant: no payload fields beyond request_id.
+func pullFingerprint() string {
+	return computeFingerprint("pull")
+}
+
+// prCreateFingerprint creates a fingerprint for a PR create operation.
+// Normalizes title/baseBranch via TrimSpace, treats omitted draft as false,
+// and includes whether base_branch was provided to avoid aliasing omitted
+// vs whitespace-only invalid payloads.
+func prCreateFingerprint(title, body, baseBranch string, draft bool, baseBranchProvided bool) string {
+	return computeFingerprint("pr_create",
+		strings.TrimSpace(title),
+		body,
+		strings.TrimSpace(baseBranch),
+		fmt.Sprintf("%t", draft),
+		fmt.Sprintf("%t", baseBranchProvided))
+}
+
+// prCheckoutFingerprint creates a fingerprint for a PR checkout operation.
+func prCheckoutFingerprint(number int) string {
+	return computeFingerprint("pr_checkout", fmt.Sprintf("%d", number))
+}
+
+// idempotencyCheckOrBegin resolves a mutation idempotency key:
+// - completed exact match -> replay
+// - in-flight exact match -> coalesce by waiting on returned inFlight
+// - miss -> caller becomes owner and must call idempotencyComplete
+// - mismatch -> error
+func (c *Client) idempotencyCheckOrBegin(opType MessageType, requestID, fingerprint string) (result Message, replay bool, inFlight *inFlightMutation, err error) {
+	c.mutationMu.Lock()
+	defer c.mutationMu.Unlock()
+
+	cache := c.ensureMutationCacheLocked()
+	key := idempotencyCacheKey{OpType: opType, RequestID: requestID}
+	if entry, ok := cache.get(key); ok {
+		if entry.Fingerprint != fingerprint {
+			return Message{}, false, nil, &idempotencyMismatchError{requestID: requestID}
+		}
+		return entry.Result, true, nil, nil
+	}
+
+	if c.inFlightMutations == nil {
+		c.inFlightMutations = make(map[idempotencyCacheKey]*inFlightMutation)
+	}
+	if existing, ok := c.inFlightMutations[key]; ok {
+		if existing.Fingerprint != fingerprint {
+			return Message{}, false, nil, &idempotencyMismatchError{requestID: requestID}
+		}
+		return Message{}, false, existing, nil
+	}
+
+	c.inFlightMutations[key] = &inFlightMutation{
+		Fingerprint: fingerprint,
+		done:        make(chan struct{}),
+	}
+	return Message{}, false, nil, nil
+}
+
+// idempotencyComplete stores the final mutation result and releases any
+// coalesced duplicates waiting on the same in-flight key.
+func (c *Client) idempotencyComplete(opType MessageType, requestID, fingerprint string, result Message) {
+	c.mutationMu.Lock()
+	defer c.mutationMu.Unlock()
+
+	cache := c.ensureMutationCacheLocked()
+	key := idempotencyCacheKey{OpType: opType, RequestID: requestID}
+	cache.store(key, &idempotencyCacheEntry{
+		Fingerprint: fingerprint,
+		Result:      result,
+	})
+
+	if inFlight, ok := c.inFlightMutations[key]; ok {
+		inFlight.Result = result
+		delete(c.inFlightMutations, key)
+		close(inFlight.done)
+	}
+}
+
+// bestEffortCanon attempts canonicalization for fingerprinting.
+// Returns the input unchanged on error (fingerprint will still be consistent).
+func bestEffortCanon(path string) string {
+	canon, err := canonicalizePath(path)
+	if err != nil {
+		return path
+	}
+	return canon
+}
+
+// idempotencyCheck checks the idempotency cache and returns the cached result if hit.
+// Returns (result, true) for replay, (_, false) for miss.
+// Returns an error message for fingerprint mismatch.
+func (c *Client) idempotencyCheck(opType MessageType, requestID, fingerprint string) (Message, bool, error) {
+	c.mutationMu.Lock()
+	defer c.mutationMu.Unlock()
+
+	cache := c.ensureMutationCacheLocked()
+	key := idempotencyCacheKey{OpType: opType, RequestID: requestID}
+	entry, ok := cache.get(key)
+	if !ok {
+		return Message{}, false, nil
+	}
+	if entry.Fingerprint != fingerprint {
+		return Message{}, false, &idempotencyMismatchError{requestID: requestID}
+	}
+	return entry.Result, true, nil
+}
+
+// idempotencyStore stores a result in the idempotency cache.
+func (c *Client) idempotencyStore(opType MessageType, requestID, fingerprint string, result Message) {
+	c.idempotencyComplete(opType, requestID, fingerprint, result)
+}
+
+// idempotencyMismatchError indicates a request_id collision with different parameters.
+type idempotencyMismatchError struct {
+	requestID string
+}
+
+func (e *idempotencyMismatchError) Error() string {
+	return "request_id " + e.requestID + " already used with different parameters"
+}
+
+// ensureMutationCacheLocked lazily initializes the per-client mutation cache.
+// Caller must hold c.mutationMu.
+func (c *Client) ensureMutationCacheLocked() *idempotencyCache {
+	if c.mutationCache == nil {
+		c.mutationCache = newIdempotencyCache()
+	}
+	return c.mutationCache
+}
+
+// ensureMutationCache keeps backward compatibility for existing callers that
+// only need best-effort cache access.
+func (c *Client) ensureMutationCache() *idempotencyCache {
+	c.mutationMu.Lock()
+	defer c.mutationMu.Unlock()
+	return c.ensureMutationCacheLocked()
 }
 
 // Client represents a single WebSocket connection.
@@ -266,16 +589,28 @@ type Client struct {
 	// - This is safe because writes happen in a single goroutine and reads are
 	//   protected by server.mu when accessing from other goroutines.
 	activeSessionID string
+
+	// mutationCache stores recent file mutation results for idempotent replay.
+	// Lazy-initialized on first mutation. Guarded by mutationMu.
+	// Phase 3 P3U2 + Phase 4 P4U2: Enables idempotent replay/coalescing.
+	mutationMu    sync.Mutex
+	mutationCache *idempotencyCache
+
+	// inFlightMutations tracks active mutation requests by operation+request_id.
+	// Exact duplicates wait for completion and reuse the final result.
+	// Guarded by mutationMu.
+	inFlightMutations map[idempotencyCacheKey]*inFlightMutation
 }
 
 // NewServer creates a new WebSocket server.
 // Call Start() to begin accepting connections.
 func NewServer(addr string) *Server {
 	return &Server{
-		addr:      addr,
-		clients:   make(map[*Client]bool),
-		broadcast: make(chan Message, channelBufferSize),
-		sessionID: "session-" + formatTimestamp(time.Now()),
+		addr:                   addr,
+		clients:                make(map[*Client]bool),
+		broadcast:              make(chan Message, channelBufferSize),
+		sessionID:              "session-" + formatTimestamp(time.Now()),
+		createdSessionSequence: 0,
 		upgrader: websocket.Upgrader{
 			// Allow connections from any origin during development.
 			// In production with TLS and auth, this is less critical.
@@ -286,6 +621,7 @@ func NewServer(addr string) *Server {
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
 		},
+		keepAwake: newKeepAwakeControlPlane(),
 	}
 }
 

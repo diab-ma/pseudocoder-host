@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -32,6 +34,9 @@ qr = true
 pair_socket = "/tmp/pseudocoder-pair.sock"
 chunk_grouping_enabled = true
 chunk_grouping_proximity = 25
+v2_kill_switch = true
+v2_rollout_stage = "beta"
+v2_phase_0_enabled = true
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
@@ -112,6 +117,16 @@ chunk_grouping_proximity = 25
 	}
 	if cfg.ChunkGroupingProximity != 25 {
 		t.Errorf("ChunkGroupingProximity = %d, want 25", cfg.ChunkGroupingProximity)
+	}
+	// P7U1: V2 rollout fields
+	if !cfg.V2KillSwitch {
+		t.Error("V2KillSwitch = false, want true")
+	}
+	if cfg.V2RolloutStage != "beta" {
+		t.Errorf("V2RolloutStage = %q, want beta", cfg.V2RolloutStage)
+	}
+	if !cfg.V2Phase0Enabled {
+		t.Error("V2Phase0Enabled = false, want true")
 	}
 }
 
@@ -551,3 +566,624 @@ func findSubstring(s, substr string) bool {
 	}
 	return false
 }
+
+// =============================================================================
+// P17U5: Keep-Awake Config Tests
+// =============================================================================
+
+func TestValidateKeepAwakeBatteryThreshold(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   int
+		wantErr bool
+	}{
+		{"disabled", 0, false},
+		{"min", 1, false},
+		{"mid", 50, false},
+		{"max", 100, false},
+		{"too_low", -1, true},
+		{"too_high", 101, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{KeepAwakeAutoDisableBatteryPercent: tt.value}
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateKeepAwakeAuditMaxRows(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   int
+		wantErr bool
+	}{
+		{"default", 0, false},
+		{"min", 100, false},
+		{"mid", 5000, false},
+		{"max", 50000, false},
+		{"too_low", 99, true},
+		{"too_high", 50001, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{KeepAwakeAuditMaxRows: tt.value}
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateKeepAwakeAdminRevokeList(t *testing.T) {
+	// AllowAdminRevoke with empty list should fail
+	cfg := &Config{KeepAwakeAllowAdminRevoke: true}
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate() should fail for admin revoke without device IDs")
+	}
+
+	// AllowAdminRevoke with whitespace-only IDs should fail
+	cfg = &Config{
+		KeepAwakeAllowAdminRevoke: true,
+		KeepAwakeAdminDeviceIDs:   []string{" ", "  "},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate() should fail for admin revoke with whitespace-only IDs")
+	}
+
+	// AllowAdminRevoke with valid IDs should pass
+	cfg = &Config{
+		KeepAwakeAllowAdminRevoke: true,
+		KeepAwakeAdminDeviceIDs:   []string{"device-1"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() unexpected error: %v", err)
+	}
+}
+
+func TestNormalizeKeepAwakeAdminDeviceIDs(t *testing.T) {
+	result := NormalizeKeepAwakeAdminDeviceIDs([]string{
+		"  dev-1 ", "dev-2", " ", "dev-1", "dev-3",
+	})
+	if len(result) != 3 {
+		t.Fatalf("expected 3 IDs, got %d: %v", len(result), result)
+	}
+	if result[0] != "dev-1" || result[1] != "dev-2" || result[2] != "dev-3" {
+		t.Errorf("unexpected result: %v", result)
+	}
+}
+
+func TestLoad_KeepAwakeFields(t *testing.T) {
+	content := `
+keep_awake_remote_enabled = true
+keep_awake_allow_admin_revoke = true
+keep_awake_admin_device_ids = ["dev-1", "dev-2"]
+keep_awake_allow_on_battery = true
+keep_awake_auto_disable_battery_percent = 20
+keep_awake_audit_max_rows = 500
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.KeepAwakeRemoteEnabled {
+		t.Error("KeepAwakeRemoteEnabled should be true")
+	}
+	if !cfg.KeepAwakeAllowAdminRevoke {
+		t.Error("KeepAwakeAllowAdminRevoke should be true")
+	}
+	if len(cfg.KeepAwakeAdminDeviceIDs) != 2 {
+		t.Errorf("KeepAwakeAdminDeviceIDs len = %d, want 2", len(cfg.KeepAwakeAdminDeviceIDs))
+	}
+	if !cfg.KeepAwakeAllowOnBattery {
+		t.Error("KeepAwakeAllowOnBattery should be true")
+	}
+	if !cfg.KeepAwakeAllowOnBatterySet {
+		t.Error("KeepAwakeAllowOnBatterySet should be true")
+	}
+	if !cfg.EffectiveKeepAwakeAllowOnBattery() {
+		t.Error("EffectiveKeepAwakeAllowOnBattery should be true")
+	}
+	if cfg.KeepAwakeAutoDisableBatteryPercent != 20 {
+		t.Errorf("KeepAwakeAutoDisableBatteryPercent = %d, want 20", cfg.KeepAwakeAutoDisableBatteryPercent)
+	}
+	if cfg.KeepAwakeAuditMaxRows != 500 {
+		t.Errorf("KeepAwakeAuditMaxRows = %d, want 500", cfg.KeepAwakeAuditMaxRows)
+	}
+}
+
+func TestLoad_KeepAwakeAllowOnBatteryDefault(t *testing.T) {
+	content := `
+keep_awake_remote_enabled = true
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.KeepAwakeAllowOnBatterySet {
+		t.Error("KeepAwakeAllowOnBatterySet should be false when key is omitted")
+	}
+	if !cfg.EffectiveKeepAwakeAllowOnBattery() {
+		t.Error("EffectiveKeepAwakeAllowOnBattery should default to true when key is omitted")
+	}
+}
+
+func TestLoad_KeepAwakeAllowOnBatteryExplicitFalse(t *testing.T) {
+	content := `
+keep_awake_allow_on_battery = false
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.KeepAwakeAllowOnBatterySet {
+		t.Error("KeepAwakeAllowOnBatterySet should be true for explicit key")
+	}
+	if cfg.EffectiveKeepAwakeAllowOnBattery() {
+		t.Error("EffectiveKeepAwakeAllowOnBattery should be false when explicitly configured false")
+	}
+}
+
+// =============================================================================
+// P18U2: Keep-Awake Policy Persistence Tests
+// =============================================================================
+
+func TestKeepAwakePolicyPersist_AtomicWrite(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	initial := `# My config
+repo = "/some/repo"
+keep_awake_remote_enabled = false
+# trailing comment
+`
+	if err := os.WriteFile(cfgPath, []byte(initial), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := PersistKeepAwakePolicy(cfgPath, true); err != nil {
+		t.Fatalf("PersistKeepAwakePolicy: %v", err)
+	}
+
+	// Re-read and verify.
+	content, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(content), "keep_awake_remote_enabled = true") {
+		t.Errorf("expected keep_awake_remote_enabled = true in:\n%s", content)
+	}
+	// Verify comments preserved.
+	if !strings.Contains(string(content), "# My config") {
+		t.Error("comment was not preserved")
+	}
+	if !strings.Contains(string(content), "# trailing comment") {
+		t.Error("trailing comment was not preserved")
+	}
+	// Verify other fields preserved.
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Repo != "/some/repo" {
+		t.Errorf("Repo = %q, want /some/repo", cfg.Repo)
+	}
+	if !cfg.KeepAwakeRemoteEnabled {
+		t.Error("KeepAwakeRemoteEnabled should be true after persist")
+	}
+}
+
+func TestKeepAwakePolicyPersist_ReadOnlyFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("keep_awake_remote_enabled = false\n"), 0400); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	err := PersistKeepAwakePolicy(cfgPath, true)
+	if err == nil {
+		t.Fatal("expected error for read-only file")
+	}
+	if !strings.Contains(err.Error(), "read-only") {
+		t.Errorf("expected read-only error, got: %v", err)
+	}
+}
+
+func TestKeepAwakePolicyPersist_ReadOnlyDir(t *testing.T) {
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "readonly")
+	if err := os.MkdirAll(roDir, 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfgPath := filepath.Join(roDir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("keep_awake_remote_enabled = false\n"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Make directory read-only.
+	if err := os.Chmod(roDir, 0500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(roDir, 0700) })
+
+	err := PersistKeepAwakePolicy(cfgPath, true)
+	if err == nil {
+		t.Fatal("expected error for read-only directory")
+	}
+	if !strings.Contains(err.Error(), "read-only") {
+		t.Errorf("expected read-only dir error, got: %v", err)
+	}
+}
+
+func TestKeepAwakePolicyPersist_MalformedTOML(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("invalid = \n"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	err := PersistKeepAwakePolicy(cfgPath, true)
+	if err == nil {
+		t.Fatal("expected error for malformed TOML")
+	}
+	if !strings.Contains(err.Error(), "malformed TOML") {
+		t.Errorf("expected malformed TOML error, got: %v", err)
+	}
+}
+
+func TestKeepAwakePolicyPersist_WriterContention(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("keep_awake_remote_enabled = false\n"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Hold a flock on the file.
+	f, err := os.Open(cfgPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	err = PersistKeepAwakePolicy(cfgPath, true)
+	if err == nil {
+		t.Fatal("expected error for lock contention")
+	}
+	if !strings.Contains(err.Error(), "locked") {
+		t.Errorf("expected lock contention error, got: %v", err)
+	}
+}
+
+func TestKeepAwakePolicyPersist_RejectsUnsafeSymlinkPath(t *testing.T) {
+	dir := t.TempDir()
+	otherDir := t.TempDir()
+
+	// Create real config in otherDir.
+	realPath := filepath.Join(otherDir, "config.toml")
+	if err := os.WriteFile(realPath, []byte("keep_awake_remote_enabled = false\n"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Create symlink pointing outside dir.
+	linkPath := filepath.Join(dir, "config.toml")
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	err := PersistKeepAwakePolicy(linkPath, true)
+	if err == nil {
+		t.Fatal("expected error for unsafe symlink")
+	}
+	if !strings.Contains(err.Error(), "unsafe symlink") {
+		t.Errorf("expected unsafe symlink error, got: %v", err)
+	}
+}
+
+func TestKeepAwakePolicyPersist_CanonicalPathIdentityPreserved(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	initial := `repo = "/myrepo"
+addr = "127.0.0.1:7070"
+keep_awake_remote_enabled = true
+keep_awake_allow_on_battery = false
+`
+	if err := os.WriteFile(cfgPath, []byte(initial), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Disable.
+	if err := PersistKeepAwakePolicy(cfgPath, false); err != nil {
+		t.Fatalf("persist false: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.KeepAwakeRemoteEnabled {
+		t.Error("expected false after persist")
+	}
+	// Other fields should be untouched.
+	if cfg.Repo != "/myrepo" {
+		t.Errorf("Repo = %q, want /myrepo", cfg.Repo)
+	}
+	if cfg.Addr != "127.0.0.1:7070" {
+		t.Errorf("Addr = %q, want 127.0.0.1:7070", cfg.Addr)
+	}
+
+	// Re-enable.
+	if err := PersistKeepAwakePolicy(cfgPath, true); err != nil {
+		t.Fatalf("persist true: %v", err)
+	}
+	cfg, err = Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.KeepAwakeRemoteEnabled {
+		t.Error("expected true after second persist")
+	}
+}
+
+// =============================================================================
+// P7U1: V2 Rollout Feature Flag Tests
+// =============================================================================
+
+func TestLoad_V2RolloutFields(t *testing.T) {
+	content := `
+v2_kill_switch = true
+v2_rollout_stage = "beta"
+v2_phase_0_enabled = true
+v2_phase_5_enabled = true
+v2_phase_19_enabled = true
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.V2KillSwitch {
+		t.Error("V2KillSwitch should be true")
+	}
+	if cfg.V2RolloutStage != "beta" {
+		t.Errorf("V2RolloutStage = %q, want beta", cfg.V2RolloutStage)
+	}
+	if !cfg.V2Phase0Enabled {
+		t.Error("V2Phase0Enabled should be true")
+	}
+	if !cfg.V2Phase5Enabled {
+		t.Error("V2Phase5Enabled should be true")
+	}
+	if !cfg.V2Phase19Enabled {
+		t.Error("V2Phase19Enabled should be true")
+	}
+	// Unset phases should be false
+	if cfg.V2Phase1Enabled {
+		t.Error("V2Phase1Enabled should be false")
+	}
+}
+
+func TestV2PhaseEnabled_KillSwitchOverride(t *testing.T) {
+	cfg := &Config{
+		V2Phase0Enabled: true,
+		V2Phase5Enabled: true,
+		V2KillSwitch:    true,
+	}
+	// Kill switch should override all
+	if cfg.V2PhaseEnabled(0) {
+		t.Error("V2PhaseEnabled(0) should be false when kill switch active")
+	}
+	if cfg.V2PhaseEnabled(5) {
+		t.Error("V2PhaseEnabled(5) should be false when kill switch active")
+	}
+	if !cfg.V2AllPhasesDisabled() {
+		t.Error("V2AllPhasesDisabled() should be true when kill switch active")
+	}
+}
+
+func TestV2PhaseEnabled_WithoutKillSwitch(t *testing.T) {
+	cfg := &Config{
+		V2Phase0Enabled: true,
+		V2Phase5Enabled: true,
+	}
+	if !cfg.V2PhaseEnabled(0) {
+		t.Error("V2PhaseEnabled(0) should be true")
+	}
+	if !cfg.V2PhaseEnabled(5) {
+		t.Error("V2PhaseEnabled(5) should be true")
+	}
+	if cfg.V2PhaseEnabled(1) {
+		t.Error("V2PhaseEnabled(1) should be false")
+	}
+	// Invalid phase
+	if cfg.V2PhaseEnabled(7) {
+		t.Error("V2PhaseEnabled(7) should be false (invalid)")
+	}
+	if cfg.V2PhaseEnabled(99) {
+		t.Error("V2PhaseEnabled(99) should be false (invalid)")
+	}
+}
+
+func TestSetV2PhaseEnabled(t *testing.T) {
+	cfg := &Config{}
+	if !cfg.SetV2PhaseEnabled(0, true) {
+		t.Error("SetV2PhaseEnabled(0) should return true")
+	}
+	if !cfg.V2Phase0Enabled {
+		t.Error("V2Phase0Enabled should be true after set")
+	}
+	// Invalid phase
+	if cfg.SetV2PhaseEnabled(7, true) {
+		t.Error("SetV2PhaseEnabled(7) should return false")
+	}
+}
+
+func TestV2PhaseFlags(t *testing.T) {
+	cfg := &Config{
+		V2Phase0Enabled: true,
+		V2Phase19Enabled: true,
+	}
+	flags := cfg.V2PhaseFlags()
+	if !flags[0] {
+		t.Error("flags[0] should be true")
+	}
+	if !flags[19] {
+		t.Error("flags[19] should be true")
+	}
+	if flags[1] {
+		t.Error("flags[1] should be false")
+	}
+}
+
+func TestEffectiveV2RolloutStage(t *testing.T) {
+	cfg := &Config{}
+	if cfg.EffectiveV2RolloutStage() != "internal" {
+		t.Errorf("EffectiveV2RolloutStage = %q, want internal", cfg.EffectiveV2RolloutStage())
+	}
+	cfg.V2RolloutStage = "beta"
+	if cfg.EffectiveV2RolloutStage() != "beta" {
+		t.Errorf("EffectiveV2RolloutStage = %q, want beta", cfg.EffectiveV2RolloutStage())
+	}
+}
+
+func TestValidate_V2RolloutStage(t *testing.T) {
+	tests := []struct {
+		name    string
+		stage   string
+		wantErr bool
+	}{
+		{"empty", "", false},
+		{"internal", "internal", false},
+		{"beta", "beta", false},
+		{"broader", "broader", false},
+		{"invalid", "production", true},
+		{"typo", "Broader", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{V2RolloutStage: tt.stage}
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestPersistRolloutFlags_AtomicWrite(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	initial := `# Config
+repo = "/some/repo"
+v2_kill_switch = false
+v2_phase_0_enabled = false
+`
+	if err := os.WriteFile(cfgPath, []byte(initial), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cfg := &Config{
+		V2KillSwitch:    false,
+		V2RolloutStage:  "beta",
+		V2Phase0Enabled: true,
+		V2Phase5Enabled: true,
+	}
+
+	if err := PersistRolloutFlags(cfgPath, cfg); err != nil {
+		t.Fatalf("PersistRolloutFlags: %v", err)
+	}
+
+	// Re-read and verify.
+	loaded, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.V2KillSwitch {
+		t.Error("V2KillSwitch should be false")
+	}
+	if loaded.V2RolloutStage != "beta" {
+		t.Errorf("V2RolloutStage = %q, want beta", loaded.V2RolloutStage)
+	}
+	if !loaded.V2Phase0Enabled {
+		t.Error("V2Phase0Enabled should be true")
+	}
+	if !loaded.V2Phase5Enabled {
+		t.Error("V2Phase5Enabled should be true")
+	}
+	// Other fields preserved
+	if loaded.Repo != "/some/repo" {
+		t.Errorf("Repo = %q, want /some/repo", loaded.Repo)
+	}
+	// Comments preserved
+	content, _ := os.ReadFile(cfgPath)
+	if !strings.Contains(string(content), "# Config") {
+		t.Error("comment not preserved")
+	}
+}
+
+func TestPersistRolloutFlags_KillSwitch(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("repo = \"/r\"\n"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cfg := &Config{V2KillSwitch: true}
+	if err := PersistRolloutFlags(cfgPath, cfg); err != nil {
+		t.Fatalf("PersistRolloutFlags: %v", err)
+	}
+
+	loaded, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !loaded.V2KillSwitch {
+		t.Error("V2KillSwitch should be true after persist")
+	}
+}
+
+func TestPersistRolloutFlags_ReadOnlyFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("v2_kill_switch = false\n"), 0400); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	err := PersistRolloutFlags(cfgPath, &Config{V2KillSwitch: true})
+	if err == nil {
+		t.Fatal("expected error for read-only file")
+	}
+}
+
+func TestPersistRolloutFlags_MalformedTOML(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("bad = \n"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	err := PersistRolloutFlags(cfgPath, &Config{})
+	if err == nil {
+		t.Fatal("expected error for malformed TOML")
+	}
+}
+

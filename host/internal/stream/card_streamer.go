@@ -28,8 +28,11 @@ type ChunkInfo struct {
 	Offset      int    // Deprecated: use Content directly
 	Length      int    // Deprecated: use Content directly
 	Content     string // Raw chunk content (including @@ header)
-	ContentHash string // SHA256 hash prefix for stale detection
-	GroupIndex  int    // Group number for proximity grouping (0-based)
+	ContentHash     string // SHA256 hash prefix for stale detection
+	GroupIndex      int    // Group number for proximity grouping (0-based)
+	SemanticKind    string // Semantic classification (e.g., "import", "function")
+	SemanticLabel   string // Display label for the chunk
+	SemanticGroupID string // Deterministic group identifier
 }
 
 // ChunkGroupInfo describes a group of related chunks for proximity grouping.
@@ -50,6 +53,33 @@ type ChunkGroupInfo struct {
 	ChunkCount int
 }
 
+// SemanticGroupInfo describes a semantic group of related chunks.
+// Semantic groups are determined by code analysis (C2) rather than
+// proximity. This type mirrors server.SemanticGroupInfo for the
+// streaming layer to avoid import cycles.
+type SemanticGroupInfo struct {
+	// GroupID is the deterministic identifier (e.g., "sg-" + 12 hex).
+	GroupID string
+
+	// Label is the display label for the group.
+	Label string
+
+	// Kind is the semantic classification (e.g., "import", "function").
+	Kind string
+
+	// LineStart is the starting line number of the group.
+	LineStart int
+
+	// LineEnd is the ending line number of the group.
+	LineEnd int
+
+	// ChunkIndexes lists the chunk indices belonging to this group.
+	ChunkIndexes []int
+
+	// RiskLevel is an optional risk assessment for this group.
+	RiskLevel string
+}
+
 // DiffStats mirrors server.DiffStats for the streaming layer.
 type DiffStats struct {
 	ByteSize     int
@@ -64,10 +94,11 @@ type CardBroadcaster interface {
 	// BroadcastDiffCard sends a card to all connected clients.
 	// The chunks parameter provides per-chunk metadata for granular decisions.
 	// The chunkGroups parameter provides proximity grouping metadata (nil when disabled).
+	// The semanticGroups parameter provides semantic grouping metadata (nil when disabled).
 	// The isBinary flag indicates per-chunk actions should be disabled.
 	// The isDeleted flag indicates this is a file deletion (use file-level actions).
 	// The stats parameter provides size metrics for large diff warnings.
-	BroadcastDiffCard(cardID, file, diffContent string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64)
+	BroadcastDiffCard(cardID, file, diffContent string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, semanticGroups []SemanticGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64)
 
 	// BroadcastCardRemoved notifies clients that a card was removed.
 	// This is called when changes are staged/reverted externally.
@@ -368,6 +399,10 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 		cs.seenFileHashes[file] = contentHash
 		cs.mu.Unlock()
 
+		// Semantic enrichment (non-blocking).
+		var semanticGroups []SemanticGroupInfo
+		chunkInfoList, semanticGroups = EnrichChunksWithSemantics(cardID, file, chunkInfoList, isBinary, isDeleted)
+
 		// Broadcast to clients (same message for new and updated cards)
 		if cs.config.Broadcaster != nil {
 			cs.config.Broadcaster.BroadcastDiffCard(
@@ -376,6 +411,7 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 				card.Diff,
 				chunkInfoList,
 				chunkGroups,
+				semanticGroups,
 				isBinary,
 				isDeleted,
 				stats,
@@ -552,12 +588,17 @@ func (cs *CardStreamer) StreamPendingCards() error {
 		// This is a heuristic for pending cards loaded from storage
 		isDeleted := stats != nil && stats.AddedLines == 0 && stats.DeletedLines > 0
 
+		// Semantic enrichment (non-blocking).
+		var semanticGroups []SemanticGroupInfo
+		chunkInfoList, semanticGroups = EnrichChunksWithSemantics(card.ID, card.File, chunkInfoList, isBinary, isDeleted)
+
 		cs.config.Broadcaster.BroadcastDiffCard(
 			card.ID,
 			card.File,
 			card.Diff,
 			chunkInfoList,
 			chunkGroups,
+			semanticGroups,
 			isBinary,
 			isDeleted,
 			stats,

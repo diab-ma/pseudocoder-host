@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -670,9 +671,142 @@ func TestSchemaVersion(t *testing.T) {
 		t.Fatalf("SchemaVersion failed: %v", err)
 	}
 
-	// Current schema version should be 8 (V8 restructured decided_chunks with id as PK)
-	if version != 8 {
-		t.Errorf("SchemaVersion = %d, want 8", version)
+	// Current schema version should be 10 (V10 added keep_awake_audit).
+	if version != 10 {
+		t.Errorf("SchemaVersion = %d, want 10", version)
+	}
+}
+
+// TestMigrateToV9BackfillsLegacySystemSessions verifies migration backfill logic
+// for legacy host bootstrap session IDs.
+func TestMigrateToV9BackfillsLegacySystemSessions(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "v8_sessions.db")
+
+	rawDB, err := sql.Open(
+		"sqlite",
+		dbPath+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)",
+	)
+	if err != nil {
+		t.Fatalf("sql.Open failed: %v", err)
+	}
+
+	if _, err := rawDB.Exec(`
+		CREATE TABLE schema_version (
+			version INTEGER PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		);
+	`); err != nil {
+		rawDB.Close()
+		t.Fatalf("create schema_version failed: %v", err)
+	}
+	if _, err := rawDB.Exec(`
+		CREATE TABLE review_cards (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL DEFAULT '',
+			file TEXT NOT NULL,
+			diff TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			created_at TEXT NOT NULL,
+			decided_at TEXT,
+			comment TEXT NOT NULL DEFAULT ''
+		);
+	`); err != nil {
+		rawDB.Close()
+		t.Fatalf("create review_cards failed: %v", err)
+	}
+	if _, err := rawDB.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			repo TEXT NOT NULL,
+			branch TEXT NOT NULL,
+			started_at TEXT NOT NULL,
+			last_seen TEXT NOT NULL,
+			last_commit TEXT,
+			status TEXT NOT NULL DEFAULT 'running'
+		);
+	`); err != nil {
+		rawDB.Close()
+		t.Fatalf("create sessions failed: %v", err)
+	}
+	if _, err := rawDB.Exec(
+		"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+		8,
+		time.Now().Format(time.RFC3339),
+	); err != nil {
+		rawDB.Close()
+		t.Fatalf("insert schema version failed: %v", err)
+	}
+
+	ts := time.Now().Format(time.RFC3339Nano)
+	insertSession := func(id string) {
+		t.Helper()
+		if _, err := rawDB.Exec(
+			`INSERT INTO sessions (id, repo, branch, started_at, last_seen, status) VALUES (?, ?, ?, ?, ?, ?)`,
+			id,
+			"/tmp/repo",
+			"main",
+			ts,
+			ts,
+			"running",
+		); err != nil {
+			rawDB.Close()
+			t.Fatalf("insert session %q failed: %v", id, err)
+		}
+	}
+	insertSession("session-1735000000")    // legacy bootstrap ID (10 digits) -> true
+	insertSession("session-1735000000000") // all-digit legacy variant -> true
+	insertSession("session-123abc")        // mixed suffix -> false
+	insertSession("session-custom")        // user/custom ID -> false
+
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("rawDB close failed: %v", err)
+	}
+
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	version, err := store.SchemaVersion()
+	if err != nil {
+		t.Fatalf("SchemaVersion failed: %v", err)
+	}
+	if version != 10 {
+		t.Fatalf("schema version = %d, want 10", version)
+	}
+
+	legacy, err := store.GetSession("session-1735000000")
+	if err != nil {
+		t.Fatalf("GetSession legacy failed: %v", err)
+	}
+	if legacy == nil || !legacy.IsSystem {
+		t.Fatalf("legacy session IsSystem = %v, want true", legacy != nil && legacy.IsSystem)
+	}
+
+	longID, err := store.GetSession("session-1735000000000")
+	if err != nil {
+		t.Fatalf("GetSession long id failed: %v", err)
+	}
+	if longID == nil || !longID.IsSystem {
+		t.Fatalf("long id session IsSystem = %v, want true", longID != nil && longID.IsSystem)
+	}
+
+	mixed, err := store.GetSession("session-123abc")
+	if err != nil {
+		t.Fatalf("GetSession mixed id failed: %v", err)
+	}
+	if mixed == nil || mixed.IsSystem {
+		t.Fatalf("mixed id session IsSystem = %v, want false", mixed != nil && mixed.IsSystem)
+	}
+
+	custom, err := store.GetSession("session-custom")
+	if err != nil {
+		t.Fatalf("GetSession custom failed: %v", err)
+	}
+	if custom == nil || custom.IsSystem {
+		t.Fatalf("custom session IsSystem = %v, want false", custom != nil && custom.IsSystem)
 	}
 }
 
@@ -1267,10 +1401,10 @@ func TestRecordChunkDecision(t *testing.T) {
 
 	// Record decision for chunk 0
 	decision := &ChunkDecision{
-		CardID:    "fc-decide",
+		CardID:     "fc-decide",
 		ChunkIndex: 0,
-		Status:    CardAccepted,
-		Timestamp: time.Now(),
+		Status:     CardAccepted,
+		Timestamp:  time.Now(),
 	}
 	if err := store.RecordChunkDecision(decision); err != nil {
 		t.Fatalf("RecordChunkDecision failed: %v", err)
@@ -1323,10 +1457,10 @@ func TestRecordChunkDecisionErrors(t *testing.T) {
 
 	// Try to decide already-decided chunk
 	decision := &ChunkDecision{
-		CardID:    "fc-errors",
+		CardID:     "fc-errors",
 		ChunkIndex: 0,
-		Status:    CardRejected,
-		Timestamp: time.Now(),
+		Status:     CardRejected,
+		Timestamp:  time.Now(),
 	}
 	err = store.RecordChunkDecision(decision)
 	if err == nil {
@@ -3011,5 +3145,125 @@ func TestGetLegacyDecidedChunkOnlyMatchesNullHash(t *testing.T) {
 	}
 	if found.ContentHash != "hash-abc" {
 		t.Errorf("ContentHash = %s, want 'hash-abc'", found.ContentHash)
+	}
+}
+
+// =============================================================================
+// P17U5: Keep-Awake Audit Tests
+// =============================================================================
+
+// TestKeepAwakeAuditSave verifies basic audit entry persistence.
+func TestKeepAwakeAuditSave(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+	entry := &KeepAwakeAuditEntry{
+		Operation:      "enable",
+		RequestID:      "req-1",
+		ActorDeviceID:  "device-1",
+		TargetDeviceID: "",
+		SessionID:      "session-1",
+		LeaseID:        "ka-1",
+		Reason:         "test",
+		At:             now,
+	}
+	if err := store.SaveAndPruneKeepAwakeAudit(entry, 1000); err != nil {
+		t.Fatalf("SaveAndPruneKeepAwakeAudit failed: %v", err)
+	}
+
+	entries, err := store.ListKeepAwakeAudit(10)
+	if err != nil {
+		t.Fatalf("ListKeepAwakeAudit failed: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].Operation != "enable" {
+		t.Errorf("Operation = %q, want %q", entries[0].Operation, "enable")
+	}
+	if entries[0].RequestID != "req-1" {
+		t.Errorf("RequestID = %q, want %q", entries[0].RequestID, "req-1")
+	}
+	if entries[0].LeaseID != "ka-1" {
+		t.Errorf("LeaseID = %q, want %q", entries[0].LeaseID, "ka-1")
+	}
+}
+
+// TestKeepAwakeAuditPrune verifies that pruning removes oldest entries beyond maxRows.
+func TestKeepAwakeAuditPrune(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+	// Insert 5 entries with maxRows=3
+	for i := 0; i < 5; i++ {
+		entry := &KeepAwakeAuditEntry{
+			Operation: fmt.Sprintf("op-%d", i),
+			RequestID: fmt.Sprintf("req-%d", i),
+			LeaseID:   fmt.Sprintf("ka-%d", i),
+			At:        now.Add(time.Duration(i) * time.Second),
+		}
+		if err := store.SaveAndPruneKeepAwakeAudit(entry, 3); err != nil {
+			t.Fatalf("SaveAndPruneKeepAwakeAudit[%d] failed: %v", i, err)
+		}
+	}
+
+	entries, err := store.ListKeepAwakeAudit(0)
+	if err != nil {
+		t.Fatalf("ListKeepAwakeAudit failed: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries after pruning, got %d", len(entries))
+	}
+	// Newest first: op-4, op-3, op-2
+	if entries[0].Operation != "op-4" {
+		t.Errorf("entries[0].Operation = %q, want %q", entries[0].Operation, "op-4")
+	}
+	if entries[2].Operation != "op-2" {
+		t.Errorf("entries[2].Operation = %q, want %q", entries[2].Operation, "op-2")
+	}
+}
+
+// TestMigrateToV10 verifies the keep_awake_audit table is created.
+func TestMigrateToV10(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	version, err := store.SchemaVersion()
+	if err != nil {
+		t.Fatalf("SchemaVersion failed: %v", err)
+	}
+	if version < 10 {
+		t.Errorf("SchemaVersion = %d, want >= 10", version)
+	}
+
+	exists, err := store.tableExists("keep_awake_audit")
+	if err != nil {
+		t.Fatalf("tableExists failed: %v", err)
+	}
+	if !exists {
+		t.Error("keep_awake_audit table should exist after v10 migration")
+	}
+}
+
+func TestKeepAwakeAuditProbe(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.ProbeKeepAwakeAuditWrite(); err != nil {
+		t.Fatalf("ProbeKeepAwakeAuditWrite should succeed, got: %v", err)
 	}
 }
