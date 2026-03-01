@@ -1,6 +1,6 @@
 # privacy policy
 
-**Last Updated:** January 10, 2025
+**Last Updated:** March 2026
 
 ## The Short Version
 
@@ -13,6 +13,7 @@ pseudocoder is a local-first tool. Everything happens on your devices:
 - **Your code stays on your computer.**
 - **Your terminal output goes directly from your computer to your phone over Tailscale or your local network.**
 - **Your git commits go to *your* git remote, not ours.**
+- **File operations (browse, read, write, create, delete) operate within your local repository directory.**
 - **Your pairing tokens are stored locally in your device's secure storage.**
 
 the host binary has no telemetry and never phones home.

@@ -10,6 +10,8 @@ go build -o pseudocoder ./cmd
 
 Requirements:
 - Go 1.24+
+- [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) — required for semantic analysis enrichment
+- [tree-sitter CLI](https://tree-sitter.github.io/) — optional, enables enhanced semantic analysis for diff cards
 
 ## Running Tests
 

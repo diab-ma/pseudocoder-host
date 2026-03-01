@@ -115,13 +115,45 @@ commit panel in review tab allows a frictionless way to enter message, commit, a
   <img src="assets/screenshot-review.png" alt="Review and Commit" width="300">
 </p>
 
+<h3 align="center">File Browser</h3>
+
+browse, read, write, create, and delete files in the supervised repository from mobile. write operations use version-conflict detection to prevent overwriting concurrent changes. external file changes are detected automatically via polling.
+
+<h3 align="center">Git</h3>
+
+paginated commit history, branch list with create and switch (blocks switching with a dirty tree), fetch, pull (fast-forward-only), and commit/push with request-scoped correlation. all git operations are scoped to the supervised repository.
+
+<h3 align="center">Keep-Awake</h3>
+
+prevent host machine from sleeping during active sessions. the host runs an authoritative state machine with multi-client lease arbitration and battery policy enforcement (macOS). enable via CLI or startup flag:
+
+```bash
+pseudocoder keep-awake enable-remote    # enable remote keep-awake policy
+pseudocoder keep-awake disable-remote   # disable remote keep-awake policy
+pseudocoder keep-awake status           # show current policy status
+pseudocoder start --enable-remote-keep-awake  # enable at startup
+```
+
+---
+
+## Diagnostics
+
+run `pseudocoder doctor` to diagnose onboarding readiness and connectivity issues. checks TLS certificates, network reachability, pairing IPC socket, and host readiness. use `--json` for machine-readable output.
+
+```bash
+pseudocoder doctor          # interactive preflight checks
+pseudocoder doctor --json   # JSON output for scripting
+```
+
 ---
 
 ## Security
 
-use Tailscale or trusted LAN only. we recommend never exposing to public internet. 
+use Tailscale or trusted LAN only. we recommend never exposing to public internet.
 all connections use TLS 1.2+. paired devices have full terminal access. only pair devices you control.
 pairing codes are generated locally (IPC/loopback) to avoid exposing them on the network.
+file operations are scoped to the supervised repository directory.
+keep-awake policy mutations are restricted to loopback-only API with Bearer-token auth.
 
 manage devices:
 ```bash
@@ -138,6 +170,10 @@ pseudocoder devices revoke <id>   # remove access
 - `pair_socket`: local IPC socket used by `pseudocoder pair` (default: `~/.pseudocoder/pair.sock`)
 - `chunk_grouping_enabled`: group nearby diff hunks into a single review card section
 - `chunk_grouping_proximity`: max line distance for grouping (default: `20` when enabled)
+- `keep_awake_remote_enabled`: allow mobile devices to activate keep-awake (default: `false`)
+- `keep_awake_allow_on_battery`: permit keep-awake when on battery power (default: `true`)
+- `keep_awake_auto_disable_battery_percent`: battery % threshold to auto-disable (0 = disabled)
+- `keep_awake_audit_max_rows`: max durable audit log rows retained (default: `1000`)
 
 ---
 
@@ -150,6 +186,11 @@ pseudocoder devices revoke <id>   # remove access
 | pairing code expired | run `pseudocoder pair --qr` (codes last 5 min) |
 | `pseudocoder pair` fails | ensure the host is running and `~/.pseudocoder/pair.sock` is accessible |
 | QR won't scan | enter manually: host IP, port `7070`, 6-digit code |
+| keep-awake not activating | check `pseudocoder keep-awake status`, ensure `keep_awake_remote_enabled = true` in config |
+| file write conflict | another process modified the file; re-read and retry the write |
+| branch switch blocked | commit or stash uncommitted changes before switching branches |
+| pull rejected | non-fast-forward; fetch and merge or rebase locally |
+| general connectivity issues | run `pseudocoder doctor` for guided diagnostics |
 | macOS Gatekeeper | `xattr -d com.apple.quarantine /usr/local/bin/pseudocoder` |
 
 ---
@@ -162,12 +203,21 @@ pseudocoder devices revoke <id>   # remove access
 | `pseudocoder host start` | start host daemon with advanced options |
 | `pseudocoder host status` | show host daemon status |
 | `pseudocoder pair --qr` | generate new pairing code |
+| `pseudocoder doctor` | diagnose onboarding readiness and connectivity |
+| `pseudocoder doctor --json` | diagnostics with JSON output |
 | `pseudocoder session list` | list active sessions |
 | `pseudocoder session new --name <name>` | create a new session |
+| `pseudocoder session kill <id>` | kill a session |
+| `pseudocoder session rename <id> <name>` | rename a session |
 | `pseudocoder session list-tmux` | list available tmux sessions |
 | `pseudocoder session attach-tmux <name>` | attach to a tmux session |
+| `pseudocoder session detach <id>` | detach from a tmux session |
 | `pseudocoder devices list` | list paired devices |
 | `pseudocoder devices revoke <id>` | revoke device access |
+| `pseudocoder keep-awake enable-remote` | enable remote keep-awake policy |
+| `pseudocoder keep-awake disable-remote` | disable remote keep-awake policy |
+| `pseudocoder keep-awake status` | show keep-awake policy status |
+| `pseudocoder start --enable-remote-keep-awake` | start with keep-awake enabled |
 | `pseudocoder --version` | show version |
 
 ---
