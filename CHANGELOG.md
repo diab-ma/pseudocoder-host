@@ -4,7 +4,7 @@ All notable changes to pseudocoder will be documented in this file.
 
 ## [Unreleased]
 
-## [0.2.0-beta] - 2026-03-XX
+## [0.2.0-beta] - 2026-03-01
 
 ### Features
 
@@ -13,7 +13,7 @@ All notable changes to pseudocoder will be documented in this file.
 - **Keep-awake system**: host-authoritative state machine (OFF/PENDING/ON/DEGRADED), multi-client lease arbitration, CLI commands (`keep-awake enable-remote/disable-remote/status`), `start --enable-remote-keep-awake` flag, battery policy enforcement (macOS caffeinate), SQLite audit persistence
 - **Diagnostics**: `pseudocoder doctor` with preflight checks (TLS, network, pairing IPC, host readiness), `--json` output
 - **Semantic analysis**: tree-sitter enrichment for diff cards, sensitive path detection
-- **Rollout controls**: `pseudocoder flags` CLI (list/enable/disable/promote/rollout-stage/kill-switch)
+
 
 ### Improvements
 
