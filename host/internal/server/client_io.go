@@ -75,10 +75,12 @@ func (c *Client) writePump() {
 // In future units, this will handle review.decision messages from clients.
 func (c *Client) readPump() {
 	defer func() {
+		deviceID := c.deviceID
 		// Unregister the client when this goroutine exits
 		c.server.mu.Lock()
 		delete(c.server.clients, c)
 		c.server.mu.Unlock()
+		c.server.onKeepAwakeClientDisconnected(deviceID)
 
 		// Use closeSend() to safely close the channel.
 		// Stop() may have already closed it during shutdown.
@@ -157,6 +159,10 @@ func (c *Client) readPump() {
 			c.handleRepoCommit(data)
 		case MessageTypeRepoPush:
 			c.handleRepoPush(data)
+		case MessageTypeRepoFetch:
+			c.handleRepoFetch(data)
+		case MessageTypeRepoPull:
+			c.handleRepoPull(data)
 		// Phase 9.3: Multi-session PTY management messages
 		case MessageTypeSessionCreate:
 			c.handleSessionCreate(data)
@@ -166,6 +172,8 @@ func (c *Client) readPump() {
 			c.handleSessionSwitch(data)
 		case MessageTypeSessionRename:
 			c.handleSessionRename(data)
+		case MessageTypeSessionClearHistory:
+			c.handleSessionClearHistory(data)
 		// Phase 12: tmux session integration messages
 		case MessageTypeTmuxList:
 			c.handleTmuxList(data)
@@ -173,6 +181,44 @@ func (c *Client) readPump() {
 			c.handleTmuxAttach(data)
 		case MessageTypeTmuxDetach:
 			c.handleTmuxDetach(data)
+		// Phase 3: File explorer protocol messages
+		case MessageTypeFileList:
+			c.handleFileList(data)
+		case MessageTypeFileRead:
+			c.handleFileRead(data)
+		case MessageTypeFileWrite:
+			c.handleFileWrite(data)
+		case MessageTypeFileCreate:
+			c.handleFileCreate(data)
+		case MessageTypeFileDelete:
+			c.handleFileDelete(data)
+		// Phase 4: Git history and branch listing
+		case MessageTypeRepoHistory:
+			c.handleRepoHistory(data)
+		case MessageTypeRepoBranches:
+			c.handleRepoBranches(data)
+		// Phase 4 P4U2: Branch mutation handlers
+		case MessageTypeRepoBranchCreate:
+			c.handleRepoBranchCreate(data)
+		case MessageTypeRepoBranchSwitch:
+			c.handleRepoBranchSwitch(data)
+		// Phase 9 P9U4: PR sub-tab handlers
+		case MessageTypeRepoPrList:
+			c.handleRepoPrList(data)
+		case MessageTypeRepoPrView:
+			c.handleRepoPrView(data)
+		case MessageTypeRepoPrCreate:
+			c.handleRepoPrCreate(data)
+		case MessageTypeRepoPrCheckout:
+			c.handleRepoPrCheckout(data)
+		case MessageTypeSessionKeepAwakeEnable:
+			c.handleKeepAwakeEnable(data)
+		case MessageTypeSessionKeepAwakeDisable:
+			c.handleKeepAwakeDisable(data)
+		case MessageTypeSessionKeepAwakeExtend:
+			c.handleKeepAwakeExtend(data)
+		case MessageTypeSessionKeepAwakeStatus:
+			c.handleKeepAwakeStatus(data)
 		default:
 			log.Printf("Received message: type=%s", msg.Type)
 		}

@@ -17,16 +17,19 @@ func mapChunksToServer(chunks []stream.ChunkInfo) []ChunkInfo {
 	serverChunks := make([]ChunkInfo, len(chunks))
 	for i, h := range chunks {
 		serverChunks[i] = ChunkInfo{
-			Index:       h.Index,
-			OldStart:    h.OldStart,
-			OldCount:    h.OldCount,
-			NewStart:    h.NewStart,
-			NewCount:    h.NewCount,
-			Offset:      h.Offset,
-			Length:      h.Length,
-			Content:     h.Content,
-			ContentHash: h.ContentHash,
-			GroupIndex:  h.GroupIndex,
+			Index:           h.Index,
+			OldStart:        h.OldStart,
+			OldCount:        h.OldCount,
+			NewStart:        h.NewStart,
+			NewCount:        h.NewCount,
+			Offset:          h.Offset,
+			Length:          h.Length,
+			Content:         h.Content,
+			ContentHash:     h.ContentHash,
+			GroupIndex:      h.GroupIndex,
+			SemanticKind:    h.SemanticKind,
+			SemanticLabel:   h.SemanticLabel,
+			SemanticGroupID: h.SemanticGroupID,
 		}
 	}
 	return serverChunks
@@ -48,6 +51,34 @@ func mapChunkGroupsToServer(groups []stream.ChunkGroupInfo) []ChunkGroupInfo {
 			LineStart:  g.LineStart,
 			LineEnd:    g.LineEnd,
 			ChunkCount: g.ChunkCount,
+		}
+	}
+	return serverGroups
+}
+
+// mapSemanticGroupsToServer converts a slice of stream.SemanticGroupInfo to server.SemanticGroupInfo.
+// This mapping is necessary because the stream and server packages define
+// their own SemanticGroupInfo types to avoid import cycles.
+// Returns nil if the input is nil (semantic analysis disabled).
+func mapSemanticGroupsToServer(groups []stream.SemanticGroupInfo) []SemanticGroupInfo {
+	if groups == nil {
+		return nil
+	}
+	serverGroups := make([]SemanticGroupInfo, len(groups))
+	for i, g := range groups {
+		var chunkIndexes []int
+		if g.ChunkIndexes != nil {
+			chunkIndexes = make([]int, len(g.ChunkIndexes))
+			copy(chunkIndexes, g.ChunkIndexes)
+		}
+		serverGroups[i] = SemanticGroupInfo{
+			GroupID:      g.GroupID,
+			Label:        g.Label,
+			Kind:         g.Kind,
+			LineStart:    g.LineStart,
+			LineEnd:      g.LineEnd,
+			ChunkIndexes: chunkIndexes,
+			RiskLevel:    g.RiskLevel,
 		}
 	}
 	return serverGroups

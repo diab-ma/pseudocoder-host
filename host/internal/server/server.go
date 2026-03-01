@@ -27,6 +27,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -36,6 +38,7 @@ import (
 	"time"
 
 	// Internal error codes package for standardized error handling.
+	"github.com/pseudocoder/host/internal/config"
 	apperrors "github.com/pseudocoder/host/internal/errors"
 )
 
@@ -428,4 +431,362 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(result)
+}
+
+// KeepAwakePolicyHandler handles POST /api/keep-awake/policy for CLI-driven
+// keep-awake policy mutation with atomic validate -> persist -> apply -> broadcast.
+type KeepAwakePolicyHandler struct {
+	server         *Server
+	tokenValidator ApprovalTokenValidator
+	configPath     string
+	persistPolicy  func(string, bool) error
+}
+
+// NewKeepAwakePolicyHandler creates a handler for the /api/keep-awake/policy endpoint.
+func NewKeepAwakePolicyHandler(server *Server, tokenValidator ApprovalTokenValidator, configPath string) *KeepAwakePolicyHandler {
+	return &KeepAwakePolicyHandler{
+		server:         server,
+		tokenValidator: tokenValidator,
+		configPath:     configPath,
+		persistPolicy:  config.PersistKeepAwakePolicy,
+	}
+}
+
+// keepAwakePolicyRequest is the JSON request body for POST /api/keep-awake/policy.
+type keepAwakePolicyRequest struct {
+	RequestID     string `json:"request_id"`
+	RemoteEnabled *bool  `json:"remote_enabled"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 1. POST-only.
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			ErrorCode: "keep_awake.method_not_allowed",
+			Error:     "Only POST is allowed",
+		})
+		return
+	}
+
+	// 2. Loopback enforcement.
+	if !isLoopbackRequest(r) {
+		log.Printf("server: rejected /api/keep-awake/policy from non-loopback: %s", r.RemoteAddr)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
+			Error:     "Policy endpoint is only available from localhost",
+		})
+		return
+	}
+
+	// 3. Token validator unavailable -> 503.
+	if h.tokenValidator == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			ErrorCode: apperrors.CodeKeepAwakeConflict,
+			Error:     "Authentication system unavailable",
+		})
+		return
+	}
+
+	// 4. Bearer token extraction and validation.
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
+			Error:     "Authorization header required",
+		})
+		return
+	}
+	const bearerPrefix = "Bearer "
+	if !strings.HasPrefix(authHeader, bearerPrefix) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
+			Error:     "Invalid authorization format (expected Bearer token)",
+		})
+		return
+	}
+	tokenRaw := strings.TrimPrefix(authHeader, bearerPrefix)
+	tokenRaw = strings.TrimSpace(tokenRaw)
+	if tokenRaw == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
+			Error:     "Authorization token is required",
+		})
+		return
+	}
+	if !h.tokenValidator.ValidateToken(tokenRaw) {
+		log.Printf("server: rejected /api/keep-awake/policy with invalid token")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
+			Error:     "Invalid approval token",
+		})
+		return
+	}
+
+	// 5. Caller identity.
+	callerIdentity := sha256Hex(tokenRaw)
+
+	// 6. Parse request body with strict JSON.
+	var req keepAwakePolicyRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			ErrorCode: apperrors.CodeServerInvalidMessage,
+			Error:     fmt.Sprintf("Invalid JSON: %v", err),
+		})
+		return
+	}
+	if req.RequestID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			ErrorCode: apperrors.CodeServerInvalidMessage,
+			Error:     "request_id is required",
+		})
+		return
+	}
+	if req.RemoteEnabled == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			RequestID: req.RequestID,
+			ErrorCode: apperrors.CodeServerInvalidMessage,
+			Error:     "remote_enabled is required",
+		})
+		return
+	}
+
+	// 7. Normalize reason.
+	reason, err := normalizeKeepAwakePolicyReason(req.Reason)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			RequestID: req.RequestID,
+			ErrorCode: apperrors.CodeServerInvalidMessage,
+			Error:     err.Error(),
+		})
+		return
+	}
+
+	remoteEnabled := *req.RemoteEnabled
+	fingerprint := computeFingerprint("policy_mutation", fmt.Sprintf("%t", remoteEnabled), reason)
+
+	// 8. Lock -> idempotency check -> no-op detect -> reserve.
+	idKey := policyIdempotencyKey{CallerIdentity: callerIdentity, RequestID: req.RequestID}
+	h.server.keepAwake.mu.Lock()
+	cached, replay, idErr := h.server.policyIdempotencyCheckLocked(idKey, fingerprint)
+	if replay {
+		h.server.keepAwake.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(cached)
+		return
+	}
+	if idErr != nil {
+		h.server.keepAwake.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			RequestID: req.RequestID,
+			ErrorCode: apperrors.CodeKeepAwakeConflict,
+			Error:     idErr.Error(),
+		})
+		return
+	}
+
+	// No-op detection: if policy already matches, return success without persist.
+	currentEnabled := h.server.keepAwake.policy.RemoteEnabled
+	if currentEnabled == remoteEnabled {
+		now := h.server.keepAwake.now()
+		status := h.server.keepAwakeStatusPayloadLocked(now)
+		h.server.policyIdempotencyReserveLocked(idKey)
+		resp := KeepAwakePolicyMutationResponse{
+			RequestID:      req.RequestID,
+			Success:        true,
+			StatusRevision: status.StatusRevision,
+			KeepAwake:      status,
+			HotApplied:     true,
+			Persisted:      false,
+		}
+		h.server.policyIdempotencyCompleteLocked(idKey, fingerprint, resp)
+		h.server.keepAwake.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Reserve in-flight.
+	h.server.policyIdempotencyReserveLocked(idKey)
+	oldPolicy := h.server.keepAwake.policy
+
+	// Unlock before persist I/O.
+	h.server.keepAwake.mu.Unlock()
+
+	// 9. Persist to disk (no lock held, flock guards file contention).
+	if h.configPath == "" {
+		h.server.keepAwake.mu.Lock()
+		h.server.policyIdempotencyCancelLocked(idKey)
+		h.server.keepAwake.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			RequestID: req.RequestID,
+			ErrorCode: apperrors.CodeKeepAwakeConflict,
+			Error:     "config path is unavailable; cannot persist keep-awake policy",
+		})
+		return
+	}
+	if err := h.persistPolicy(h.configPath, remoteEnabled); err != nil {
+		log.Printf("keep-awake policy persist failed: %v", err)
+		h.server.keepAwake.mu.Lock()
+		h.server.policyIdempotencyCancelLocked(idKey)
+		h.server.keepAwake.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			RequestID: req.RequestID,
+			ErrorCode: apperrors.CodeKeepAwakeConflict,
+			Error:     "policy persistence failed: " + err.Error(),
+		})
+		return
+	}
+	persisted := true
+
+	// 10. Re-lock -> apply policy -> revoke leases if disabling -> audit -> revision++ -> snapshot.
+	h.server.keepAwake.mu.Lock()
+	newPolicy := h.server.keepAwake.policy
+	newPolicy.RemoteEnabled = remoteEnabled
+	h.server.keepAwake.policy = newPolicy
+
+	now := h.server.keepAwake.now()
+
+	// Write audit.
+	auditReason := reason
+	if auditReason == "" {
+		if remoteEnabled {
+			auditReason = "cli_enable"
+		} else {
+			auditReason = "cli_disable"
+		}
+	}
+	if err := h.server.keepAwakeWriteAuditLocked(KeepAwakeAuditEvent{
+		Operation:     "policy_change",
+		RequestID:     req.RequestID,
+		ActorDeviceID: "cli:" + callerIdentity[:8],
+		Reason:        auditReason,
+		At:            now,
+	}); err != nil {
+		// Audit write failed -> rollback.
+		h.server.keepAwake.policy = oldPolicy
+		h.server.policyIdempotencyCancelLocked(idKey)
+		h.server.keepAwake.mu.Unlock()
+
+		// Rollback persist.
+		if persisted && h.configPath != "" {
+			if rbErr := h.persistPolicy(h.configPath, oldPolicy.RemoteEnabled); rbErr != nil {
+				log.Printf("keep-awake policy rollback persist failed: %v", rbErr)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+					RequestID: req.RequestID,
+					ErrorCode: apperrors.CodeKeepAwakeConflict,
+					Error:     "policy apply failed and rollback failed; manually restore keep_awake_remote_enabled in config: " + rbErr.Error(),
+				})
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+			RequestID: req.RequestID,
+			ErrorCode: apperrors.CodeKeepAwakeConflict,
+			Error:     "policy apply failed; rollback completed: " + apperrors.GetMessage(err),
+		})
+		return
+	}
+
+	// Disable dominance: revoke all leases when disabling.
+	if oldPolicy.RemoteEnabled && !remoteEnabled && len(h.server.keepAwake.leases) > 0 {
+		for key, lease := range h.server.keepAwake.leases {
+			if err := h.server.keepAwakeWriteAuditLocked(KeepAwakeAuditEvent{
+				Operation:      "policy_revoke",
+				ActorDeviceID:  "cli:" + callerIdentity[:8],
+				TargetDeviceID: lease.DeviceID,
+				SessionID:      lease.SessionID,
+				LeaseID:        lease.LeaseID,
+				Reason:         "remote_disabled_by_cli",
+				At:             now,
+			}); err != nil {
+				status := h.server.keepAwakeFailClosedOnPolicyAuditErrorLocked(now, err)
+				h.server.policyIdempotencyCancelLocked(idKey)
+				h.server.keepAwake.mu.Unlock()
+				changedMsg := NewKeepAwakeChangedMessage(status)
+				go h.server.broadcastKeepAwakeChanged(changedMsg, nil, true)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+					RequestID: req.RequestID,
+					ErrorCode: apperrors.CodeKeepAwakeConflict,
+					Error:     "policy apply failed; keep-awake forced fail-closed after revoke audit error",
+				})
+				return
+			}
+			if timer := h.server.keepAwake.timers[key]; timer != nil {
+				timer.Stop()
+				delete(h.server.keepAwake.timers, key)
+			}
+			delete(h.server.keepAwake.leases, key)
+		}
+		h.server.keepAwakeSetRuntimeStateLocked(false)
+	}
+
+	h.server.keepAwake.statusRevision++
+	revision := h.server.keepAwake.statusRevision
+	status := h.server.keepAwakeStatusPayloadLocked(now)
+
+	resp := KeepAwakePolicyMutationResponse{
+		RequestID:      req.RequestID,
+		Success:        true,
+		StatusRevision: revision,
+		KeepAwake:      status,
+		HotApplied:     true,
+		Persisted:      persisted,
+	}
+	h.server.policyIdempotencyCompleteLocked(idKey, fingerprint, resp)
+	h.server.keepAwake.mu.Unlock()
+
+	// 11. Broadcast (non-blocking, failure preserves committed truth).
+	changedMsg := NewKeepAwakeChangedMessage(status)
+	go h.server.broadcastKeepAwakeChanged(changedMsg, nil, true)
+
+	// 12. Return 200.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+}
+
+// sha256Hex returns the hex-encoded SHA256 digest of s.
+func sha256Hex(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
 }

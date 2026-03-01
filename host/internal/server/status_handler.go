@@ -37,6 +37,28 @@ type StatusResponse struct {
 
 	// PairSocketPath is the path to the pairing IPC socket, or empty if unavailable.
 	PairSocketPath string `json:"pair_socket_path,omitempty"`
+
+	// KeepAwake is the keep-awake status summary (nil when not available).
+	KeepAwake *KeepAwakeStatusSummary `json:"keep_awake,omitempty"`
+}
+
+// KeepAwakeStatusSummary contains keep-awake status for the /status endpoint.
+type KeepAwakeStatusSummary struct {
+	State                     string `json:"state"`
+	ActiveLeaseCount          int    `json:"active_lease_count"`
+	NextExpiryMs              int64  `json:"next_expiry_ms,omitempty"`
+	RemoteEnabled             bool   `json:"remote_enabled"`
+	AllowAdminRevoke          bool   `json:"allow_admin_revoke"`
+	AllowOnBattery            bool   `json:"allow_on_battery"`
+	AutoDisableBatteryPercent int    `json:"auto_disable_battery_percent,omitempty"`
+	DegradedReason            string `json:"degraded_reason,omitempty"`
+	StatusRevision            int64  `json:"status_revision"`
+	ServerBootID              string `json:"server_boot_id"`
+	OnBattery                 *bool  `json:"on_battery,omitempty"`
+	BatteryPercent            *int   `json:"battery_percent,omitempty"`
+	PolicyBlocked             bool   `json:"policy_blocked,omitempty"`
+	PolicyReason              string `json:"policy_reason,omitempty"`
+	RecoveryHint              string `json:"recovery_hint,omitempty"`
 }
 
 // StatusHandler handles HTTP requests for host status.
@@ -107,6 +129,29 @@ func (h *StatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		RequireAuth:      h.requireAuth,
 		PairSocketPath:   h.pairSocket,
 	}
+
+	// Include keep-awake summary.
+	kaStatus := h.server.KeepAwakeSummary()
+	summary := &KeepAwakeStatusSummary{
+		State:                     kaStatus.State,
+		ActiveLeaseCount:          kaStatus.ActiveLeaseCount,
+		NextExpiryMs:              kaStatus.NextExpiryMs,
+		RemoteEnabled:             kaStatus.Policy.RemoteEnabled,
+		AllowAdminRevoke:          kaStatus.Policy.AllowAdminRevoke,
+		AllowOnBattery:            kaStatus.Policy.AllowOnBattery,
+		AutoDisableBatteryPercent: kaStatus.Policy.AutoDisableBatteryPercent,
+		DegradedReason:            kaStatus.DegradedReason,
+		StatusRevision:            kaStatus.StatusRevision,
+		ServerBootID:              kaStatus.ServerBootID,
+		RecoveryHint:              kaStatus.RecoveryHint,
+	}
+	if kaStatus.Power != nil {
+		summary.OnBattery = kaStatus.Power.OnBattery
+		summary.BatteryPercent = kaStatus.Power.BatteryPercent
+		summary.PolicyBlocked = kaStatus.Power.PolicyBlocked
+		summary.PolicyReason = kaStatus.Power.PolicyReason
+	}
+	resp.KeepAwake = summary
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {

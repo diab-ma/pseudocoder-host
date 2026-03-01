@@ -7,6 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 	apperrors "github.com/pseudocoder/host/internal/errors"
 	"github.com/pseudocoder/host/internal/pty"
+	"github.com/pseudocoder/host/internal/storage"
 	"github.com/pseudocoder/host/internal/stream"
 )
 
@@ -45,6 +49,30 @@ func readMessage(t *testing.T, conn *websocket.Conn) Message {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
 	return msg
+}
+
+func readSessionCreatedName(t *testing.T, conn *websocket.Conn) string {
+	t.Helper()
+
+	var resp Message
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := conn.ReadJSON(&resp); err != nil {
+		t.Fatalf("failed to read session.create response: %v", err)
+	}
+	if resp.Type != MessageTypeSessionCreated {
+		t.Fatalf("expected session.created message, got %s", resp.Type)
+	}
+
+	payload, ok := resp.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", resp.Payload)
+	}
+
+	name, ok := payload["name"].(string)
+	if !ok {
+		t.Fatalf("expected string name payload, got %T", payload["name"])
+	}
+	return name
 }
 
 func TestWebSocketSessionStatusAndBroadcast(t *testing.T) {
@@ -281,13 +309,197 @@ func TestBroadcastToFullBuffer(t *testing.T) {
 	}
 }
 
+// TestComputeDiffCardMeta verifies the deterministic triage metadata helper.
+func TestComputeDiffCardMeta(t *testing.T) {
+	tests := []struct {
+		name           string
+		file           string
+		chunks         []ChunkInfo
+		isBinary       bool
+		isDeleted      bool
+		stats          *DiffStats
+		semanticGroups []SemanticGroupInfo
+		wantSummary    string
+		wantLevel      string
+		wantReasons    []string
+	}{
+		{
+			name:        "binary file",
+			file:        "assets/image.png",
+			isBinary:    true,
+			wantSummary: "Binary file changed",
+			wantLevel:   "high",
+			wantReasons: []string{"binary_file"},
+		},
+		{
+			name:        "deleted sensitive file",
+			file:        "config/auth_service.go",
+			isDeleted:   true,
+			wantSummary: "File deleted",
+			wantLevel:   "critical",
+			wantReasons: []string{"sensitive_path", "file_deletion"},
+		},
+		{
+			name:        "normal file with chunks and stats",
+			file:        "README.md",
+			chunks:      []ChunkInfo{{Index: 0}, {Index: 1}},
+			stats:       &DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 5, DeletedLines: 3},
+			wantSummary: "2 chunks, +5 / -3",
+			wantLevel:   "low",
+			wantReasons: nil,
+		},
+		{
+			name:        "stats without chunks",
+			file:        "docs/notes.txt",
+			stats:       &DiffStats{ByteSize: 50, LineCount: 5, AddedLines: 2, DeletedLines: 1},
+			wantSummary: "+2 / -1",
+			wantLevel:   "low",
+			wantReasons: nil,
+		},
+		{
+			name:        "no stats fallback",
+			file:        "docs/notes.txt",
+			wantSummary: "File updated",
+			wantLevel:   "low",
+			wantReasons: nil,
+		},
+		{
+			name:        "large diff by bytes",
+			file:        "data/dump.sql",
+			stats:       &DiffStats{ByteSize: 1048577, LineCount: 100, AddedLines: 50, DeletedLines: 10},
+			wantSummary: "+50 / -10",
+			wantLevel:   "high",
+			wantReasons: []string{"large_diff"},
+		},
+		{
+			name:        "high churn on source path",
+			file:        "host/internal/server/handler.go",
+			stats:       &DiffStats{ByteSize: 5000, LineCount: 300, AddedLines: 120, DeletedLines: 80},
+			chunks:      []ChunkInfo{{Index: 0}},
+			wantSummary: "1 chunks, +120 / -80",
+			wantLevel:   "medium",
+			wantReasons: []string{"high_churn", "source_change"},
+		},
+		{
+			name:        "sensitive + large + high churn yields critical with first 3 reasons",
+			file:        "host/internal/security/token_manager.go",
+			stats:       &DiffStats{ByteSize: 2000000, LineCount: 3000, AddedLines: 150, DeletedLines: 100},
+			wantSummary: "+150 / -100",
+			wantLevel:   "critical",
+			wantReasons: []string{"sensitive_path", "large_diff", "high_churn"},
+		},
+		{
+			name:        "zero-value stats",
+			file:        "README.md",
+			stats:       &DiffStats{},
+			wantSummary: "+0 / -0",
+			wantLevel:   "low",
+			wantReasons: nil,
+		},
+		// C2: Semantic summary enrichment
+		{
+			name:   "semantic groups present with stats",
+			file:   "src/handler.go",
+			chunks: []ChunkInfo{{Index: 0}, {Index: 1}},
+			stats:  &DiffStats{ByteSize: 200, LineCount: 20, AddedLines: 10, DeletedLines: 5},
+			semanticGroups: []SemanticGroupInfo{
+				{GroupID: "sg-aaa", Label: "Function changes", Kind: "function", ChunkIndexes: []int{0, 1}, RiskLevel: "medium"},
+			},
+			wantSummary: "Function changes: 2 chunk(s), +10 / -5",
+			wantLevel:   "low",
+			wantReasons: nil,
+		},
+		{
+			name:   "semantic groups present without stats",
+			file:   "src/handler.go",
+			chunks: []ChunkInfo{{Index: 0}},
+			semanticGroups: []SemanticGroupInfo{
+				{GroupID: "sg-bbb", Label: "Imports", Kind: "import", ChunkIndexes: []int{0}, RiskLevel: "low"},
+			},
+			wantSummary: "Imports: 1 chunk(s)",
+			wantLevel:   "low",
+			wantReasons: nil,
+		},
+		{
+			name:   "semantic primary group selection: highest risk wins",
+			file:   "src/handler.go",
+			chunks: []ChunkInfo{{Index: 0}, {Index: 1}, {Index: 2}},
+			stats:  &DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 5, DeletedLines: 2},
+			semanticGroups: []SemanticGroupInfo{
+				{GroupID: "sg-low", Label: "Code changes", Kind: "generic", ChunkIndexes: []int{0}, RiskLevel: "low"},
+				{GroupID: "sg-high", Label: "Function changes", Kind: "function", ChunkIndexes: []int{1, 2}, RiskLevel: "high"},
+			},
+			wantSummary: "Function changes: 2 chunk(s), +5 / -2",
+			wantLevel:   "low",
+			wantReasons: nil,
+		},
+		{
+			name:   "semantic primary group selection: same risk, larger chunk_indexes wins",
+			file:   "README.md",
+			chunks: []ChunkInfo{{Index: 0}, {Index: 1}, {Index: 2}},
+			stats:  &DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 3, DeletedLines: 1},
+			semanticGroups: []SemanticGroupInfo{
+				{GroupID: "sg-a", Label: "Imports", Kind: "import", ChunkIndexes: []int{0}, LineStart: 1, RiskLevel: "low"},
+				{GroupID: "sg-b", Label: "Code changes", Kind: "generic", ChunkIndexes: []int{1, 2}, LineStart: 10, RiskLevel: "low"},
+			},
+			wantSummary: "Code changes: 2 chunk(s), +3 / -1",
+			wantLevel:   "low",
+			wantReasons: nil,
+		},
+		{
+			name:     "semantic groups on binary card use semantic summary",
+			file:     "logo.png",
+			isBinary: true,
+			semanticGroups: []SemanticGroupInfo{
+				{GroupID: "sg-x", Label: "Binary change", Kind: "binary", ChunkIndexes: []int{0}, RiskLevel: "high"},
+			},
+			wantSummary: "Binary change: 1 chunk(s)",
+			wantLevel:   "high",
+			wantReasons: []string{"binary_file"},
+		},
+		{
+			name:      "semantic groups on deleted card use semantic summary",
+			file:      "old/main.go",
+			isDeleted: true,
+			stats:     &DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 0, DeletedLines: 8},
+			semanticGroups: []SemanticGroupInfo{
+				{GroupID: "sg-del", Label: "Deletion", Kind: "deleted", ChunkIndexes: []int{0}, RiskLevel: "high"},
+			},
+			wantSummary: "Deletion: 1 chunk(s), +0 / -8",
+			wantLevel:   "high",
+			wantReasons: []string{"file_deletion"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			summary, level, reasons := computeDiffCardMeta(tt.file, tt.chunks, tt.isBinary, tt.isDeleted, tt.stats, tt.semanticGroups)
+			if summary != tt.wantSummary {
+				t.Errorf("summary = %q, want %q", summary, tt.wantSummary)
+			}
+			if level != tt.wantLevel {
+				t.Errorf("riskLevel = %q, want %q", level, tt.wantLevel)
+			}
+			if len(reasons) != len(tt.wantReasons) {
+				t.Errorf("riskReasons = %v (len %d), want %v (len %d)", reasons, len(reasons), tt.wantReasons, len(tt.wantReasons))
+			} else {
+				for i := range reasons {
+					if reasons[i] != tt.wantReasons[i] {
+						t.Errorf("riskReasons[%d] = %q, want %q", i, reasons[i], tt.wantReasons[i])
+					}
+				}
+			}
+		})
+	}
+}
+
 // TestNewDiffCardMessage verifies the diff.card message constructor.
 func TestNewDiffCardMessage(t *testing.T) {
 	chunks := []ChunkInfo{
 		{Index: 0, OldStart: 1, OldCount: 3, NewStart: 1, NewCount: 4, Offset: 0, Length: 11},
 	}
 	stats := &DiffStats{ByteSize: 11, LineCount: 1, AddedLines: 1, DeletedLines: 0}
-	msg := NewDiffCardMessage("card-123", "src/main.go", "+added line", chunks, nil, false, false, stats, 1703500000000)
+	msg := NewDiffCardMessage("card-123", "src/main.go", "+added line", chunks, nil, nil, false, false, stats, 1703500000000)
 
 	if msg.Type != MessageTypeDiffCard {
 		t.Errorf("expected type %s, got %s", MessageTypeDiffCard, msg.Type)
@@ -315,6 +527,17 @@ func TestNewDiffCardMessage(t *testing.T) {
 	}
 	if payload.CreatedAt != 1703500000000 {
 		t.Errorf("expected CreatedAt 1703500000000, got %d", payload.CreatedAt)
+	}
+
+	// B1: metadata fields should be populated
+	if payload.Summary != "1 chunks, +1 / -0" {
+		t.Errorf("expected Summary '1 chunks, +1 / -0', got %q", payload.Summary)
+	}
+	if payload.RiskLevel != "low" {
+		t.Errorf("expected RiskLevel 'low', got %q", payload.RiskLevel)
+	}
+	if payload.RiskReasons != nil {
+		t.Errorf("expected nil RiskReasons, got %v", payload.RiskReasons)
 	}
 }
 
@@ -421,7 +644,7 @@ func TestBroadcastDiffCard(t *testing.T) {
 		{Index: 0, OldStart: 1, OldCount: 3, NewStart: 1, NewCount: 4, Offset: 0, Length: 9},
 	}
 	stats := &stream.DiffStats{ByteSize: 9, LineCount: 1, AddedLines: 1, DeletedLines: 0}
-	s.BroadcastDiffCard("card-abc", "file.go", "+new line", chunks, nil, false, false, stats, 1703500000000)
+	s.BroadcastDiffCard("card-abc", "file.go", "+new line", chunks, nil, nil, false, false, stats, 1703500000000)
 
 	msg := readMessage(t, conn)
 	if msg.Type != MessageTypeDiffCard {
@@ -441,6 +664,14 @@ func TestBroadcastDiffCard(t *testing.T) {
 	}
 	if payload["diff"] != "+new line" {
 		t.Errorf("expected diff '+new line', got %v", payload["diff"])
+	}
+
+	// B1: metadata should be present in broadcast JSON
+	if payload["summary"] != "1 chunks, +1 / -0" {
+		t.Errorf("expected summary '1 chunks, +1 / -0', got %v", payload["summary"])
+	}
+	if payload["risk_level"] != "low" {
+		t.Errorf("expected risk_level 'low', got %v", payload["risk_level"])
 	}
 }
 
@@ -1010,8 +1241,8 @@ func TestReconnectHandlerWithPendingCards(t *testing.T) {
 
 	s.SetReconnectHandler(func(sendToClient func(Message)) {
 		// Simulate sending pending cards on reconnect
-		sendToClient(NewDiffCardMessage("card-1", "file1.go", "+line1", nil, nil, false, false, nil, 1000))
-		sendToClient(NewDiffCardMessage("card-2", "file2.go", "+line2", nil, nil, false, false, nil, 2000))
+		sendToClient(NewDiffCardMessage("card-1", "file1.go", "+line1", nil, nil, nil, false, false, nil, 1000))
+		sendToClient(NewDiffCardMessage("card-2", "file2.go", "+line2", nil, nil, nil, false, false, nil, 2000))
 	})
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
@@ -1046,6 +1277,56 @@ func TestReconnectHandlerWithPendingCards(t *testing.T) {
 	}
 	if payload["card_id"] != "card-2" {
 		t.Errorf("expected card_id card-2, got %v", payload["card_id"])
+	}
+}
+
+// TestReconnectHandlerBinaryCardSemanticGroups verifies that binary cards
+// replayed during reconnect include semantic_groups (C2-G1 parity).
+func TestReconnectHandlerBinaryCardSemanticGroups(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	// Simulate reconnect handler that sends a binary card WITH semantic groups,
+	// matching the fixed reconnect path behavior in host.go.
+	s.SetReconnectHandler(func(sendToClient func(Message)) {
+		groups := []SemanticGroupInfo{
+			{GroupID: "sg-binary", Label: "Binary", Kind: "binary",
+				LineStart: 0, LineEnd: 0, ChunkIndexes: []int{0}, RiskLevel: "low"},
+		}
+		sendToClient(NewDiffCardMessage("card-bin", "photo.jpg",
+			"(binary file - content not shown)",
+			nil, nil, groups, true, false, nil, 1000))
+	})
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Read session.status
+	_ = readMessage(t, conn)
+
+	// Read the binary card
+	msg := readMessage(t, conn)
+	if msg.Type != MessageTypeDiffCard {
+		t.Fatalf("expected diff.card, got %s", msg.Type)
+	}
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", msg.Payload)
+	}
+	if isBin, _ := payload["is_binary"].(bool); !isBin {
+		t.Error("expected is_binary=true")
+	}
+	semGroups, ok := payload["semantic_groups"].([]interface{})
+	if !ok || len(semGroups) == 0 {
+		t.Fatal("expected semantic_groups for binary card in reconnect replay")
+	}
+	group0, _ := semGroups[0].(map[string]interface{})
+	if kind, _ := group0["kind"].(string); kind != "binary" {
+		t.Errorf("expected binary kind, got %q", kind)
 	}
 }
 
@@ -1553,7 +1834,7 @@ func TestChunkInfoSerialization(t *testing.T) {
 		{Index: 1, OldStart: 10, OldCount: 2, NewStart: 11, NewCount: 5, Offset: 50, Length: 75},
 	}
 
-	msg := NewDiffCardMessage("card-test", "file.go", "@@ -1,3 +1,4 @@\n+line", chunks, nil, false, false, nil, 1703500000000)
+	msg := NewDiffCardMessage("card-test", "file.go", "@@ -1,3 +1,4 @@\n+line", chunks, nil, nil, false, false, nil, 1703500000000)
 
 	payload, ok := msg.Payload.(DiffCardPayload)
 	if !ok {
@@ -2762,6 +3043,7 @@ func TestNewSessionListMessage(t *testing.T) {
 			LastSeen:   1704070800000,
 			LastCommit: "abc123",
 			Status:     "complete",
+			IsSystem:   true,
 		},
 		{
 			ID:        "session-2",
@@ -2805,10 +3087,16 @@ func TestNewSessionListMessage(t *testing.T) {
 	if s.Status != "complete" {
 		t.Errorf("session 0 Status = %q, want complete", s.Status)
 	}
+	if !s.IsSystem {
+		t.Errorf("session 0 IsSystem = %v, want true", s.IsSystem)
+	}
 
 	// Verify second session has empty LastCommit
 	if payload.Sessions[1].LastCommit != "" {
 		t.Errorf("session 1 LastCommit = %q, want empty", payload.Sessions[1].LastCommit)
+	}
+	if payload.Sessions[1].IsSystem {
+		t.Errorf("session 1 IsSystem = %v, want false", payload.Sessions[1].IsSystem)
 	}
 }
 
@@ -2826,6 +3114,7 @@ func TestSessionsToInfoList(t *testing.T) {
 			LastSeen:   later,
 			LastCommit: "commit1",
 			Status:     "complete",
+			IsSystem:   true,
 		},
 		{
 			ID:        "session-b",
@@ -2856,10 +3145,16 @@ func TestSessionsToInfoList(t *testing.T) {
 	if infos[0].LastCommit != "commit1" {
 		t.Errorf("info 0 LastCommit = %q, want commit1", infos[0].LastCommit)
 	}
+	if !infos[0].IsSystem {
+		t.Errorf("info 0 IsSystem = %v, want true", infos[0].IsSystem)
+	}
 
 	// Verify second session info has empty last commit
 	if infos[1].LastCommit != "" {
 		t.Errorf("info 1 LastCommit = %q, want empty", infos[1].LastCommit)
+	}
+	if infos[1].IsSystem {
+		t.Errorf("info 1 IsSystem = %v, want false", infos[1].IsSystem)
 	}
 }
 
@@ -3015,7 +3310,8 @@ func TestHandleRepoCommitNoGitOps(t *testing.T) {
 	commitReq := map[string]interface{}{
 		"type": "repo.commit",
 		"payload": map[string]interface{}{
-			"message": "Test commit",
+			"request_id": "test-req-commit-nogit",
+			"message":    "Test commit",
 		},
 	}
 	reqData, _ := json.Marshal(commitReq)
@@ -3080,10 +3376,183 @@ func TestHandleRepoCommitInvalidPayload(t *testing.T) {
 	}
 }
 
+func TestHandleRepoCommitReadinessBlocked(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Read session.status
+	_ = readMessage(t, conn)
+
+	// No staged files -> readiness blocked.
+	commitReq := map[string]interface{}{
+		"type": "repo.commit",
+		"payload": map[string]interface{}{
+			"request_id": "test-req-blocked",
+			"message":    "blocked commit",
+		},
+	}
+	reqData, _ := json.Marshal(commitReq)
+	if err := conn.WriteMessage(websocket.TextMessage, reqData); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	msg := readMessage(t, conn)
+	if msg.Type != MessageTypeRepoCommitResult {
+		t.Fatalf("expected repo.commit_result, got %s", msg.Type)
+	}
+
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", msg.Payload)
+	}
+	if payload["success"] != false {
+		t.Errorf("expected success=false, got %v", payload["success"])
+	}
+	if payload["error_code"] != apperrors.CodeCommitReadinessBlocked {
+		t.Errorf("expected error_code %s, got %v", apperrors.CodeCommitReadinessBlocked, payload["error_code"])
+	}
+}
+
+func TestHandleRepoCommitOverrideRequired(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	// Stage one file and keep one unstaged file to trigger risky readiness.
+	stagedFile := filepath.Join(repoDir, "staged.txt")
+	if err := os.WriteFile(stagedFile, []byte("staged content"), 0644); err != nil {
+		t.Fatalf("write staged file failed: %v", err)
+	}
+	runGitForCommitHandlerTest(t, repoDir, "add", "staged.txt")
+	unstagedFile := filepath.Join(repoDir, "unstaged.txt")
+	if err := os.WriteFile(unstagedFile, []byte("unstaged content"), 0644); err != nil {
+		t.Fatalf("write unstaged file failed: %v", err)
+	}
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Read session.status
+	_ = readMessage(t, conn)
+
+	commitReq := map[string]interface{}{
+		"type": "repo.commit",
+		"payload": map[string]interface{}{
+			"request_id": "test-req-override-req",
+			"message":    "override required",
+		},
+	}
+	reqData, _ := json.Marshal(commitReq)
+	if err := conn.WriteMessage(websocket.TextMessage, reqData); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	msg := readMessage(t, conn)
+	if msg.Type != MessageTypeRepoCommitResult {
+		t.Fatalf("expected repo.commit_result, got %s", msg.Type)
+	}
+
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", msg.Payload)
+	}
+	if payload["success"] != false {
+		t.Errorf("expected success=false, got %v", payload["success"])
+	}
+	if payload["error_code"] != apperrors.CodeCommitOverrideRequired {
+		t.Errorf("expected error_code %s, got %v", apperrors.CodeCommitOverrideRequired, payload["error_code"])
+	}
+}
+
+func TestHandleRepoCommitOverrideAccepted(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	// Stage one file and keep one unstaged file to trigger risky readiness.
+	stagedFile := filepath.Join(repoDir, "staged.txt")
+	if err := os.WriteFile(stagedFile, []byte("staged content"), 0644); err != nil {
+		t.Fatalf("write staged file failed: %v", err)
+	}
+	runGitForCommitHandlerTest(t, repoDir, "add", "staged.txt")
+	unstagedFile := filepath.Join(repoDir, "unstaged.txt")
+	if err := os.WriteFile(unstagedFile, []byte("unstaged content"), 0644); err != nil {
+		t.Fatalf("write unstaged file failed: %v", err)
+	}
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Read session.status
+	_ = readMessage(t, conn)
+
+	commitReq := map[string]interface{}{
+		"type": "repo.commit",
+		"payload": map[string]interface{}{
+			"request_id":        "test-req-override-acc",
+			"message":           "override accepted",
+			"override_warnings": true,
+		},
+	}
+	reqData, _ := json.Marshal(commitReq)
+	if err := conn.WriteMessage(websocket.TextMessage, reqData); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	msg := readMessage(t, conn)
+	if msg.Type != MessageTypeRepoCommitResult {
+		t.Fatalf("expected repo.commit_result, got %s", msg.Type)
+	}
+
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", msg.Payload)
+	}
+	if payload["success"] != true {
+		t.Errorf("expected success=true, got %v", payload["success"])
+	}
+	if payload["hash"] == "" {
+		t.Error("expected non-empty commit hash")
+	}
+}
+
 // TestNewRepoStatusMessage tests the repo.status message constructor.
 func TestNewRepoStatusMessage(t *testing.T) {
 	stagedFiles := []string{"file1.txt", "dir/file2.txt"}
-	msg := NewRepoStatusMessage("main", "origin/main", 2, stagedFiles, 5, "abc1234 Add feature")
+	msg := NewRepoStatusMessage(
+		"main",
+		"origin/main",
+		2,
+		stagedFiles,
+		5,
+		"abc1234 Add feature",
+		"risky",
+		[]string{},
+		[]string{"unstaged_changes_present"},
+		[]string{"Review or stage unstaged changes, or commit anyway to include only staged files."},
+	)
 
 	if msg.Type != MessageTypeRepoStatus {
 		t.Errorf("expected type %s, got %s", MessageTypeRepoStatus, msg.Type)
@@ -3115,12 +3584,49 @@ func TestNewRepoStatusMessage(t *testing.T) {
 	if payload.LastCommit != "abc1234 Add feature" {
 		t.Errorf("expected LastCommit 'abc1234 Add feature', got %s", payload.LastCommit)
 	}
+	if payload.ReadinessState != "risky" {
+		t.Errorf("expected ReadinessState risky, got %s", payload.ReadinessState)
+	}
+	if len(payload.ReadinessWarnings) != 1 || payload.ReadinessWarnings[0] != "unstaged_changes_present" {
+		t.Errorf("expected ReadinessWarnings [unstaged_changes_present], got %v", payload.ReadinessWarnings)
+	}
+	if len(payload.ReadinessActions) != 1 {
+		t.Errorf("expected 1 ReadinessAction, got %d", len(payload.ReadinessActions))
+	}
+}
+
+func setupGitRepoForCommitHandlerTest(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	runGitForCommitHandlerTest(t, dir, "init")
+	runGitForCommitHandlerTest(t, dir, "config", "user.email", "test@example.com")
+	runGitForCommitHandlerTest(t, dir, "config", "user.name", "Test User")
+
+	initialFile := filepath.Join(dir, "initial.txt")
+	if err := os.WriteFile(initialFile, []byte("initial content"), 0644); err != nil {
+		t.Fatalf("write initial file failed: %v", err)
+	}
+	runGitForCommitHandlerTest(t, dir, "add", "initial.txt")
+	runGitForCommitHandlerTest(t, dir, "commit", "-m", "initial")
+
+	return dir
+}
+
+func runGitForCommitHandlerTest(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
+	}
 }
 
 // TestNewRepoCommitResultMessage tests the repo.commit_result message constructor.
 func TestNewRepoCommitResultMessage(t *testing.T) {
 	// Test success case
-	msg := NewRepoCommitResultMessage(true, "abc1234", "1 file changed", "", "")
+	msg := NewRepoCommitResultMessage("test-req-commit", true, "abc1234", "1 file changed", "", "")
 
 	if msg.Type != MessageTypeRepoCommitResult {
 		t.Errorf("expected type %s, got %s", MessageTypeRepoCommitResult, msg.Type)
@@ -3131,6 +3637,9 @@ func TestNewRepoCommitResultMessage(t *testing.T) {
 		t.Fatalf("expected RepoCommitResultPayload, got %T", msg.Payload)
 	}
 
+	if payload.RequestID != "test-req-commit" {
+		t.Errorf("expected RequestID test-req-commit, got %s", payload.RequestID)
+	}
 	if !payload.Success {
 		t.Error("expected Success true")
 	}
@@ -3150,7 +3659,7 @@ func TestNewRepoCommitResultMessage(t *testing.T) {
 
 // TestNewRepoCommitResultMessageError tests error case.
 func TestNewRepoCommitResultMessageError(t *testing.T) {
-	msg := NewRepoCommitResultMessage(false, "", "", "commit.no_staged_changes", "nothing to commit")
+	msg := NewRepoCommitResultMessage("test-req-err", false, "", "", "commit.no_staged_changes", "nothing to commit")
 
 	payload, ok := msg.Payload.(RepoCommitResultPayload)
 	if !ok {
@@ -3192,8 +3701,9 @@ func TestHandleRepoPushNoGitOps(t *testing.T) {
 	pushReq := map[string]interface{}{
 		"type": "repo.push",
 		"payload": map[string]interface{}{
-			"remote": "origin",
-			"branch": "main",
+			"request_id": "test-req-push-nogit",
+			"remote":     "origin",
+			"branch":     "main",
 		},
 	}
 	reqData, _ := json.Marshal(pushReq)
@@ -3261,7 +3771,7 @@ func TestHandleRepoPushInvalidPayload(t *testing.T) {
 // TestNewRepoPushResultMessage tests the repo.push_result message constructor.
 func TestNewRepoPushResultMessage(t *testing.T) {
 	// Test success case
-	msg := NewRepoPushResultMessage(true, "To origin/main abc1234..def5678", "", "")
+	msg := NewRepoPushResultMessage("test-req-push", true, "To origin/main abc1234..def5678", "", "")
 
 	if msg.Type != MessageTypeRepoPushResult {
 		t.Errorf("expected type %s, got %s", MessageTypeRepoPushResult, msg.Type)
@@ -3272,6 +3782,9 @@ func TestNewRepoPushResultMessage(t *testing.T) {
 		t.Fatalf("expected RepoPushResultPayload, got %T", msg.Payload)
 	}
 
+	if payload.RequestID != "test-req-push" {
+		t.Errorf("expected RequestID test-req-push, got %s", payload.RequestID)
+	}
 	if !payload.Success {
 		t.Error("expected Success true")
 	}
@@ -3288,7 +3801,7 @@ func TestNewRepoPushResultMessage(t *testing.T) {
 
 // TestNewRepoPushResultMessageError tests error case.
 func TestNewRepoPushResultMessageError(t *testing.T) {
-	msg := NewRepoPushResultMessage(false, "", "push.no_upstream", "no upstream configured")
+	msg := NewRepoPushResultMessage("test-req-err", false, "", "push.no_upstream", "no upstream configured")
 
 	payload, ok := msg.Payload.(RepoPushResultPayload)
 	if !ok {
@@ -3306,6 +3819,719 @@ func TestNewRepoPushResultMessageError(t *testing.T) {
 	}
 	if payload.Error != "no upstream configured" {
 		t.Errorf("expected Error 'no upstream configured', got %s", payload.Error)
+	}
+}
+
+// =============================================================================
+// P9U0: Commit/Push Request Correlation Tests
+// =============================================================================
+
+func TestHandleRepoCommit(t *testing.T) {
+	t.Run("success_echoes_request_id", func(t *testing.T) {
+		repoDir := setupGitRepoForCommitHandlerTest(t)
+		stagedFile := filepath.Join(repoDir, "staged.txt")
+		os.WriteFile(stagedFile, []byte("staged"), 0644)
+		runGitForCommitHandlerTest(t, repoDir, "add", "staged.txt")
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn) // session.status
+
+		msg := map[string]interface{}{
+			"type": "repo.commit",
+			"payload": map[string]interface{}{
+				"request_id": "commit-1",
+				"message":    "test commit",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		if resp.Type != MessageTypeRepoCommitResult {
+			t.Fatalf("expected repo.commit_result, got %s", resp.Type)
+		}
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != true {
+			t.Fatalf("expected success=true, got error: %v", payload["error"])
+		}
+		if payload["request_id"] != "commit-1" {
+			t.Errorf("expected request_id commit-1, got %v", payload["request_id"])
+		}
+	})
+
+	t.Run("missing_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.commit",
+			"payload": map[string]interface{}{
+				"message": "no request id",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("empty_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.commit",
+			"payload": map[string]interface{}{
+				"request_id": "   ",
+				"message":    "empty request id",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("non_string_request_id_preserves_raw_value", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.commit",
+			"payload": map[string]interface{}{
+				"request_id": 123,
+				"message":    "non-string request id",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "123" {
+			t.Errorf("expected raw request_id echoed as string, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+}
+
+func TestHandleRepoPush(t *testing.T) {
+	t.Run("missing_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.push",
+			"payload": map[string]interface{}{
+				"remote": "origin",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("non_string_request_id_preserves_raw_value", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.push",
+			"payload": map[string]interface{}{
+				"request_id": 456,
+				"remote":     "origin",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "456" {
+			t.Errorf("expected raw request_id echoed as string, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+}
+
+func TestHandleRepoCommit_RequesterOnly(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+	stagedFile := filepath.Join(repoDir, "staged.txt")
+	os.WriteFile(stagedFile, []byte("staged"), 0644)
+	runGitForCommitHandlerTest(t, repoDir, "add", "staged.txt")
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	msg := map[string]interface{}{
+		"type": "repo.commit",
+		"payload": map[string]interface{}{
+			"request_id": "requester-commit",
+			"message":    "requester only test",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoCommitResult {
+		t.Fatalf("client 1 expected repo.commit_result, got %s", resp1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.commit_result")
+	}
+}
+
+func TestHandleRepoPush_RequesterOnly(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	// Push will fail (no remote), but result should still be requester-only
+	msg := map[string]interface{}{
+		"type": "repo.push",
+		"payload": map[string]interface{}{
+			"request_id": "requester-push",
+			"remote":     "origin",
+			"branch":     "main",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoPushResult {
+		t.Fatalf("client 1 expected repo.push_result, got %s", resp1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.push_result")
+	}
+}
+
+func TestHandleRepoCommit_Idempotency(t *testing.T) {
+	t.Run("replay", func(t *testing.T) {
+		repoDir := setupGitRepoForCommitHandlerTest(t)
+		stagedFile := filepath.Join(repoDir, "staged.txt")
+		os.WriteFile(stagedFile, []byte("staged"), 0644)
+		runGitForCommitHandlerTest(t, repoDir, "add", "staged.txt")
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.commit",
+			"payload": map[string]interface{}{
+				"request_id": "idem-commit",
+				"message":    "idem test",
+			},
+		}
+		data, _ := json.Marshal(msg)
+
+		// First request
+		conn.WriteMessage(websocket.TextMessage, data)
+		resp1 := readMessage(t, conn)
+		p1, _ := resp1.Payload.(map[string]interface{})
+		if p1["success"] != true {
+			t.Fatalf("first commit failed: %v", p1["error"])
+		}
+
+		// Replay same request
+		conn.WriteMessage(websocket.TextMessage, data)
+		resp2 := readMessage(t, conn)
+		p2, _ := resp2.Payload.(map[string]interface{})
+		if p2["success"] != true {
+			t.Fatalf("replay should succeed: %v", p2["error"])
+		}
+		if p2["request_id"] != "idem-commit" {
+			t.Errorf("expected request_id idem-commit, got %v", p2["request_id"])
+		}
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		repoDir := setupGitRepoForCommitHandlerTest(t)
+		stagedFile := filepath.Join(repoDir, "staged.txt")
+		os.WriteFile(stagedFile, []byte("staged"), 0644)
+		runGitForCommitHandlerTest(t, repoDir, "add", "staged.txt")
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		// First request
+		msg1 := map[string]interface{}{
+			"type": "repo.commit",
+			"payload": map[string]interface{}{
+				"request_id": "idem-commit-mm",
+				"message":    "message A",
+			},
+		}
+		data1, _ := json.Marshal(msg1)
+		conn.WriteMessage(websocket.TextMessage, data1)
+		readMessage(t, conn) // consume result
+
+		// Same request_id, different message
+		msg2 := map[string]interface{}{
+			"type": "repo.commit",
+			"payload": map[string]interface{}{
+				"request_id": "idem-commit-mm",
+				"message":    "message B",
+			},
+		}
+		data2, _ := json.Marshal(msg2)
+		conn.WriteMessage(websocket.TextMessage, data2)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false for mismatch")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+}
+
+func TestHandleRepoPush_Idempotency(t *testing.T) {
+	t.Run("replay", func(t *testing.T) {
+		repoDir := setupGitRepoForCommitHandlerTest(t)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		// Push will fail (no remote), but the failure should be cached for replay
+		msg := map[string]interface{}{
+			"type": "repo.push",
+			"payload": map[string]interface{}{
+				"request_id": "idem-push",
+				"remote":     "origin",
+				"branch":     "main",
+			},
+		}
+		data, _ := json.Marshal(msg)
+
+		// First request
+		conn.WriteMessage(websocket.TextMessage, data)
+		resp1 := readMessage(t, conn)
+		p1, _ := resp1.Payload.(map[string]interface{})
+
+		// Replay same request
+		conn.WriteMessage(websocket.TextMessage, data)
+		resp2 := readMessage(t, conn)
+		p2, _ := resp2.Payload.(map[string]interface{})
+
+		// Both results should match
+		if p1["success"] != p2["success"] {
+			t.Errorf("replay success mismatch: first=%v replay=%v", p1["success"], p2["success"])
+		}
+		if p2["request_id"] != "idem-push" {
+			t.Errorf("expected request_id idem-push, got %v", p2["request_id"])
+		}
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		repoDir := setupGitRepoForCommitHandlerTest(t)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		// First request
+		msg1 := map[string]interface{}{
+			"type": "repo.push",
+			"payload": map[string]interface{}{
+				"request_id": "idem-push-mm",
+				"remote":     "origin",
+				"branch":     "main",
+			},
+		}
+		data1, _ := json.Marshal(msg1)
+		conn.WriteMessage(websocket.TextMessage, data1)
+		readMessage(t, conn)
+
+		// Same request_id, different branch
+		msg2 := map[string]interface{}{
+			"type": "repo.push",
+			"payload": map[string]interface{}{
+				"request_id":       "idem-push-mm",
+				"remote":           "origin",
+				"branch":           "develop",
+				"force_with_lease": true,
+			},
+		}
+		data2, _ := json.Marshal(msg2)
+		conn.WriteMessage(websocket.TextMessage, data2)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false for mismatch")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+}
+
+func TestHandleRepoCommit_InFlightCoalesce(t *testing.T) {
+	client := &Client{
+		send:   make(chan Message, 4),
+		done:   make(chan struct{}),
+		server: NewServer("unused"),
+	}
+
+	requestID := "in-flight-commit-1"
+	fingerprint := commitFingerprint("in-flight commit", false, false, false)
+	resultMsg := NewRepoCommitResultMessage(requestID, true, "abc123", "1 file changed", "", "")
+
+	// First request becomes the in-flight owner.
+	if _, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoCommit, requestID, fingerprint); err != nil {
+		t.Fatalf("first idempotencyCheckOrBegin failed: %v", err)
+	} else if replay {
+		t.Fatal("first request should not replay from cache")
+	} else if inFlight != nil {
+		t.Fatal("first request should not coalesce onto existing in-flight entry")
+	}
+
+	// Exact duplicate should coalesce and wait for completion.
+	_, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoCommit, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("duplicate idempotencyCheckOrBegin failed: %v", err)
+	}
+	if replay {
+		t.Fatal("duplicate should not replay before owner completes")
+	}
+	if inFlight == nil {
+		t.Fatal("duplicate should coalesce onto in-flight request")
+	}
+
+	// Mismatch while in-flight remains invalid.
+	if _, _, _, mismatchErr := client.idempotencyCheckOrBegin(
+		MessageTypeRepoCommit,
+		requestID,
+		commitFingerprint("different commit message", false, false, false),
+	); mismatchErr == nil {
+		t.Fatal("expected mismatch error for same request_id with different fingerprint while in-flight")
+	}
+
+	// Owner completes; coalesced duplicate observes exact final result.
+	client.idempotencyComplete(MessageTypeRepoCommit, requestID, fingerprint, resultMsg)
+	select {
+	case <-inFlight.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight completion")
+	}
+	if inFlight.Result.Type != MessageTypeRepoCommitResult {
+		t.Fatalf("expected result type %s, got %s", MessageTypeRepoCommitResult, inFlight.Result.Type)
+	}
+	payload, ok := inFlight.Result.Payload.(RepoCommitResultPayload)
+	if !ok {
+		t.Fatalf("expected RepoCommitResultPayload, got %T", inFlight.Result.Payload)
+	}
+	if payload.RequestID != requestID {
+		t.Fatalf("expected request_id %s, got %s", requestID, payload.RequestID)
+	}
+	if !payload.Success {
+		t.Fatal("expected success=true")
+	}
+
+	// Any later duplicate should replay from completed cache.
+	cached, replay, waiting, err := client.idempotencyCheckOrBegin(MessageTypeRepoCommit, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("replay idempotencyCheckOrBegin failed: %v", err)
+	}
+	if !replay {
+		t.Fatal("expected completed replay hit")
+	}
+	if waiting != nil {
+		t.Fatal("expected no in-flight entry after completion")
+	}
+	if cached.Type != MessageTypeRepoCommitResult {
+		t.Fatalf("expected replay type %s, got %s", MessageTypeRepoCommitResult, cached.Type)
+	}
+}
+
+func TestHandleRepoPush_InFlightCoalesce(t *testing.T) {
+	client := &Client{
+		send:   make(chan Message, 4),
+		done:   make(chan struct{}),
+		server: NewServer("unused"),
+	}
+
+	requestID := "in-flight-push-1"
+	fingerprint := pushFingerprint("origin", "main", false)
+	resultMsg := NewRepoPushResultMessage(requestID, true, "To origin/main", "", "")
+
+	// First request becomes the in-flight owner.
+	if _, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoPush, requestID, fingerprint); err != nil {
+		t.Fatalf("first idempotencyCheckOrBegin failed: %v", err)
+	} else if replay {
+		t.Fatal("first request should not replay from cache")
+	} else if inFlight != nil {
+		t.Fatal("first request should not coalesce onto existing in-flight entry")
+	}
+
+	// Exact duplicate should coalesce and wait for completion.
+	_, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoPush, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("duplicate idempotencyCheckOrBegin failed: %v", err)
+	}
+	if replay {
+		t.Fatal("duplicate should not replay before owner completes")
+	}
+	if inFlight == nil {
+		t.Fatal("duplicate should coalesce onto in-flight request")
+	}
+
+	// Mismatch while in-flight remains invalid.
+	if _, _, _, mismatchErr := client.idempotencyCheckOrBegin(
+		MessageTypeRepoPush,
+		requestID,
+		pushFingerprint("origin", "develop", true),
+	); mismatchErr == nil {
+		t.Fatal("expected mismatch error for same request_id with different fingerprint while in-flight")
+	}
+
+	// Owner completes; coalesced duplicate observes exact final result.
+	client.idempotencyComplete(MessageTypeRepoPush, requestID, fingerprint, resultMsg)
+	select {
+	case <-inFlight.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight completion")
+	}
+	if inFlight.Result.Type != MessageTypeRepoPushResult {
+		t.Fatalf("expected result type %s, got %s", MessageTypeRepoPushResult, inFlight.Result.Type)
+	}
+	payload, ok := inFlight.Result.Payload.(RepoPushResultPayload)
+	if !ok {
+		t.Fatalf("expected RepoPushResultPayload, got %T", inFlight.Result.Payload)
+	}
+	if payload.RequestID != requestID {
+		t.Fatalf("expected request_id %s, got %s", requestID, payload.RequestID)
+	}
+	if !payload.Success {
+		t.Fatal("expected success=true")
+	}
+
+	// Any later duplicate should replay from completed cache.
+	cached, replay, waiting, err := client.idempotencyCheckOrBegin(MessageTypeRepoPush, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("replay idempotencyCheckOrBegin failed: %v", err)
+	}
+	if !replay {
+		t.Fatal("expected completed replay hit")
+	}
+	if waiting != nil {
+		t.Fatal("expected no in-flight entry after completion")
+	}
+	if cached.Type != MessageTypeRepoPushResult {
+		t.Fatalf("expected replay type %s, got %s", MessageTypeRepoPushResult, cached.Type)
+	}
+}
+
+func TestHandleRepoCommitPush_CrossOpIsolation(t *testing.T) {
+	// Same request_id across commit and push should be independent
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+	stagedFile := filepath.Join(repoDir, "staged.txt")
+	os.WriteFile(stagedFile, []byte("staged"), 0644)
+	runGitForCommitHandlerTest(t, repoDir, "add", "staged.txt")
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	sharedID := "shared-req-id"
+
+	// Commit with shared ID
+	commitMsg := map[string]interface{}{
+		"type": "repo.commit",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+			"message":    "cross-op test",
+		},
+	}
+	commitData, _ := json.Marshal(commitMsg)
+	conn.WriteMessage(websocket.TextMessage, commitData)
+	commitResp := readMessage(t, conn)
+	commitP, _ := commitResp.Payload.(map[string]interface{})
+	if commitP["success"] != true {
+		t.Fatalf("commit failed: %v", commitP["error"])
+	}
+
+	// Push with same request_id should NOT be treated as replay of commit
+	pushMsg := map[string]interface{}{
+		"type": "repo.push",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+			"remote":     "origin",
+		},
+	}
+	pushData, _ := json.Marshal(pushMsg)
+	conn.WriteMessage(websocket.TextMessage, pushData)
+	pushResp := readMessage(t, conn)
+	if pushResp.Type != MessageTypeRepoPushResult {
+		t.Fatalf("expected repo.push_result, got %s", pushResp.Type)
 	}
 }
 
@@ -3376,6 +4602,28 @@ func TestNewSessionClosedMessageNoReason(t *testing.T) {
 
 	if payload.Reason != "" {
 		t.Errorf("expected empty Reason, got %s", payload.Reason)
+	}
+}
+
+// TestNewSessionClearHistoryResultMessage verifies clear-history result constructor.
+func TestNewSessionClearHistoryResultMessage(t *testing.T) {
+	msg := NewSessionClearHistoryResultMessage("req-1", true, 3, "", "")
+	if msg.Type != MessageTypeSessionClearHistoryResult {
+		t.Errorf("expected type %s, got %s", MessageTypeSessionClearHistoryResult, msg.Type)
+	}
+
+	payload, ok := msg.Payload.(SessionClearHistoryResultPayload)
+	if !ok {
+		t.Fatalf("expected SessionClearHistoryResultPayload, got %T", msg.Payload)
+	}
+	if payload.RequestID != "req-1" {
+		t.Errorf("RequestID = %q, want req-1", payload.RequestID)
+	}
+	if !payload.Success {
+		t.Error("expected success=true")
+	}
+	if payload.ClearedCount != 3 {
+		t.Errorf("ClearedCount = %d, want 3", payload.ClearedCount)
 	}
 }
 
@@ -3483,6 +4731,20 @@ func TestSessionPayloadSerialization(t *testing.T) {
 				CursorCol: 10,
 			},
 		},
+		{
+			name: "SessionClearHistoryPayload",
+			payload: SessionClearHistoryPayload{
+				RequestID: "req-1",
+			},
+		},
+		{
+			name: "SessionClearHistoryResultPayload",
+			payload: SessionClearHistoryResultPayload{
+				RequestID:    "req-1",
+				Success:      true,
+				ClearedCount: 2,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -3521,12 +4783,372 @@ func TestSessionMessageTypeValues(t *testing.T) {
 		{MessageTypeSessionSwitch, "session.switch"},
 		{MessageTypeSessionRename, "session.rename"},
 		{MessageTypeSessionBuffer, "session.buffer"},
+		{MessageTypeSessionClearHistory, "session.clear_history"},
+		{MessageTypeSessionClearHistoryResult, "session.clear_history_result"},
 	}
 
 	for _, tt := range tests {
 		if string(tt.msgType) != tt.expected {
 			t.Errorf("expected %s, got %s", tt.expected, tt.msgType)
 		}
+	}
+}
+
+func TestHandleSessionClearHistoryMissingRequestID(t *testing.T) {
+	s := NewServer(":0")
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+	s.SetSessionStore(store)
+
+	errCh := s.StartAsync()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer s.Stop()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleWebSocket(w, r)
+	}))
+	defer ts.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = readMessage(t, conn) // session.status
+
+	msg := map[string]interface{}{
+		"type": "session.clear_history",
+		"payload": map[string]interface{}{
+			"request_id": "",
+		},
+	}
+	if err := conn.WriteJSON(msg); err != nil {
+		t.Fatalf("Failed to send message: %v", err)
+	}
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeError {
+		t.Fatalf("expected error, got %s", resp.Type)
+	}
+	payload := resp.Payload.(map[string]interface{})
+	if payload["code"] != apperrors.CodeServerInvalidMessage {
+		t.Fatalf("expected code %s, got %v", apperrors.CodeServerInvalidMessage, payload["code"])
+	}
+}
+
+func TestHandleSessionClearHistorySuccessBroadcastsSessionList(t *testing.T) {
+	s := NewServer(":0")
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+	s.SetSessionStore(store)
+
+	now := time.Now().Truncate(time.Millisecond)
+	if err := store.SaveSession(&storage.Session{
+		ID:        "running-1",
+		Repo:      "/tmp/repo",
+		Branch:    "main",
+		StartedAt: now,
+		LastSeen:  now,
+		Status:    storage.SessionStatusRunning,
+	}); err != nil {
+		t.Fatalf("SaveSession running failed: %v", err)
+	}
+	if err := store.SaveSession(&storage.Session{
+		ID:        "complete-1",
+		Repo:      "/tmp/repo",
+		Branch:    "main",
+		StartedAt: now.Add(time.Minute),
+		LastSeen:  now.Add(time.Minute),
+		Status:    storage.SessionStatusComplete,
+	}); err != nil {
+		t.Fatalf("SaveSession complete failed: %v", err)
+	}
+	if err := store.SaveSession(&storage.Session{
+		ID:        "system-complete",
+		Repo:      "/tmp/repo",
+		Branch:    "main",
+		StartedAt: now.Add(2 * time.Minute),
+		LastSeen:  now.Add(2 * time.Minute),
+		Status:    storage.SessionStatusComplete,
+		IsSystem:  true,
+	}); err != nil {
+		t.Fatalf("SaveSession system complete failed: %v", err)
+	}
+
+	errCh := s.StartAsync()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer s.Stop()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleWebSocket(w, r)
+	}))
+	defer ts.Close()
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("conn1 dial failed: %v", err)
+	}
+	defer conn1.Close()
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("conn2 dial failed: %v", err)
+	}
+	defer conn2.Close()
+
+	_ = readMessage(t, conn1) // session.status
+	_ = readMessage(t, conn2) // session.status
+
+	if err := conn1.WriteJSON(map[string]interface{}{
+		"type": "session.clear_history",
+		"payload": map[string]interface{}{
+			"request_id": "req-clear-1",
+		},
+	}); err != nil {
+		t.Fatalf("send clear history failed: %v", err)
+	}
+
+	first := readMessage(t, conn1)
+	if first.Type != MessageTypeSessionClearHistoryResult {
+		t.Fatalf("expected clear_history_result first for requester, got %s", first.Type)
+	}
+	firstPayload := first.Payload.(map[string]interface{})
+	if firstPayload["request_id"] != "req-clear-1" {
+		t.Fatalf("unexpected request_id: %v", firstPayload["request_id"])
+	}
+	if ok, _ := firstPayload["success"].(bool); !ok {
+		t.Fatalf("expected success=true, got %v", firstPayload["success"])
+	}
+	if got := int(firstPayload["cleared_count"].(float64)); got != 1 {
+		t.Fatalf("cleared_count = %d, want 1", got)
+	}
+
+	// Both clients should receive a refreshed session.list:
+	// archived non-system rows are cleared, archived system rows remain.
+	list1 := readMessage(t, conn1)
+	if list1.Type != MessageTypeSessionList {
+		t.Fatalf("requester expected session.list after result, got %s", list1.Type)
+	}
+	list2 := readMessage(t, conn2)
+	if list2.Type != MessageTypeSessionList {
+		t.Fatalf("other client expected session.list broadcast, got %s", list2.Type)
+	}
+
+	for _, msg := range []Message{list1, list2} {
+		payload := msg.Payload.(map[string]interface{})
+		sessions := payload["sessions"].([]interface{})
+		if len(sessions) != 2 {
+			t.Fatalf("expected 2 remaining sessions, got %d", len(sessions))
+		}
+
+		var runningEntry map[string]interface{}
+		var systemEntry map[string]interface{}
+		for _, raw := range sessions {
+			entry := raw.(map[string]interface{})
+			switch entry["id"] {
+			case "running-1":
+				runningEntry = entry
+			case "system-complete":
+				systemEntry = entry
+			}
+		}
+
+		if runningEntry == nil {
+			t.Fatalf("expected running-1 in refreshed session list, got %#v", sessions)
+		}
+		if _, ok := runningEntry["is_system"]; ok {
+			t.Fatalf("running-1 should omit is_system when false, got %v", runningEntry["is_system"])
+		}
+		if systemEntry == nil {
+			t.Fatalf("expected system-complete in refreshed session list, got %#v", sessions)
+		}
+		if isSystem, ok := systemEntry["is_system"].(bool); !ok || !isSystem {
+			t.Fatalf("system-complete is_system = %v (ok=%v), want true", systemEntry["is_system"], ok)
+		}
+	}
+}
+
+// TestFileMessageTypeValues verifies the file protocol wire format strings.
+func TestFileMessageTypeValues(t *testing.T) {
+	tests := []struct {
+		msgType  MessageType
+		expected string
+	}{
+		{MessageTypeFileList, "file.list"},
+		{MessageTypeFileListResult, "file.list_result"},
+		{MessageTypeFileRead, "file.read"},
+		{MessageTypeFileReadResult, "file.read_result"},
+		{MessageTypeFileWrite, "file.write"},
+		{MessageTypeFileWriteResult, "file.write_result"},
+		{MessageTypeFileCreate, "file.create"},
+		{MessageTypeFileCreateResult, "file.create_result"},
+		{MessageTypeFileDelete, "file.delete"},
+		{MessageTypeFileDeleteResult, "file.delete_result"},
+		{MessageTypeFileWatch, "file.watch"},
+	}
+
+	for _, tt := range tests {
+		if string(tt.msgType) != tt.expected {
+			t.Errorf("expected %s, got %s", tt.expected, tt.msgType)
+		}
+	}
+}
+
+// TestFileListResultPayload_MarshalContractShape verifies the list result
+// payload keeps required success fields and omits success-only fields on failure.
+func TestFileListResultPayload_MarshalContractShape(t *testing.T) {
+	successPayload := FileListResultPayload{
+		RequestID: "req-1",
+		Path:      ".",
+		Success:   true,
+		Entries:   []FileEntry{},
+	}
+	successJSON, err := json.Marshal(successPayload)
+	if err != nil {
+		t.Fatalf("marshal success payload: %v", err)
+	}
+	if !strings.Contains(string(successJSON), `"entries":[]`) {
+		t.Fatalf("expected success payload to include empty entries array, got %s", string(successJSON))
+	}
+
+	failurePayload := FileListResultPayload{
+		RequestID: "req-2",
+		Path:      ".",
+		Success:   false,
+		ErrorCode: "action.invalid",
+		Error:     "bad path",
+	}
+	failureJSON, err := json.Marshal(failurePayload)
+	if err != nil {
+		t.Fatalf("marshal failure payload: %v", err)
+	}
+	if strings.Contains(string(failureJSON), `"entries"`) {
+		t.Fatalf("expected failure payload to omit entries, got %s", string(failureJSON))
+	}
+}
+
+// TestFileReadResultPayload_MarshalContractShape verifies the read result
+// payload keeps required success fields and omits success-only fields on failure.
+func TestFileReadResultPayload_MarshalContractShape(t *testing.T) {
+	successPayload := FileReadResultPayload{
+		RequestID: "req-1",
+		Path:      "empty.txt",
+		Success:   true,
+		Content:   "",
+		Encoding:  "utf-8",
+		Version:   "sha256:abc",
+	}
+	successJSON, err := json.Marshal(successPayload)
+	if err != nil {
+		t.Fatalf("marshal success payload: %v", err)
+	}
+	if !strings.Contains(string(successJSON), `"content":""`) {
+		t.Fatalf("expected success payload to include empty content string, got %s", string(successJSON))
+	}
+
+	failurePayload := FileReadResultPayload{
+		RequestID: "req-2",
+		Path:      "missing.txt",
+		Success:   false,
+		ErrorCode: "storage.not_found",
+		Error:     "missing",
+	}
+	failureJSON, err := json.Marshal(failurePayload)
+	if err != nil {
+		t.Fatalf("marshal failure payload: %v", err)
+	}
+	if strings.Contains(string(failureJSON), `"content"`) {
+		t.Fatalf("expected failure payload to omit content, got %s", string(failureJSON))
+	}
+}
+
+// TestRepoHistoryResultPayload_MarshalContractShape verifies the history result
+// payload keeps required success fields and omits success-only fields on failure.
+func TestRepoHistoryResultPayload_MarshalContractShape(t *testing.T) {
+	successPayload := RepoHistoryResultPayload{
+		RequestID: "req-1",
+		Success:   true,
+		Entries:   nil, // Success payload must still emit an empty array.
+	}
+	successJSON, err := json.Marshal(successPayload)
+	if err != nil {
+		t.Fatalf("marshal success payload: %v", err)
+	}
+	if !strings.Contains(string(successJSON), `"entries":[]`) {
+		t.Fatalf("expected success payload to include empty entries array, got %s", string(successJSON))
+	}
+
+	failurePayload := RepoHistoryResultPayload{
+		RequestID: "req-2",
+		Success:   false,
+		ErrorCode: apperrors.CodeServerInvalidMessage,
+		Error:     "invalid cursor",
+	}
+	failureJSON, err := json.Marshal(failurePayload)
+	if err != nil {
+		t.Fatalf("marshal failure payload: %v", err)
+	}
+	if strings.Contains(string(failureJSON), `"entries"`) {
+		t.Fatalf("expected failure payload to omit entries, got %s", string(failureJSON))
+	}
+	if strings.Contains(string(failureJSON), `"next_cursor"`) {
+		t.Fatalf("expected failure payload to omit next_cursor, got %s", string(failureJSON))
+	}
+}
+
+// TestRepoBranchesResultPayload_MarshalContractShape verifies the branches result
+// payload keeps required success fields and omits success-only fields on failure.
+func TestRepoBranchesResultPayload_MarshalContractShape(t *testing.T) {
+	successPayload := RepoBranchesResultPayload{
+		RequestID:     "req-1",
+		Success:       true,
+		CurrentBranch: "main",
+		Local:         nil, // Success payload must still emit an empty array.
+		TrackedRemote: nil, // Success payload must still emit an empty array.
+	}
+	successJSON, err := json.Marshal(successPayload)
+	if err != nil {
+		t.Fatalf("marshal success payload: %v", err)
+	}
+	if !strings.Contains(string(successJSON), `"local":[]`) {
+		t.Fatalf("expected success payload to include empty local array, got %s", string(successJSON))
+	}
+	if !strings.Contains(string(successJSON), `"tracked_remote":[]`) {
+		t.Fatalf("expected success payload to include empty tracked_remote array, got %s", string(successJSON))
+	}
+	if !strings.Contains(string(successJSON), `"current_branch":"main"`) {
+		t.Fatalf("expected success payload to include current_branch, got %s", string(successJSON))
+	}
+
+	failurePayload := RepoBranchesResultPayload{
+		RequestID: "req-2",
+		Success:   false,
+		ErrorCode: apperrors.CodeServerInvalidMessage,
+		Error:     "request_id is required",
+	}
+	failureJSON, err := json.Marshal(failurePayload)
+	if err != nil {
+		t.Fatalf("marshal failure payload: %v", err)
+	}
+	if strings.Contains(string(failureJSON), `"local"`) {
+		t.Fatalf("expected failure payload to omit local, got %s", string(failureJSON))
+	}
+	if strings.Contains(string(failureJSON), `"tracked_remote"`) {
+		t.Fatalf("expected failure payload to omit tracked_remote, got %s", string(failureJSON))
+	}
+	if strings.Contains(string(failureJSON), `"current_branch"`) {
+		t.Fatalf("expected failure payload to omit current_branch, got %s", string(failureJSON))
 	}
 }
 
@@ -3564,7 +5186,7 @@ func TestServer_BroadcastAfterStop(t *testing.T) {
 	// This tests the s.stopped check in Broadcast()
 	s.Broadcast(NewHeartbeatMessage())
 	s.BroadcastTerminalOutput("test output")
-	s.BroadcastDiffCard("card-1", "file.go", "diff content", nil, nil, false, false, nil, time.Now().Unix())
+	s.BroadcastDiffCard("card-1", "file.go", "diff content", nil, nil, nil, false, false, nil, time.Now().Unix())
 
 	// If we get here without panic, the test passes
 }
@@ -4536,6 +6158,120 @@ func TestHandleSessionCreateSuccess(t *testing.T) {
 	}
 }
 
+func TestHandleSessionCreateAutoNamesStartAtOneWithPreexistingSessions(t *testing.T) {
+	s := NewServer(":0")
+
+	// Create and configure session manager with pre-existing sessions.
+	// These simulate legacy/default registrations that must not offset
+	// user-facing auto name numbering.
+	mgr := pty.NewSessionManager()
+	if _, err := mgr.CreateWithID("legacy-main", pty.SessionConfig{HistoryLines: 100}); err != nil {
+		t.Fatalf("failed to create legacy-main session: %v", err)
+	}
+	if _, err := mgr.CreateWithID("legacy-shadow", pty.SessionConfig{HistoryLines: 100}); err != nil {
+		t.Fatalf("failed to create legacy-shadow session: %v", err)
+	}
+	s.SetSessionManager(mgr)
+
+	errCh := s.StartAsync()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer s.Stop()
+	defer mgr.CloseAll()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleWebSocket(w, r)
+	}))
+	defer ts.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	// Drain initial session.status
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.ReadMessage()
+
+	msg := map[string]interface{}{
+		"type": "session.create",
+		"payload": map[string]interface{}{
+			"command": "/bin/sh",
+			"args":    []string{"-c", "sleep 5"},
+		},
+	}
+	if err := conn.WriteJSON(msg); err != nil {
+		t.Fatalf("failed to send session.create: %v", err)
+	}
+
+	name := readSessionCreatedName(t, conn)
+	if name != "Session 1" {
+		t.Fatalf("expected first unnamed session to be Session 1, got %q", name)
+	}
+}
+
+func TestHandleSessionCreateAutoNameSequenceIncludesNamedSessions(t *testing.T) {
+	s := NewServer(":0")
+	mgr := pty.NewSessionManager()
+	s.SetSessionManager(mgr)
+
+	errCh := s.StartAsync()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer s.Stop()
+	defer mgr.CloseAll()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleWebSocket(w, r)
+	}))
+	defer ts.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	// Drain initial session.status
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.ReadMessage()
+
+	sendCreate := func(name string) {
+		payload := map[string]interface{}{
+			"command": "/bin/sh",
+			"args":    []string{"-c", "sleep 5"},
+		}
+		if name != "" {
+			payload["name"] = name
+		}
+		msg := map[string]interface{}{
+			"type":    "session.create",
+			"payload": payload,
+		}
+		if err := conn.WriteJSON(msg); err != nil {
+			t.Fatalf("failed to send session.create: %v", err)
+		}
+	}
+
+	sendCreate("")
+	if got := readSessionCreatedName(t, conn); got != "Session 1" {
+		t.Fatalf("first unnamed session = %q, want Session 1", got)
+	}
+
+	sendCreate("My named session")
+	if got := readSessionCreatedName(t, conn); got != "My named session" {
+		t.Fatalf("named session = %q, want My named session", got)
+	}
+
+	sendCreate("")
+	if got := readSessionCreatedName(t, conn); got != "Session 3" {
+		t.Fatalf("third created session with empty name = %q, want Session 3", got)
+	}
+}
+
 // TestHandleSessionCloseSuccess tests successful session closure.
 func TestHandleSessionCloseSuccess(t *testing.T) {
 	s := NewServer(":0")
@@ -5129,5 +6865,4558 @@ func TestHandleTerminalResizeSessionNotRunning(t *testing.T) {
 	}
 	if code, ok := payload["code"].(string); !ok || code != apperrors.CodeSessionNotRunning {
 		t.Errorf("Expected code %q, got %v", apperrors.CodeSessionNotRunning, payload["code"])
+	}
+}
+
+// =============================================================================
+// C1: Semantic Data Model Tests
+// =============================================================================
+
+// TestNewDiffCardMessage_WithSemanticGroups verifies semantic groups appear in payload JSON.
+func TestNewDiffCardMessage_WithSemanticGroups(t *testing.T) {
+	groups := []SemanticGroupInfo{
+		{
+			GroupID:      "sg-abc123def456",
+			Label:        "Imports",
+			Kind:         "import",
+			LineStart:    1,
+			LineEnd:      5,
+			ChunkIndexes: []int{0, 1},
+			RiskLevel:    "low",
+		},
+	}
+	msg := NewDiffCardMessage("card-1", "file.go", "+line", nil, nil, groups, false, false, nil, 1000)
+	payload, ok := msg.Payload.(DiffCardPayload)
+	if !ok {
+		t.Fatalf("expected DiffCardPayload, got %T", msg.Payload)
+	}
+	if len(payload.SemanticGroups) != 1 {
+		t.Fatalf("expected 1 semantic group, got %d", len(payload.SemanticGroups))
+	}
+	sg := payload.SemanticGroups[0]
+	if sg.GroupID != "sg-abc123def456" {
+		t.Errorf("expected GroupID sg-abc123def456, got %s", sg.GroupID)
+	}
+	if sg.Label != "Imports" {
+		t.Errorf("expected Label Imports, got %s", sg.Label)
+	}
+	if sg.Kind != "import" {
+		t.Errorf("expected Kind import, got %s", sg.Kind)
+	}
+	if len(sg.ChunkIndexes) != 2 || sg.ChunkIndexes[0] != 0 || sg.ChunkIndexes[1] != 1 {
+		t.Errorf("expected ChunkIndexes [0,1], got %v", sg.ChunkIndexes)
+	}
+	if sg.RiskLevel != "low" {
+		t.Errorf("expected RiskLevel low, got %s", sg.RiskLevel)
+	}
+
+	// Verify JSON serialization includes semantic_groups
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("json marshal failed: %v", err)
+	}
+	jsonStr := string(data)
+	if !strings.Contains(jsonStr, `"semantic_groups"`) {
+		t.Errorf("JSON missing semantic_groups key: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"sg-abc123def456"`) {
+		t.Errorf("JSON missing group_id value: %s", jsonStr)
+	}
+}
+
+// TestNewDiffCardMessage_NilSemanticGroups verifies omitempty omits the key.
+func TestNewDiffCardMessage_NilSemanticGroups(t *testing.T) {
+	msg := NewDiffCardMessage("card-1", "file.go", "+line", nil, nil, nil, false, false, nil, 1000)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("json marshal failed: %v", err)
+	}
+	jsonStr := string(data)
+	if strings.Contains(jsonStr, `"semantic_groups"`) {
+		t.Errorf("JSON should omit semantic_groups when nil: %s", jsonStr)
+	}
+}
+
+// TestChunkInfoSerialization_WithSemanticFields verifies chunk semantic fields in JSON.
+func TestChunkInfoSerialization_WithSemanticFields(t *testing.T) {
+	chunk := ChunkInfo{
+		Index:           0,
+		OldStart:        1,
+		OldCount:        3,
+		NewStart:        1,
+		NewCount:        4,
+		SemanticKind:    "import",
+		SemanticLabel:   "Import",
+		SemanticGroupID: "sg-abc123def456",
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("json marshal failed: %v", err)
+	}
+	jsonStr := string(data)
+	if !strings.Contains(jsonStr, `"semantic_kind":"import"`) {
+		t.Errorf("JSON missing semantic_kind: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"semantic_label":"Import"`) {
+		t.Errorf("JSON missing semantic_label: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"semantic_group_id":"sg-abc123def456"`) {
+		t.Errorf("JSON missing semantic_group_id: %s", jsonStr)
+	}
+}
+
+// TestChunkInfoSerialization_OmitsEmptySemanticFields verifies omitempty behavior.
+func TestChunkInfoSerialization_OmitsEmptySemanticFields(t *testing.T) {
+	chunk := ChunkInfo{
+		Index:    0,
+		OldStart: 1,
+		OldCount: 3,
+		NewStart: 1,
+		NewCount: 4,
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("json marshal failed: %v", err)
+	}
+	jsonStr := string(data)
+	if strings.Contains(jsonStr, `"semantic_kind"`) {
+		t.Errorf("JSON should omit empty semantic_kind: %s", jsonStr)
+	}
+	if strings.Contains(jsonStr, `"semantic_label"`) {
+		t.Errorf("JSON should omit empty semantic_label: %s", jsonStr)
+	}
+	if strings.Contains(jsonStr, `"semantic_group_id"`) {
+		t.Errorf("JSON should omit empty semantic_group_id: %s", jsonStr)
+	}
+}
+
+func TestSemanticPayloadCompatibilityMatrix(t *testing.T) {
+	type matrixCase struct {
+		name                 string
+		payload              DiffCardPayload
+		expectChunkSemantics bool
+		expectSemanticGroups bool
+		verifyRoundTrip      func(t *testing.T, got DiffCardPayload)
+	}
+
+	baseChunk := ChunkInfo{
+		Index:    0,
+		OldStart: 1,
+		OldCount: 2,
+		NewStart: 1,
+		NewCount: 3,
+		Offset:   0,
+		Length:   12,
+		Content:  "@@ -1,2 +1,3 @@\n+line",
+	}
+	basePayload := DiffCardPayload{
+		CardID:    "card-c4",
+		File:      "main.go",
+		Diff:      "@@ -1,2 +1,3 @@\n+line",
+		Chunks:    []ChunkInfo{baseChunk},
+		CreatedAt: 1703500000000,
+	}
+
+	cases := []matrixCase{
+		{
+			name:                 "legacy_no_semantic",
+			payload:              basePayload,
+			expectChunkSemantics: false,
+			expectSemanticGroups: false,
+			verifyRoundTrip: func(t *testing.T, got DiffCardPayload) {
+				if len(got.SemanticGroups) != 0 {
+					t.Fatalf("expected no semantic groups, got %d", len(got.SemanticGroups))
+				}
+				if got.Chunks[0].SemanticKind != "" || got.Chunks[0].SemanticLabel != "" || got.Chunks[0].SemanticGroupID != "" {
+					t.Fatalf("expected empty chunk semantic fields, got %+v", got.Chunks[0])
+				}
+			},
+		},
+		{
+			name: "partial_chunk_only",
+			payload: DiffCardPayload{
+				CardID: "card-c4-chunk-only",
+				File:   "main.go",
+				Diff:   "@@ -1,2 +1,3 @@\n+line",
+				Chunks: []ChunkInfo{
+					{
+						Index:           0,
+						OldStart:        1,
+						OldCount:        2,
+						NewStart:        1,
+						NewCount:        3,
+						Offset:          0,
+						Length:          12,
+						Content:         "@@ -1,2 +1,3 @@\n+line",
+						SemanticKind:    "function",
+						SemanticLabel:   "HandleRequest",
+						SemanticGroupID: "sg-c4chunkonly",
+					},
+				},
+				CreatedAt: 1703500000001,
+			},
+			expectChunkSemantics: true,
+			expectSemanticGroups: false,
+			verifyRoundTrip: func(t *testing.T, got DiffCardPayload) {
+				chunk := got.Chunks[0]
+				if chunk.SemanticKind != "function" {
+					t.Fatalf("expected chunk semantic_kind=function, got %q", chunk.SemanticKind)
+				}
+				if chunk.SemanticLabel != "HandleRequest" {
+					t.Fatalf("expected chunk semantic_label=HandleRequest, got %q", chunk.SemanticLabel)
+				}
+				if chunk.SemanticGroupID != "sg-c4chunkonly" {
+					t.Fatalf("expected chunk semantic_group_id=sg-c4chunkonly, got %q", chunk.SemanticGroupID)
+				}
+				if len(got.SemanticGroups) != 0 {
+					t.Fatalf("expected no semantic groups, got %d", len(got.SemanticGroups))
+				}
+			},
+		},
+		{
+			name: "partial_group_only",
+			payload: DiffCardPayload{
+				CardID: "card-c4-group-only",
+				File:   "main.go",
+				Diff:   "@@ -1,2 +1,3 @@\n+line",
+				Chunks: []ChunkInfo{
+					baseChunk,
+				},
+				SemanticGroups: []SemanticGroupInfo{
+					{
+						GroupID:      "sg-c4grouponly",
+						Label:        "Imports",
+						Kind:         "import",
+						LineStart:    1,
+						LineEnd:      3,
+						ChunkIndexes: []int{0},
+						RiskLevel:    "low",
+					},
+				},
+				CreatedAt: 1703500000002,
+			},
+			expectChunkSemantics: false,
+			expectSemanticGroups: true,
+			verifyRoundTrip: func(t *testing.T, got DiffCardPayload) {
+				if len(got.SemanticGroups) != 1 {
+					t.Fatalf("expected 1 semantic group, got %d", len(got.SemanticGroups))
+				}
+				group := got.SemanticGroups[0]
+				if group.GroupID != "sg-c4grouponly" || group.Label != "Imports" || group.Kind != "import" {
+					t.Fatalf("unexpected semantic group round-trip value: %+v", group)
+				}
+				chunk := got.Chunks[0]
+				if chunk.SemanticKind != "" || chunk.SemanticLabel != "" || chunk.SemanticGroupID != "" {
+					t.Fatalf("expected empty chunk semantic fields, got %+v", chunk)
+				}
+			},
+		},
+		{
+			name: "full_chunk_and_group",
+			payload: DiffCardPayload{
+				CardID: "card-c4-full",
+				File:   "main.go",
+				Diff:   "@@ -1,2 +1,3 @@\n+line",
+				Chunks: []ChunkInfo{
+					{
+						Index:           0,
+						OldStart:        1,
+						OldCount:        2,
+						NewStart:        1,
+						NewCount:        3,
+						Offset:          0,
+						Length:          12,
+						Content:         "@@ -1,2 +1,3 @@\n+line",
+						SemanticKind:    "import",
+						SemanticLabel:   "Import",
+						SemanticGroupID: "sg-c4full",
+					},
+				},
+				SemanticGroups: []SemanticGroupInfo{
+					{
+						GroupID:      "sg-c4full",
+						Label:        "Imports",
+						Kind:         "import",
+						LineStart:    1,
+						LineEnd:      3,
+						ChunkIndexes: []int{0},
+						RiskLevel:    "low",
+					},
+				},
+				CreatedAt: 1703500000003,
+			},
+			expectChunkSemantics: true,
+			expectSemanticGroups: true,
+			verifyRoundTrip: func(t *testing.T, got DiffCardPayload) {
+				if len(got.SemanticGroups) != 1 {
+					t.Fatalf("expected 1 semantic group, got %d", len(got.SemanticGroups))
+				}
+				chunk := got.Chunks[0]
+				if chunk.SemanticKind != "import" || chunk.SemanticLabel != "Import" || chunk.SemanticGroupID != "sg-c4full" {
+					t.Fatalf("unexpected chunk semantic round-trip values: %+v", chunk)
+				}
+				group := got.SemanticGroups[0]
+				if group.GroupID != "sg-c4full" || group.Label != "Imports" || group.Kind != "import" {
+					t.Fatalf("unexpected semantic group round-trip values: %+v", group)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.payload)
+			if err != nil {
+				t.Fatalf("json marshal failed: %v", err)
+			}
+
+			var payloadMap map[string]interface{}
+			if err := json.Unmarshal(data, &payloadMap); err != nil {
+				t.Fatalf("json unmarshal to map failed: %v", err)
+			}
+
+			_, hasSemanticGroups := payloadMap["semantic_groups"]
+			if tc.expectSemanticGroups != hasSemanticGroups {
+				t.Fatalf("semantic_groups presence mismatch: got %v, want %v", hasSemanticGroups, tc.expectSemanticGroups)
+			}
+
+			chunksRaw, ok := payloadMap["chunks"].([]interface{})
+			if !ok || len(chunksRaw) != 1 {
+				t.Fatalf("expected exactly 1 serialized chunk, got %v", payloadMap["chunks"])
+			}
+			chunkMap, ok := chunksRaw[0].(map[string]interface{})
+			if !ok {
+				t.Fatalf("expected chunk object, got %T", chunksRaw[0])
+			}
+
+			chunkFields := []string{"semantic_kind", "semantic_label", "semantic_group_id"}
+			for _, field := range chunkFields {
+				_, hasField := chunkMap[field]
+				if tc.expectChunkSemantics != hasField {
+					t.Fatalf("%s presence mismatch: got %v, want %v", field, hasField, tc.expectChunkSemantics)
+				}
+			}
+
+			var roundTrip DiffCardPayload
+			if err := json.Unmarshal(data, &roundTrip); err != nil {
+				t.Fatalf("json unmarshal to DiffCardPayload failed: %v", err)
+			}
+
+			if roundTrip.CardID != tc.payload.CardID || roundTrip.File != tc.payload.File || roundTrip.CreatedAt != tc.payload.CreatedAt {
+				t.Fatalf(
+					"round-trip base fields mismatch: got card=%q file=%q created_at=%d",
+					roundTrip.CardID, roundTrip.File, roundTrip.CreatedAt,
+				)
+			}
+			if len(roundTrip.Chunks) != 1 {
+				t.Fatalf("expected 1 chunk after round-trip, got %d", len(roundTrip.Chunks))
+			}
+
+			tc.verifyRoundTrip(t, roundTrip)
+		})
+	}
+}
+
+// TestUndoResultMessage_WithSemanticMetadata verifies that undo re-emit with
+// semantic metadata doesn't break serialization.
+func TestUndoResultMessage_WithSemanticMetadata(t *testing.T) {
+	chunks := []ChunkInfo{
+		{Index: 0, OldStart: 1, OldCount: 3, NewStart: 1, NewCount: 5,
+			Content: "+import fmt", ContentHash: "abc123",
+			SemanticKind: "import", SemanticLabel: "Import", SemanticGroupID: "sg-test123456"},
+	}
+	groups := []SemanticGroupInfo{
+		{GroupID: "sg-test123456", Label: "Imports", Kind: "import",
+			LineStart: 1, LineEnd: 5, ChunkIndexes: []int{0}, RiskLevel: "low"},
+	}
+	stats := &DiffStats{ByteSize: 11, LineCount: 1, AddedLines: 1, DeletedLines: 0}
+
+	msg := NewDiffCardMessage("card-undo", "main.go", "+import fmt",
+		chunks, nil, groups, false, false, stats, 1703500000000)
+
+	// Serialize to JSON and back to verify no panic/corruption
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("json marshal failed: %v", err)
+	}
+
+	var roundtrip Message
+	if err := json.Unmarshal(data, &roundtrip); err != nil {
+		t.Fatalf("json unmarshal failed: %v", err)
+	}
+
+	if roundtrip.Type != MessageTypeDiffCard {
+		t.Errorf("expected type %s, got %s", MessageTypeDiffCard, roundtrip.Type)
+	}
+
+	// Verify semantic fields survive round-trip
+	payloadMap, ok := roundtrip.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", roundtrip.Payload)
+	}
+	semGroups, ok := payloadMap["semantic_groups"].([]interface{})
+	if !ok || len(semGroups) != 1 {
+		t.Errorf("expected 1 semantic group in round-trip, got %v", payloadMap["semantic_groups"])
+	}
+}
+
+// TestReconnectReplayBinarySemanticGroups verifies that reconnect replay emits
+// semantic groups for binary cards (C2-G1 parity fix).
+func TestReconnectReplayBinarySemanticGroups(t *testing.T) {
+	// Simulate what the reconnect handler in host.go does for binary cards.
+	// After the fix, binary cards should get semantic groups via EnrichChunksWithSemantics.
+	binaryGroups := []SemanticGroupInfo{
+		{GroupID: "sg-bin123", Label: "Binary", Kind: "binary",
+			LineStart: 0, LineEnd: 0, ChunkIndexes: []int{0}, RiskLevel: "low"},
+	}
+
+	msg := NewDiffCardMessage("card-bin-reconnect", "image.png",
+		"(binary file - content not shown)",
+		nil,          // no chunks for binary
+		nil,          // no chunk groups
+		binaryGroups, // semantic groups must be present
+		true,         // isBinary
+		false,        // isDeleted
+		nil,          // no stats for binary
+		1703500000000,
+	)
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("json marshal failed: %v", err)
+	}
+
+	var roundtrip Message
+	if err := json.Unmarshal(data, &roundtrip); err != nil {
+		t.Fatalf("json unmarshal failed: %v", err)
+	}
+
+	payloadMap, ok := roundtrip.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", roundtrip.Payload)
+	}
+
+	// Binary card must have is_binary=true
+	if isBin, _ := payloadMap["is_binary"].(bool); !isBin {
+		t.Error("expected is_binary=true in binary reconnect card")
+	}
+
+	// Binary card must have semantic_groups with kind "binary"
+	semGroups, ok := payloadMap["semantic_groups"].([]interface{})
+	if !ok || len(semGroups) == 0 {
+		t.Fatal("expected semantic_groups for binary reconnect card, got none")
+	}
+	group0, _ := semGroups[0].(map[string]interface{})
+	if kind, _ := group0["kind"].(string); kind != "binary" {
+		t.Errorf("expected binary group kind, got %q", kind)
+	}
+}
+
+// TestUndoReEmitBinarySemanticGroups verifies that undo re-emit includes
+// semantic groups for binary cards (C2-G1 parity fix).
+func TestUndoReEmitBinarySemanticGroups(t *testing.T) {
+	// After the fix, binary undo re-emit calls EnrichChunksWithSemantics,
+	// which produces binary semantic groups via synthetic chunk.
+	_, semGroups := stream.EnrichChunksWithSemantics(
+		"card-bin-undo", "logo.png", nil, true, false,
+	)
+
+	if len(semGroups) == 0 {
+		t.Fatal("EnrichChunksWithSemantics should produce semantic groups for binary card")
+	}
+	if semGroups[0].Kind != "binary" {
+		t.Errorf("expected binary group kind, got %q", semGroups[0].Kind)
+	}
+
+	// Verify the mapped server types serialize correctly in a diff card message
+	serverGroups := mapSemanticGroupsToServer(semGroups)
+	msg := NewDiffCardMessage("card-bin-undo", "logo.png",
+		"(binary file - content not shown)",
+		nil,          // no chunks
+		nil,          // no chunk groups
+		serverGroups, // semantic groups from enrichment
+		true,         // isBinary
+		false,        // isDeleted
+		nil,          // no stats
+		1703500000000,
+	)
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("json marshal failed: %v", err)
+	}
+
+	var roundtrip Message
+	if err := json.Unmarshal(data, &roundtrip); err != nil {
+		t.Fatalf("json unmarshal failed: %v", err)
+	}
+
+	payloadMap, ok := roundtrip.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", roundtrip.Payload)
+	}
+
+	groups, ok := payloadMap["semantic_groups"].([]interface{})
+	if !ok || len(groups) == 0 {
+		t.Fatal("expected semantic_groups in binary undo re-emit card")
+	}
+	group0, _ := groups[0].(map[string]interface{})
+	if kind, _ := group0["kind"].(string); kind != "binary" {
+		t.Errorf("expected binary kind in undo semantic group, got %q", kind)
+	}
+}
+
+// TestSensitivePathParity_B1_C2 verifies that B1 card-risk and C2 semantic-group
+// risk use the same sensitive-path helper and produce consistent results.
+func TestSensitivePathParity_B1_C2(t *testing.T) {
+	paths := []struct {
+		path      string
+		sensitive bool
+	}{
+		{"config/auth_service.go", true},
+		{"lib/token_store.dart", true},
+		{"README.md", false},
+		{"main.go", false},
+	}
+
+	for _, p := range paths {
+		t.Run(p.path, func(t *testing.T) {
+			// B1: computeDiffCardMeta detects sensitive path via risk reasons
+			_, _, reasons := computeDiffCardMeta(p.path, nil, false, false,
+				&DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 5, DeletedLines: 3}, nil)
+
+			b1Sensitive := false
+			for _, r := range reasons {
+				if r == "sensitive_path" {
+					b1Sensitive = true
+					break
+				}
+			}
+
+			// C2: uses semantic.IsSensitivePath (same helper)
+			if b1Sensitive != p.sensitive {
+				t.Errorf("B1 sensitive=%v, expected %v for path %s", b1Sensitive, p.sensitive, p.path)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// P4U1: Repo History and Branches message types and constructors
+// -----------------------------------------------------------------------------
+
+func TestRepoMessageTypeValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		msgType  MessageType
+		expected string
+	}{
+		{"repo.history", MessageTypeRepoHistory, "repo.history"},
+		{"repo.history_result", MessageTypeRepoHistoryResult, "repo.history_result"},
+		{"repo.branches", MessageTypeRepoBranches, "repo.branches"},
+		{"repo.branches_result", MessageTypeRepoBranchesResult, "repo.branches_result"},
+		// P9U4: PR message types
+		{"repo.pr_list", MessageTypeRepoPrList, "repo.pr_list"},
+		{"repo.pr_list_result", MessageTypeRepoPrListResult, "repo.pr_list_result"},
+		{"repo.pr_view", MessageTypeRepoPrView, "repo.pr_view"},
+		{"repo.pr_view_result", MessageTypeRepoPrViewResult, "repo.pr_view_result"},
+		{"repo.pr_create", MessageTypeRepoPrCreate, "repo.pr_create"},
+		{"repo.pr_create_result", MessageTypeRepoPrCreateResult, "repo.pr_create_result"},
+		{"repo.pr_checkout", MessageTypeRepoPrCheckout, "repo.pr_checkout"},
+		{"repo.pr_checkout_result", MessageTypeRepoPrCheckoutResult, "repo.pr_checkout_result"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if string(tc.msgType) != tc.expected {
+				t.Errorf("expected %q, got %q", tc.expected, string(tc.msgType))
+			}
+		})
+	}
+}
+
+func TestNewRepoHistoryResultMessage(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		entries := []RepoHistoryEntry{
+			{Hash: "abc123", Subject: "Test", Author: "Me", AuthoredAt: 1000},
+		}
+		msg := NewRepoHistoryResultMessage("req-1", true, entries, "next-abc", "", "")
+		if msg.Type != MessageTypeRepoHistoryResult {
+			t.Errorf("expected type %s, got %s", MessageTypeRepoHistoryResult, msg.Type)
+		}
+		payload, ok := msg.Payload.(RepoHistoryResultPayload)
+		if !ok {
+			t.Fatalf("expected RepoHistoryResultPayload, got %T", msg.Payload)
+		}
+		if payload.RequestID != "req-1" {
+			t.Errorf("expected request_id 'req-1', got %q", payload.RequestID)
+		}
+		if !payload.Success {
+			t.Error("expected success=true")
+		}
+		if len(payload.Entries) != 1 {
+			t.Errorf("expected 1 entry, got %d", len(payload.Entries))
+		}
+		if payload.NextCursor != "next-abc" {
+			t.Errorf("expected next_cursor 'next-abc', got %q", payload.NextCursor)
+		}
+		if payload.ErrorCode != "" || payload.Error != "" {
+			t.Errorf("expected no error fields, got code=%q msg=%q", payload.ErrorCode, payload.Error)
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		msg := NewRepoHistoryResultMessage("req-2", false, nil, "", "commit.git_error", "git failed")
+		payload, ok := msg.Payload.(RepoHistoryResultPayload)
+		if !ok {
+			t.Fatalf("expected RepoHistoryResultPayload, got %T", msg.Payload)
+		}
+		if payload.Success {
+			t.Error("expected success=false")
+		}
+		if payload.ErrorCode != "commit.git_error" {
+			t.Errorf("expected error code 'commit.git_error', got %q", payload.ErrorCode)
+		}
+		if payload.Error != "git failed" {
+			t.Errorf("expected error 'git failed', got %q", payload.Error)
+		}
+	})
+}
+
+func TestNewRepoBranchesResultMessage(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		local := []string{"dev", "main"}
+		tracked := []string{"origin/dev", "origin/main"}
+		msg := NewRepoBranchesResultMessage("req-3", true, "main", local, tracked, "", "")
+		if msg.Type != MessageTypeRepoBranchesResult {
+			t.Errorf("expected type %s, got %s", MessageTypeRepoBranchesResult, msg.Type)
+		}
+		payload, ok := msg.Payload.(RepoBranchesResultPayload)
+		if !ok {
+			t.Fatalf("expected RepoBranchesResultPayload, got %T", msg.Payload)
+		}
+		if payload.RequestID != "req-3" {
+			t.Errorf("expected request_id 'req-3', got %q", payload.RequestID)
+		}
+		if !payload.Success {
+			t.Error("expected success=true")
+		}
+		if payload.CurrentBranch != "main" {
+			t.Errorf("expected current_branch 'main', got %q", payload.CurrentBranch)
+		}
+		if len(payload.Local) != 2 {
+			t.Errorf("expected 2 local branches, got %d", len(payload.Local))
+		}
+		if len(payload.TrackedRemote) != 2 {
+			t.Errorf("expected 2 tracked remotes, got %d", len(payload.TrackedRemote))
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		msg := NewRepoBranchesResultMessage("req-4", false, "", nil, nil, "server.handler_missing", "not configured")
+		payload, ok := msg.Payload.(RepoBranchesResultPayload)
+		if !ok {
+			t.Fatalf("expected RepoBranchesResultPayload, got %T", msg.Payload)
+		}
+		if payload.Success {
+			t.Error("expected success=false")
+		}
+		if payload.ErrorCode != "server.handler_missing" {
+			t.Errorf("expected error code 'server.handler_missing', got %q", payload.ErrorCode)
+		}
+	})
+}
+
+func TestHandleRepoHistory_Validation(t *testing.T) {
+	t.Run("missing_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+
+		// Drain session.status
+		readMessage(t, conn)
+
+		// Send repo.history without request_id
+		msg := map[string]interface{}{
+			"type":    "repo.history",
+			"payload": map[string]interface{}{},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		if resp.Type != MessageTypeRepoHistoryResult {
+			t.Fatalf("expected repo.history_result, got %s", resp.Type)
+		}
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected error code %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("invalid_page_size", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.history",
+			"payload": map[string]interface{}{
+				"request_id": "test-1",
+				"page_size":  300,
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "test-1" {
+			t.Errorf("expected request_id echoed, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+	})
+
+	t.Run("zero_page_size", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.history",
+			"payload": map[string]interface{}{
+				"request_id": "test-zero",
+				"page_size":  0,
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "test-zero" {
+			t.Errorf("expected request_id echoed, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected error code %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("blank_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.history",
+			"payload": map[string]interface{}{
+				"request_id": "   ",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "   " {
+			t.Errorf("expected raw blank request_id echoed, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected error code %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("invalid_page_size_type_preserves_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.history",
+			"payload": map[string]interface{}{
+				"request_id": "type-req-id",
+				"page_size":  "not-a-number",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "type-req-id" {
+			t.Errorf("expected request_id echoed, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected error code %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("non_string_request_id_preserves_raw_value", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.history",
+			"payload": map[string]interface{}{
+				"request_id": 123,
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "123" {
+			t.Errorf("expected raw request_id echoed as string, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected error code %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("nil_gitOps", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		// Don't set gitOps
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.history",
+			"payload": map[string]interface{}{
+				"request_id": "test-2",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["error_code"] != apperrors.CodeServerHandlerMissing {
+			t.Errorf("expected error code %s, got %v", apperrors.CodeServerHandlerMissing, payload["error_code"])
+		}
+	})
+}
+
+func TestHandleRepoBranches_Validation(t *testing.T) {
+	t.Run("missing_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type":    "repo.branches",
+			"payload": map[string]interface{}{},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		if resp.Type != MessageTypeRepoBranchesResult {
+			t.Fatalf("expected repo.branches_result, got %s", resp.Type)
+		}
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+	})
+
+	t.Run("blank_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branches",
+			"payload": map[string]interface{}{
+				"request_id": "  ",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "  " {
+			t.Errorf("expected raw blank request_id echoed, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected error code %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("non_string_request_id_preserves_raw_value", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branches",
+			"payload": map[string]interface{}{
+				"request_id": 456,
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "456" {
+			t.Errorf("expected raw request_id echoed as string, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected error code %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("nil_gitOps", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branches",
+			"payload": map[string]interface{}{
+				"request_id": "test-3",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["error_code"] != apperrors.CodeServerHandlerMissing {
+			t.Errorf("expected error code %s, got %v", apperrors.CodeServerHandlerMissing, payload["error_code"])
+		}
+	})
+}
+
+func TestHandleRepoHistory_RequesterOnly(t *testing.T) {
+	dir := setupTestRepo(t)
+	gitOps := NewGitOperations(dir, false, false, false)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(gitOps)
+
+	// Connect two clients
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1) // session.status
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2) // session.status
+
+	// Client 1 sends repo.history
+	msg := map[string]interface{}{
+		"type": "repo.history",
+		"payload": map[string]interface{}{
+			"request_id": "req-only-test",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	// Client 1 should receive result
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoHistoryResult {
+		t.Fatalf("client 1 expected repo.history_result, got %s", resp1.Type)
+	}
+
+	// Client 2 should NOT receive anything (with timeout)
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.history_result")
+	}
+}
+
+func TestHandleRepoBranches_RequesterOnly(t *testing.T) {
+	dir := setupTestRepo(t)
+	gitOps := NewGitOperations(dir, false, false, false)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(gitOps)
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	msg := map[string]interface{}{
+		"type": "repo.branches",
+		"payload": map[string]interface{}{
+			"request_id": "req-only-branches",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoBranchesResult {
+		t.Fatalf("client 1 expected repo.branches_result, got %s", resp1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.branches_result")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Branch Mutation handler tests (P4U2)
+// -----------------------------------------------------------------------------
+
+func TestRepoBranchMessageTypeValues(t *testing.T) {
+	if MessageTypeRepoBranchCreate != "repo.branch_create" {
+		t.Errorf("expected repo.branch_create, got %s", MessageTypeRepoBranchCreate)
+	}
+	if MessageTypeRepoBranchCreateResult != "repo.branch_create_result" {
+		t.Errorf("expected repo.branch_create_result, got %s", MessageTypeRepoBranchCreateResult)
+	}
+	if MessageTypeRepoBranchSwitch != "repo.branch_switch" {
+		t.Errorf("expected repo.branch_switch, got %s", MessageTypeRepoBranchSwitch)
+	}
+	if MessageTypeRepoBranchSwitchResult != "repo.branch_switch_result" {
+		t.Errorf("expected repo.branch_switch_result, got %s", MessageTypeRepoBranchSwitchResult)
+	}
+}
+
+func TestNewRepoBranchCreateResultMessage(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		msg := NewRepoBranchCreateResultMessage("req-1", true, "feature-x", "", "")
+		if msg.Type != MessageTypeRepoBranchCreateResult {
+			t.Fatalf("expected type %s, got %s", MessageTypeRepoBranchCreateResult, msg.Type)
+		}
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var parsed map[string]json.RawMessage
+		json.Unmarshal(data, &parsed)
+		var payload map[string]interface{}
+		json.Unmarshal(parsed["payload"], &payload)
+		if payload["request_id"] != "req-1" {
+			t.Errorf("expected request_id req-1, got %v", payload["request_id"])
+		}
+		if payload["success"] != true {
+			t.Errorf("expected success=true, got %v", payload["success"])
+		}
+		if payload["name"] != "feature-x" {
+			t.Errorf("expected name feature-x, got %v", payload["name"])
+		}
+		// Success should not have error fields
+		if _, ok := payload["error_code"]; ok {
+			t.Error("success payload should not have error_code")
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		msg := NewRepoBranchCreateResultMessage("req-2", false, "bad", "action.invalid", "invalid branch")
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var parsed map[string]json.RawMessage
+		json.Unmarshal(data, &parsed)
+		var payload map[string]interface{}
+		json.Unmarshal(parsed["payload"], &payload)
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != "action.invalid" {
+			t.Errorf("expected error_code action.invalid, got %v", payload["error_code"])
+		}
+	})
+}
+
+func TestNewRepoBranchSwitchResultMessage(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		msg := NewRepoBranchSwitchResultMessage("req-1", true, "main", nil, "", "")
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var parsed map[string]json.RawMessage
+		json.Unmarshal(data, &parsed)
+		var payload map[string]interface{}
+		json.Unmarshal(parsed["payload"], &payload)
+		if payload["success"] != true {
+			t.Error("expected success=true")
+		}
+		if _, ok := payload["blockers"]; ok {
+			t.Error("success payload should not have blockers")
+		}
+	})
+
+	t.Run("failure_with_blockers", func(t *testing.T) {
+		blockers := []string{"staged_changes_present", "unstaged_changes_present"}
+		msg := NewRepoBranchSwitchResultMessage("req-2", false, "target", blockers, "action.invalid", "dirty")
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var parsed map[string]json.RawMessage
+		json.Unmarshal(data, &parsed)
+		var payload map[string]interface{}
+		json.Unmarshal(parsed["payload"], &payload)
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		b, ok := payload["blockers"].([]interface{})
+		if !ok {
+			t.Fatalf("expected blockers array, got %T", payload["blockers"])
+		}
+		if len(b) != 2 {
+			t.Errorf("expected 2 blockers, got %d", len(b))
+		}
+	})
+
+	t.Run("failure_without_blockers", func(t *testing.T) {
+		msg := NewRepoBranchSwitchResultMessage("req-3", false, "missing", nil, "action.invalid", "not found")
+		data, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var parsed map[string]json.RawMessage
+		json.Unmarshal(data, &parsed)
+		var payload map[string]interface{}
+		json.Unmarshal(parsed["payload"], &payload)
+		if _, ok := payload["blockers"]; ok {
+			t.Error("failure without blockers should not have blockers field")
+		}
+	})
+}
+
+func TestHandleRepoBranchCreate(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn) // session.status
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": "create-1",
+				"name":       "new-branch",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		if resp.Type != MessageTypeRepoBranchCreateResult {
+			t.Fatalf("expected repo.branch_create_result, got %s", resp.Type)
+		}
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != true {
+			t.Fatalf("expected success=true, got error: %v", payload["error"])
+		}
+		if payload["request_id"] != "create-1" {
+			t.Errorf("expected request_id create-1, got %v", payload["request_id"])
+		}
+		if payload["name"] != "new-branch" {
+			t.Errorf("expected name new-branch, got %v", payload["name"])
+		}
+	})
+
+	t.Run("missing_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"name": "test",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("non_string_request_id_preserves_raw_value", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": 123,
+				"name":       "new-branch",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "123" {
+			t.Errorf("expected raw request_id echoed as string, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("missing_name", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": "create-no-name",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("invalid_branch_name", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": "create-invalid",
+				"name":       "-bad",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeActionInvalid {
+			t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+		}
+	})
+
+	t.Run("duplicate_branch", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		// Get current branch name to use as duplicate
+		currentBranch, _ := gitOps.GetCurrentBranchName()
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": "create-dup",
+				"name":       currentBranch,
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false for duplicate")
+		}
+		if payload["error_code"] != apperrors.CodeActionInvalid {
+			t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+		}
+	})
+
+	t.Run("no_git_ops", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		// No git ops set
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": "create-no-git",
+				"name":       "test",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["error_code"] != apperrors.CodeServerHandlerMissing {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerHandlerMissing, payload["error_code"])
+		}
+	})
+
+	t.Run("empty_repo", func(t *testing.T) {
+		dir := t.TempDir()
+		runGitCmd(t, dir, "init")
+		runGitCmd(t, dir, "config", "user.email", "test@example.com")
+		runGitCmd(t, dir, "config", "user.name", "Test User")
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": "create-empty",
+				"name":       "new-branch",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false for empty repo")
+		}
+		if payload["error_code"] != apperrors.CodeActionInvalid {
+			t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+		}
+	})
+}
+
+func TestHandleRepoBranchSwitch(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		runGitCmd(t, dir, "branch", "target")
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_switch",
+			"payload": map[string]interface{}{
+				"request_id": "switch-1",
+				"name":       "target",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		if resp.Type != MessageTypeRepoBranchSwitchResult {
+			t.Fatalf("expected repo.branch_switch_result, got %s", resp.Type)
+		}
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != true {
+			t.Fatalf("expected success=true, got error: %v", payload["error"])
+		}
+		if payload["name"] != "target" {
+			t.Errorf("expected name target, got %v", payload["name"])
+		}
+	})
+
+	t.Run("missing_request_id", func(t *testing.T) {
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_switch",
+			"payload": map[string]interface{}{
+				"name": "target",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("non_string_request_id_preserves_raw_value", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		runGitCmd(t, dir, "branch", "target")
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_switch",
+			"payload": map[string]interface{}{
+				"request_id": 456,
+				"name":       "target",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "456" {
+			t.Errorf("expected raw request_id echoed as string, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("missing_name", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_switch",
+			"payload": map[string]interface{}{
+				"request_id": "switch-no-name",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+
+	t.Run("branch_not_found", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_switch",
+			"payload": map[string]interface{}{
+				"request_id": "switch-missing",
+				"name":       "nonexistent",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false")
+		}
+		if payload["error_code"] != apperrors.CodeActionInvalid {
+			t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+		}
+	})
+
+	t.Run("dirty_blockers", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		runGitCmd(t, dir, "branch", "target")
+		// Create dirty state
+		if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		runGitCmd(t, dir, "add", "dirty.txt")
+
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_switch",
+			"payload": map[string]interface{}{
+				"request_id": "switch-dirty",
+				"name":       "target",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false for dirty switch")
+		}
+		if payload["error_code"] != apperrors.CodeActionInvalid {
+			t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+		}
+		blockers, ok := payload["blockers"].([]interface{})
+		if !ok {
+			t.Fatalf("expected blockers array, got %T", payload["blockers"])
+		}
+		if len(blockers) == 0 {
+			t.Error("expected non-empty blockers")
+		}
+	})
+
+	t.Run("empty_repo_same_branch_noop", func(t *testing.T) {
+		dir := t.TempDir()
+		runGitCmd(t, dir, "init")
+		runGitCmd(t, dir, "config", "user.email", "test@example.com")
+		runGitCmd(t, dir, "config", "user.name", "Test User")
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		currentBranch, _ := gitOps.GetCurrentBranchName()
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_switch",
+			"payload": map[string]interface{}{
+				"request_id": "switch-empty-noop",
+				"name":       currentBranch,
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != true {
+			t.Fatalf("expected success=true for same-branch noop in empty repo, got error: %v", payload["error"])
+		}
+	})
+
+	t.Run("empty_repo_different_branch_fails", func(t *testing.T) {
+		dir := t.TempDir()
+		runGitCmd(t, dir, "init")
+		runGitCmd(t, dir, "config", "user.email", "test@example.com")
+		runGitCmd(t, dir, "config", "user.name", "Test User")
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_switch",
+			"payload": map[string]interface{}{
+				"request_id": "switch-empty-other",
+				"name":       "nonexistent",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false for different branch in empty repo")
+		}
+		if payload["error_code"] != apperrors.CodeActionInvalid {
+			t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+		}
+	})
+}
+
+func TestHandleRepoBranchCreate_RequesterOnly(t *testing.T) {
+	dir := setupTestRepo(t)
+	gitOps := NewGitOperations(dir, false, false, false)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(gitOps)
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	msg := map[string]interface{}{
+		"type": "repo.branch_create",
+		"payload": map[string]interface{}{
+			"request_id": "requester-create",
+			"name":       "requester-test-branch",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoBranchCreateResult {
+		t.Fatalf("client 1 expected repo.branch_create_result, got %s", resp1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.branch_create_result")
+	}
+}
+
+func TestHandleRepoBranchSwitch_RequesterOnly(t *testing.T) {
+	dir := setupTestRepo(t)
+	runGitCmd(t, dir, "branch", "target-req")
+	gitOps := NewGitOperations(dir, false, false, false)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(gitOps)
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	msg := map[string]interface{}{
+		"type": "repo.branch_switch",
+		"payload": map[string]interface{}{
+			"request_id": "requester-switch",
+			"name":       "target-req",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoBranchSwitchResult {
+		t.Fatalf("client 1 expected repo.branch_switch_result, got %s", resp1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.branch_switch_result")
+	}
+}
+
+func TestHandleRepoBranchCreate_Idempotency(t *testing.T) {
+	t.Run("replay", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": "idem-create",
+				"name":       "idem-branch",
+			},
+		}
+		data, _ := json.Marshal(msg)
+
+		// First request
+		conn.WriteMessage(websocket.TextMessage, data)
+		resp1 := readMessage(t, conn)
+		p1, _ := resp1.Payload.(map[string]interface{})
+		if p1["success"] != true {
+			t.Fatalf("first create failed: %v", p1["error"])
+		}
+
+		// Replay same request
+		conn.WriteMessage(websocket.TextMessage, data)
+		resp2 := readMessage(t, conn)
+		p2, _ := resp2.Payload.(map[string]interface{})
+		if p2["success"] != true {
+			t.Fatalf("replay should succeed: %v", p2["error"])
+		}
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		// First request
+		msg1 := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": "idem-mismatch",
+				"name":       "branch-a",
+			},
+		}
+		data1, _ := json.Marshal(msg1)
+		conn.WriteMessage(websocket.TextMessage, data1)
+		readMessage(t, conn) // consume result
+
+		// Same request_id, different name
+		msg2 := map[string]interface{}{
+			"type": "repo.branch_create",
+			"payload": map[string]interface{}{
+				"request_id": "idem-mismatch",
+				"name":       "branch-b",
+			},
+		}
+		data2, _ := json.Marshal(msg2)
+		conn.WriteMessage(websocket.TextMessage, data2)
+
+		resp := readMessage(t, conn)
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["success"] != false {
+			t.Error("expected success=false for mismatch")
+		}
+		if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+			t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+		}
+	})
+}
+
+func TestHandleRepoBranchSwitch_Idempotency(t *testing.T) {
+	t.Run("replay", func(t *testing.T) {
+		dir := setupTestRepo(t)
+		runGitCmd(t, dir, "branch", "switch-idem")
+		gitOps := NewGitOperations(dir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.branch_switch",
+			"payload": map[string]interface{}{
+				"request_id": "idem-switch",
+				"name":       "switch-idem",
+			},
+		}
+		data, _ := json.Marshal(msg)
+
+		conn.WriteMessage(websocket.TextMessage, data)
+		resp1 := readMessage(t, conn)
+		p1, _ := resp1.Payload.(map[string]interface{})
+		if p1["success"] != true {
+			t.Fatalf("first switch failed: %v", p1["error"])
+		}
+
+		// Replay
+		conn.WriteMessage(websocket.TextMessage, data)
+		resp2 := readMessage(t, conn)
+		p2, _ := resp2.Payload.(map[string]interface{})
+		if p2["success"] != true {
+			t.Fatalf("replay should succeed: %v", p2["error"])
+		}
+	})
+}
+
+func TestHandleRepoBranchMutation_InFlightDuplicateReplay(t *testing.T) {
+	client := &Client{
+		send:   make(chan Message, 4),
+		done:   make(chan struct{}),
+		server: NewServer("unused"),
+	}
+
+	requestID := "in-flight-1"
+	fingerprint := branchCreateFingerprint("in-flight-branch")
+	resultMsg := NewRepoBranchCreateResultMessage(requestID, true, "in-flight-branch", "", "")
+
+	// First request becomes the in-flight owner.
+	if _, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoBranchCreate, requestID, fingerprint); err != nil {
+		t.Fatalf("first idempotencyCheckOrBegin failed: %v", err)
+	} else if replay {
+		t.Fatal("first request should not replay from cache")
+	} else if inFlight != nil {
+		t.Fatal("first request should not coalesce onto existing in-flight entry")
+	}
+
+	// Exact duplicate should coalesce and wait for completion.
+	_, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoBranchCreate, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("duplicate idempotencyCheckOrBegin failed: %v", err)
+	}
+	if replay {
+		t.Fatal("duplicate should not replay before owner completes")
+	}
+	if inFlight == nil {
+		t.Fatal("duplicate should coalesce onto in-flight request")
+	}
+
+	// Mismatch while in-flight remains invalid.
+	if _, _, _, mismatchErr := client.idempotencyCheckOrBegin(
+		MessageTypeRepoBranchCreate,
+		requestID,
+		branchCreateFingerprint("different-branch"),
+	); mismatchErr == nil {
+		t.Fatal("expected mismatch error for same request_id with different fingerprint while in-flight")
+	}
+
+	// Owner completes; coalesced duplicate observes exact final result.
+	client.idempotencyComplete(MessageTypeRepoBranchCreate, requestID, fingerprint, resultMsg)
+	select {
+	case <-inFlight.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight completion")
+	}
+	if inFlight.Result.Type != MessageTypeRepoBranchCreateResult {
+		t.Fatalf("expected result type %s, got %s", MessageTypeRepoBranchCreateResult, inFlight.Result.Type)
+	}
+	payload, ok := inFlight.Result.Payload.(RepoBranchCreateResultPayload)
+	if !ok {
+		t.Fatalf("expected RepoBranchCreateResultPayload, got %T", inFlight.Result.Payload)
+	}
+	if payload.RequestID != requestID {
+		t.Fatalf("expected request_id %s, got %s", requestID, payload.RequestID)
+	}
+	if !payload.Success {
+		t.Fatal("expected success=true")
+	}
+
+	// Any later duplicate should replay from completed cache.
+	cached, replay, waiting, err := client.idempotencyCheckOrBegin(MessageTypeRepoBranchCreate, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("replay idempotencyCheckOrBegin failed: %v", err)
+	}
+	if !replay {
+		t.Fatal("expected completed replay hit")
+	}
+	if waiting != nil {
+		t.Fatal("expected no in-flight entry after completion")
+	}
+	if cached.Type != MessageTypeRepoBranchCreateResult {
+		t.Fatalf("expected replay type %s, got %s", MessageTypeRepoBranchCreateResult, cached.Type)
+	}
+}
+
+func TestHandleRepoBranchMutation_CrossOpRequestIDIsolation(t *testing.T) {
+	dir := setupTestRepo(t)
+	runGitCmd(t, dir, "branch", "cross-op-target")
+	gitOps := NewGitOperations(dir, false, false, false)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(gitOps)
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	// Use same request_id for create and switch - should not collide
+	createMsg := map[string]interface{}{
+		"type": "repo.branch_create",
+		"payload": map[string]interface{}{
+			"request_id": "shared-id",
+			"name":       "cross-op-branch",
+		},
+	}
+	data, _ := json.Marshal(createMsg)
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+	if p1["success"] != true {
+		t.Fatalf("create failed: %v", p1["error"])
+	}
+
+	// Same request_id for switch should work independently
+	switchMsg := map[string]interface{}{
+		"type": "repo.branch_switch",
+		"payload": map[string]interface{}{
+			"request_id": "shared-id",
+			"name":       "cross-op-target",
+		},
+	}
+	data, _ = json.Marshal(switchMsg)
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+	if p2["success"] != true {
+		t.Fatalf("switch failed (should not collide with create): %v", p2["error"])
+	}
+}
+
+func TestRepoMutationArbitration(t *testing.T) {
+	dir := setupTestRepo(t)
+	gitOps := NewGitOperations(dir, false, false, false)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(gitOps)
+
+	// Manually lock the gate to simulate an in-progress mutation
+	s.repoMutationMu.Lock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	// Try branch create while gate is locked
+	msg := map[string]interface{}{
+		"type": "repo.branch_create",
+		"payload": map[string]interface{}{
+			"request_id": "arb-create",
+			"name":       "arb-branch",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["success"] != false {
+		t.Error("expected success=false when gate is locked")
+	}
+	if payload["error_code"] != apperrors.CodeActionInvalid {
+		t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+	}
+	errMsg, _ := payload["error"].(string)
+	if errMsg != "repo mutation already in progress" {
+		t.Errorf("expected 'repo mutation already in progress', got %q", errMsg)
+	}
+
+	// Release gate
+	s.repoMutationMu.Unlock()
+}
+
+func TestHandleRepoCommitPush_MutationGateContention(t *testing.T) {
+	t.Run("commit_rejected_when_gate_locked", func(t *testing.T) {
+		repoDir := setupGitRepoForCommitHandlerTest(t)
+		gitOps := NewGitOperations(repoDir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		s.repoMutationMu.Lock()
+		defer s.repoMutationMu.Unlock()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.commit",
+			"payload": map[string]interface{}{
+				"request_id": "gate-commit-1",
+				"message":    "should fail due to gate",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		if resp.Type != MessageTypeRepoCommitResult {
+			t.Fatalf("expected repo.commit_result, got %s", resp.Type)
+		}
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "gate-commit-1" {
+			t.Errorf("expected request_id gate-commit-1, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false when gate is locked")
+		}
+		if payload["error_code"] != apperrors.CodeActionInvalid {
+			t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+		}
+		errMsg, _ := payload["error"].(string)
+		if errMsg != "repo mutation already in progress" {
+			t.Errorf("expected 'repo mutation already in progress', got %q", errMsg)
+		}
+	})
+
+	t.Run("push_rejected_when_gate_locked", func(t *testing.T) {
+		repoDir := setupGitRepoForCommitHandlerTest(t)
+		gitOps := NewGitOperations(repoDir, false, false, false)
+
+		s, ts := newTestServer()
+		defer ts.Close()
+		defer s.Stop()
+		s.SetGitOperations(gitOps)
+
+		s.repoMutationMu.Lock()
+		defer s.repoMutationMu.Unlock()
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		readMessage(t, conn)
+
+		msg := map[string]interface{}{
+			"type": "repo.push",
+			"payload": map[string]interface{}{
+				"request_id": "gate-push-1",
+				"remote":     "origin",
+				"branch":     "main",
+			},
+		}
+		data, _ := json.Marshal(msg)
+		conn.WriteMessage(websocket.TextMessage, data)
+
+		resp := readMessage(t, conn)
+		if resp.Type != MessageTypeRepoPushResult {
+			t.Fatalf("expected repo.push_result, got %s", resp.Type)
+		}
+		payload, _ := resp.Payload.(map[string]interface{})
+		if payload["request_id"] != "gate-push-1" {
+			t.Errorf("expected request_id gate-push-1, got %v", payload["request_id"])
+		}
+		if payload["success"] != false {
+			t.Error("expected success=false when gate is locked")
+		}
+		if payload["error_code"] != apperrors.CodeActionInvalid {
+			t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+		}
+		errMsg, _ := payload["error"].(string)
+		if errMsg != "repo mutation already in progress" {
+			t.Errorf("expected 'repo mutation already in progress', got %q", errMsg)
+		}
+	})
+}
+
+// =============================================================================
+// P9U3: Fetch/Pull Tests
+// =============================================================================
+
+// TestNewRepoFetchResultMessage tests the repo.fetch_result message constructor.
+func TestNewRepoFetchResultMessage(t *testing.T) {
+	// Test success case
+	msg := NewRepoFetchResultMessage("test-req-fetch", true, "From origin\n   abc1234..def5678  main -> origin/main", "", "")
+
+	if msg.Type != MessageTypeRepoFetchResult {
+		t.Errorf("expected type %s, got %s", MessageTypeRepoFetchResult, msg.Type)
+	}
+
+	payload, ok := msg.Payload.(RepoFetchResultPayload)
+	if !ok {
+		t.Fatalf("expected RepoFetchResultPayload, got %T", msg.Payload)
+	}
+
+	if payload.RequestID != "test-req-fetch" {
+		t.Errorf("expected RequestID test-req-fetch, got %s", payload.RequestID)
+	}
+	if !payload.Success {
+		t.Error("expected Success true")
+	}
+	if payload.Output != "From origin\n   abc1234..def5678  main -> origin/main" {
+		t.Errorf("unexpected Output: %s", payload.Output)
+	}
+	if payload.ErrorCode != "" {
+		t.Errorf("expected empty ErrorCode, got %s", payload.ErrorCode)
+	}
+	if payload.Error != "" {
+		t.Errorf("expected empty Error, got %s", payload.Error)
+	}
+
+	// Test error case
+	errMsg := NewRepoFetchResultMessage("test-req-err", false, "", apperrors.CodeSyncAuthFailed, "auth failed")
+	errPayload, ok := errMsg.Payload.(RepoFetchResultPayload)
+	if !ok {
+		t.Fatalf("expected RepoFetchResultPayload, got %T", errMsg.Payload)
+	}
+	if errPayload.Success {
+		t.Error("expected Success false")
+	}
+	if errPayload.Output != "" {
+		t.Errorf("expected empty Output, got %s", errPayload.Output)
+	}
+	if errPayload.ErrorCode != apperrors.CodeSyncAuthFailed {
+		t.Errorf("expected ErrorCode %s, got %s", apperrors.CodeSyncAuthFailed, errPayload.ErrorCode)
+	}
+	if errPayload.Error != "auth failed" {
+		t.Errorf("expected Error 'auth failed', got %s", errPayload.Error)
+	}
+}
+
+// TestNewRepoPullResultMessage tests the repo.pull_result message constructor.
+func TestNewRepoPullResultMessage(t *testing.T) {
+	// Test success case
+	msg := NewRepoPullResultMessage("test-req-pull", true, "Already up to date.", "", "")
+
+	if msg.Type != MessageTypeRepoPullResult {
+		t.Errorf("expected type %s, got %s", MessageTypeRepoPullResult, msg.Type)
+	}
+
+	payload, ok := msg.Payload.(RepoPullResultPayload)
+	if !ok {
+		t.Fatalf("expected RepoPullResultPayload, got %T", msg.Payload)
+	}
+
+	if payload.RequestID != "test-req-pull" {
+		t.Errorf("expected RequestID test-req-pull, got %s", payload.RequestID)
+	}
+	if !payload.Success {
+		t.Error("expected Success true")
+	}
+	if payload.Output != "Already up to date." {
+		t.Errorf("unexpected Output: %s", payload.Output)
+	}
+	if payload.ErrorCode != "" {
+		t.Errorf("expected empty ErrorCode, got %s", payload.ErrorCode)
+	}
+	if payload.Error != "" {
+		t.Errorf("expected empty Error, got %s", payload.Error)
+	}
+
+	// Test error case
+	errMsg := NewRepoPullResultMessage("test-req-err", false, "", apperrors.CodeSyncNonFF, "not fast-forward")
+	errPayload, ok := errMsg.Payload.(RepoPullResultPayload)
+	if !ok {
+		t.Fatalf("expected RepoPullResultPayload, got %T", errMsg.Payload)
+	}
+	if errPayload.Success {
+		t.Error("expected Success false")
+	}
+	if errPayload.Output != "" {
+		t.Errorf("expected empty Output, got %s", errPayload.Output)
+	}
+	if errPayload.ErrorCode != apperrors.CodeSyncNonFF {
+		t.Errorf("expected ErrorCode %s, got %s", apperrors.CodeSyncNonFF, errPayload.ErrorCode)
+	}
+	if errPayload.Error != "not fast-forward" {
+		t.Errorf("expected Error 'not fast-forward', got %s", errPayload.Error)
+	}
+}
+
+// TestHandleRepoFetch_MissingRequestID tests repo.fetch with empty/missing request_id.
+func TestHandleRepoFetch_MissingRequestID(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn) // session.status
+
+	msg := map[string]interface{}{
+		"type":    "repo.fetch",
+		"payload": map[string]interface{}{},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoFetchResult {
+		t.Fatalf("expected repo.fetch_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["success"] != false {
+		t.Error("expected success=false")
+	}
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+// TestHandleRepoPull_MissingRequestID tests repo.pull with empty/missing request_id.
+func TestHandleRepoPull_MissingRequestID(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn) // session.status
+
+	msg := map[string]interface{}{
+		"type":    "repo.pull",
+		"payload": map[string]interface{}{},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoPullResult {
+		t.Fatalf("expected repo.pull_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["success"] != false {
+		t.Error("expected success=false")
+	}
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+// TestHandleRepoFetch_NonStringRequestIDPreservesRawValue verifies malformed
+// payloads still echo recoverable raw request_id for correlation.
+func TestHandleRepoFetch_NonStringRequestIDPreservesRawValue(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn) // session.status
+
+	msg := map[string]interface{}{
+		"type": "repo.fetch",
+		"payload": map[string]interface{}{
+			"request_id": 123,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoFetchResult {
+		t.Fatalf("expected repo.fetch_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["request_id"] != "123" {
+		t.Errorf("expected raw request_id echoed as string, got %v", payload["request_id"])
+	}
+	if payload["success"] != false {
+		t.Error("expected success=false for malformed payload")
+	}
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+// TestHandleRepoPull_NonStringRequestIDPreservesRawValue verifies malformed
+// payloads still echo recoverable raw request_id for correlation.
+func TestHandleRepoPull_NonStringRequestIDPreservesRawValue(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn) // session.status
+
+	msg := map[string]interface{}{
+		"type": "repo.pull",
+		"payload": map[string]interface{}{
+			"request_id": 456,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoPullResult {
+		t.Fatalf("expected repo.pull_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["request_id"] != "456" {
+		t.Errorf("expected raw request_id echoed as string, got %v", payload["request_id"])
+	}
+	if payload["success"] != false {
+		t.Error("expected success=false for malformed payload")
+	}
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+// TestHandleRepoFetch_MutationGateBusy tests repo.fetch when repoMutationMu is already locked.
+func TestHandleRepoFetch_MutationGateBusy(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+	gitOps := NewGitOperations(repoDir, false, false, false)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(gitOps)
+
+	s.repoMutationMu.Lock()
+	defer s.repoMutationMu.Unlock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn) // session.status
+
+	msg := map[string]interface{}{
+		"type": "repo.fetch",
+		"payload": map[string]interface{}{
+			"request_id": "gate-fetch-1",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoFetchResult {
+		t.Fatalf("expected repo.fetch_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["request_id"] != "gate-fetch-1" {
+		t.Errorf("expected request_id gate-fetch-1, got %v", payload["request_id"])
+	}
+	if payload["success"] != false {
+		t.Error("expected success=false when gate is locked")
+	}
+	if payload["error_code"] != apperrors.CodeActionInvalid {
+		t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+	}
+	errMsg, _ := payload["error"].(string)
+	if errMsg != "repo mutation already in progress" {
+		t.Errorf("expected 'repo mutation already in progress', got %q", errMsg)
+	}
+}
+
+// TestHandleRepoPull_MutationGateBusy tests repo.pull when repoMutationMu is already locked.
+func TestHandleRepoPull_MutationGateBusy(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+	gitOps := NewGitOperations(repoDir, false, false, false)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(gitOps)
+
+	s.repoMutationMu.Lock()
+	defer s.repoMutationMu.Unlock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn) // session.status
+
+	msg := map[string]interface{}{
+		"type": "repo.pull",
+		"payload": map[string]interface{}{
+			"request_id": "gate-pull-1",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoPullResult {
+		t.Fatalf("expected repo.pull_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["request_id"] != "gate-pull-1" {
+		t.Errorf("expected request_id gate-pull-1, got %v", payload["request_id"])
+	}
+	if payload["success"] != false {
+		t.Error("expected success=false when gate is locked")
+	}
+	if payload["error_code"] != apperrors.CodeActionInvalid {
+		t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+	}
+	errMsg, _ := payload["error"].(string)
+	if errMsg != "repo mutation already in progress" {
+		t.Errorf("expected 'repo mutation already in progress', got %q", errMsg)
+	}
+}
+
+// TestHandleRepoFetch_RequesterOnly tests that fetch result goes only to the requester.
+func TestHandleRepoFetch_RequesterOnly(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1) // session.status
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2) // session.status
+
+	// Fetch will fail (no remote), but result should still be requester-only
+	msg := map[string]interface{}{
+		"type": "repo.fetch",
+		"payload": map[string]interface{}{
+			"request_id": "requester-fetch",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoFetchResult {
+		t.Fatalf("client 1 expected repo.fetch_result, got %s", resp1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.fetch_result")
+	}
+}
+
+// TestHandleRepoPull_RequesterOnly tests that pull result goes only to the requester.
+func TestHandleRepoPull_RequesterOnly(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1) // session.status
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2) // session.status
+
+	// Pull will fail (no remote), but result should still be requester-only
+	msg := map[string]interface{}{
+		"type": "repo.pull",
+		"payload": map[string]interface{}{
+			"request_id": "requester-pull",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoPullResult {
+		t.Fatalf("client 1 expected repo.pull_result, got %s", resp1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.pull_result")
+	}
+}
+
+// TestHandleRepoPull_NonFF tests that a non-fast-forward pull returns sync.non_ff error.
+// This test creates a real diverged repo scenario to trigger the non-ff code path.
+func TestHandleRepoPull_NonFF(t *testing.T) {
+	// Set up a "remote" bare repo and a local clone
+	remoteDir := t.TempDir()
+	runGitForCommitHandlerTest(t, remoteDir, "init", "--bare")
+
+	localDir := setupGitRepoForCommitHandlerTest(t)
+	runGitForCommitHandlerTest(t, localDir, "remote", "add", "origin", remoteDir)
+	runGitForCommitHandlerTest(t, localDir, "push", "-u", "origin", "HEAD")
+
+	// Create a second clone to push a diverging commit
+	cloneDir := t.TempDir()
+	cmd := exec.Command("git", "clone", remoteDir, cloneDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("clone failed: %v\n%s", err, out)
+	}
+	runGitForCommitHandlerTest(t, cloneDir, "config", "user.email", "other@example.com")
+	runGitForCommitHandlerTest(t, cloneDir, "config", "user.name", "Other User")
+
+	// Push a new commit from the clone to create divergence
+	otherFile := filepath.Join(cloneDir, "other.txt")
+	if err := os.WriteFile(otherFile, []byte("other content"), 0644); err != nil {
+		t.Fatalf("write other file: %v", err)
+	}
+	runGitForCommitHandlerTest(t, cloneDir, "add", "other.txt")
+	runGitForCommitHandlerTest(t, cloneDir, "commit", "-m", "diverging commit from clone")
+	runGitForCommitHandlerTest(t, cloneDir, "push", "origin", "HEAD")
+
+	// Create a local commit on top of the old HEAD to make pull non-ff
+	localFile := filepath.Join(localDir, "local.txt")
+	if err := os.WriteFile(localFile, []byte("local content"), 0644); err != nil {
+		t.Fatalf("write local file: %v", err)
+	}
+	runGitForCommitHandlerTest(t, localDir, "add", "local.txt")
+	runGitForCommitHandlerTest(t, localDir, "commit", "-m", "local diverging commit")
+
+	// Now a pull --ff-only should fail with non-ff
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(localDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn) // session.status
+
+	msg := map[string]interface{}{
+		"type": "repo.pull",
+		"payload": map[string]interface{}{
+			"request_id": "pull-nonff-1",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoPullResult {
+		t.Fatalf("expected repo.pull_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["request_id"] != "pull-nonff-1" {
+		t.Errorf("expected request_id pull-nonff-1, got %v", payload["request_id"])
+	}
+	if payload["success"] != false {
+		t.Error("expected success=false for non-ff pull")
+	}
+	if payload["error_code"] != apperrors.CodeSyncNonFF {
+		t.Errorf("expected %s, got %v", apperrors.CodeSyncNonFF, payload["error_code"])
+	}
+}
+
+// -----------------------------------------------------------------------------
+// PR message constructor tests (P9U4)
+// -----------------------------------------------------------------------------
+
+func TestNewRepoPrListResultMessage(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		entries := []RepoPrEntryPayload{
+			{Number: 1, Title: "Fix bug", State: "open", HeadBranch: "fix", BaseBranch: "main", Author: "me", URL: "http://1"},
+		}
+		msg := NewRepoPrListResultMessage("req-pr-list-1", true, entries, "", "")
+		if msg.Type != MessageTypeRepoPrListResult {
+			t.Errorf("expected %s, got %s", MessageTypeRepoPrListResult, msg.Type)
+		}
+		p, ok := msg.Payload.(RepoPrListResultPayload)
+		if !ok {
+			t.Fatalf("expected RepoPrListResultPayload, got %T", msg.Payload)
+		}
+		if p.RequestID != "req-pr-list-1" || !p.Success || len(p.Entries) != 1 {
+			t.Errorf("unexpected payload: %+v", p)
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		msg := NewRepoPrListResultMessage("req-pr-list-2", false, nil, apperrors.CodePrGhMissing, "gh not found")
+		p, _ := msg.Payload.(RepoPrListResultPayload)
+		if p.Success || p.ErrorCode != apperrors.CodePrGhMissing {
+			t.Errorf("unexpected payload: %+v", p)
+		}
+	})
+}
+
+func TestNewRepoPrViewResultMessage(t *testing.T) {
+	pr := &RepoPrDetailPayload{Number: 42, Title: "Test PR", State: "open", URL: "http://42"}
+	msg := NewRepoPrViewResultMessage("req-pr-view-1", true, pr, "", "")
+	if msg.Type != MessageTypeRepoPrViewResult {
+		t.Errorf("expected %s, got %s", MessageTypeRepoPrViewResult, msg.Type)
+	}
+	p, ok := msg.Payload.(RepoPrViewResultPayload)
+	if !ok {
+		t.Fatalf("expected RepoPrViewResultPayload, got %T", msg.Payload)
+	}
+	if p.RequestID != "req-pr-view-1" || !p.Success || p.PR == nil || p.PR.Number != 42 {
+		t.Errorf("unexpected payload: %+v", p)
+	}
+}
+
+func TestNewRepoPrCreateResultMessage(t *testing.T) {
+	pr := &RepoPrDetailPayload{Number: 99, Title: "New PR", State: "open", URL: "http://99"}
+	msg := NewRepoPrCreateResultMessage("req-pr-create-1", true, pr, "", "")
+	if msg.Type != MessageTypeRepoPrCreateResult {
+		t.Errorf("expected %s, got %s", MessageTypeRepoPrCreateResult, msg.Type)
+	}
+	p, ok := msg.Payload.(RepoPrCreateResultPayload)
+	if !ok {
+		t.Fatalf("expected RepoPrCreateResultPayload, got %T", msg.Payload)
+	}
+	if p.RequestID != "req-pr-create-1" || !p.Success || p.PR == nil || p.PR.Number != 99 {
+		t.Errorf("unexpected payload: %+v", p)
+	}
+}
+
+func TestNewRepoPrCheckoutResultMessage(t *testing.T) {
+	t.Run("success with branch change", func(t *testing.T) {
+		msg := NewRepoPrCheckoutResultMessage("req-pr-co-1", true, "feature-x", true, nil, "", "")
+		if msg.Type != MessageTypeRepoPrCheckoutResult {
+			t.Errorf("expected %s, got %s", MessageTypeRepoPrCheckoutResult, msg.Type)
+		}
+		p, ok := msg.Payload.(RepoPrCheckoutResultPayload)
+		if !ok {
+			t.Fatalf("expected RepoPrCheckoutResultPayload, got %T", msg.Payload)
+		}
+		if !p.Success || p.BranchName != "feature-x" || !p.ChangedBranch {
+			t.Errorf("unexpected payload: %+v", p)
+		}
+	})
+
+	t.Run("failure with blockers", func(t *testing.T) {
+		blockers := []string{"staged_changes_present"}
+		msg := NewRepoPrCheckoutResultMessage("req-pr-co-2", false, "", false, blockers,
+			apperrors.CodePrCheckoutBlockedDirty, "dirty")
+		p, _ := msg.Payload.(RepoPrCheckoutResultPayload)
+		if p.Success || p.ErrorCode != apperrors.CodePrCheckoutBlockedDirty || len(p.Blockers) != 1 {
+			t.Errorf("unexpected payload: %+v", p)
+		}
+	})
+}
+
+// -----------------------------------------------------------------------------
+// PR handler tests (P9U4)
+// -----------------------------------------------------------------------------
+
+func TestHandleRepoPrList_MissingRequestID(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn) // session.status
+
+	msg := map[string]interface{}{
+		"type":    "repo.pr_list",
+		"payload": map[string]interface{}{},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoPrListResult {
+		t.Fatalf("expected repo.pr_list_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["success"] != false {
+		t.Error("expected success=false")
+	}
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+func TestHandleRepoPrView_MissingRequestID(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_view",
+		"payload": map[string]interface{}{
+			"number": 1,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoPrViewResult {
+		t.Fatalf("expected repo.pr_view_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+func TestHandleRepoPrCreate_MissingRequestID(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"title": "test",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoPrCreateResult {
+		t.Fatalf("expected repo.pr_create_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+func TestHandleRepoPrCheckout_MissingRequestID(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"number": 1,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeRepoPrCheckoutResult {
+		t.Fatalf("expected repo.pr_checkout_result, got %s", resp.Type)
+	}
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+func TestHandleRepoPrCreate_MutationGateBusy(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	// Lock the mutation gate
+	s.repoMutationMu.Lock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "pr-create-busy",
+			"title":      "My PR",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["request_id"] != "pr-create-busy" {
+		t.Errorf("expected request_id echo, got %v", payload["request_id"])
+	}
+	if payload["success"] != false {
+		t.Error("expected success=false when gate busy")
+	}
+	if payload["error_code"] != apperrors.CodeActionInvalid {
+		t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+	}
+
+	s.repoMutationMu.Unlock()
+}
+
+func TestHandleRepoPrCheckout_MutationGateBusy(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	s.repoMutationMu.Lock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": "pr-co-busy",
+			"number":     42,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["error_code"] != apperrors.CodeActionInvalid {
+		t.Errorf("expected %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
+	}
+
+	s.repoMutationMu.Unlock()
+}
+
+func TestHandleRepoPrCheckout_DirtyBlocked(t *testing.T) {
+	dir := setupTestRepo(t)
+	// Create dirty state
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	runGitCmd(t, dir, "add", "dirty.txt")
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(dir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": "pr-co-dirty",
+			"number":     42,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["error_code"] != apperrors.CodePrCheckoutBlockedDirty {
+		t.Errorf("expected %s, got %v", apperrors.CodePrCheckoutBlockedDirty, payload["error_code"])
+	}
+	blockers, ok := payload["blockers"].([]interface{})
+	if !ok || len(blockers) == 0 {
+		t.Error("expected non-empty blockers array")
+	}
+}
+
+func TestHandleRepoPrCheckout_NeverEmitsDraftBlocked(t *testing.T) {
+	dir := setupTestRepo(t)
+	// Create dirty state - will be blocked by dirty, NOT draft
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	runGitCmd(t, dir, "add", "dirty.txt")
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(dir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": "pr-co-no-draft",
+			"number":     42,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	// Must never emit pr.checkout_blocked_draft
+	if payload["error_code"] == apperrors.CodePrCheckoutBlockedDraft {
+		t.Fatal("host must NEVER emit pr.checkout_blocked_draft - draft block is mobile-local only")
+	}
+}
+
+func TestHandleRepoPrCreate_ValidationEmptyTitle(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "pr-create-empty-title",
+			"title":      "   ",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["error_code"] != apperrors.CodePrValidationFailed {
+		t.Errorf("expected %s, got %v", apperrors.CodePrValidationFailed, payload["error_code"])
+	}
+}
+
+func TestHandleRepoPrCreate_ValidationWhitespaceBaseBranch(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id":  "pr-create-ws-base",
+			"title":       "Valid Title",
+			"base_branch": "   ",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["error_code"] != apperrors.CodePrValidationFailed {
+		t.Errorf("expected %s, got %v", apperrors.CodePrValidationFailed, payload["error_code"])
+	}
+}
+
+func TestHandleRepoPrView_InvalidNumber(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_view",
+		"payload": map[string]interface{}{
+			"request_id": "pr-view-invalid",
+			"number":     0,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["error_code"] != apperrors.CodePrValidationFailed {
+		t.Errorf("expected %s, got %v", apperrors.CodePrValidationFailed, payload["error_code"])
+	}
+}
+
+func TestHandleRepoPrCheckout_InvalidNumber(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(setupTestRepo(t), false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": "pr-co-invalid",
+			"number":     -1,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["error_code"] != apperrors.CodePrValidationFailed {
+		t.Errorf("expected %s, got %v", apperrors.CodePrValidationFailed, payload["error_code"])
+	}
+}
+
+// =============================================================================
+// P9U5: Idempotency Replay Tests
+// =============================================================================
+
+func TestHandleRepoFetch_IdempotencyReplay(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.fetch",
+		"payload": map[string]interface{}{
+			"request_id": "idem-fetch",
+		},
+	}
+	data, _ := json.Marshal(msg)
+
+	// First request (will fail since no remote, but result cached)
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+
+	// Replay same request
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+
+	if p1["success"] != p2["success"] {
+		t.Errorf("replay success mismatch: first=%v replay=%v", p1["success"], p2["success"])
+	}
+	if p2["request_id"] != "idem-fetch" {
+		t.Errorf("expected request_id idem-fetch, got %v", p2["request_id"])
+	}
+}
+
+func TestHandleRepoPull_IdempotencyReplay(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pull",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pull",
+		},
+	}
+	data, _ := json.Marshal(msg)
+
+	// First request
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+
+	// Replay same request
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+
+	if p1["success"] != p2["success"] {
+		t.Errorf("replay success mismatch: first=%v replay=%v", p1["success"], p2["success"])
+	}
+	if p2["request_id"] != "idem-pull" {
+		t.Errorf("expected request_id idem-pull, got %v", p2["request_id"])
+	}
+}
+
+func TestHandleRepoPrCreate_IdempotencyReplay(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	// PR create will fail (no gh CLI configured), but result should be cached
+	msg := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pr-create",
+			"title":      "Test PR",
+			"body":       "Test body",
+		},
+	}
+	data, _ := json.Marshal(msg)
+
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+
+	// Replay same request
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+
+	if p1["success"] != p2["success"] {
+		t.Errorf("replay success mismatch: first=%v replay=%v", p1["success"], p2["success"])
+	}
+	if p2["request_id"] != "idem-pr-create" {
+		t.Errorf("expected request_id idem-pr-create, got %v", p2["request_id"])
+	}
+}
+
+func TestHandleRepoPrCheckout_IdempotencyReplay(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	// PR checkout will fail (no PR), but result should be cached
+	msg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pr-checkout",
+			"number":     42,
+		},
+	}
+	data, _ := json.Marshal(msg)
+
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+
+	// Replay same request
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+
+	if p1["success"] != p2["success"] {
+		t.Errorf("replay success mismatch: first=%v replay=%v", p1["success"], p2["success"])
+	}
+	if p2["request_id"] != "idem-pr-checkout" {
+		t.Errorf("expected request_id idem-pr-checkout, got %v", p2["request_id"])
+	}
+}
+
+// =============================================================================
+// P9U5: Idempotency Mismatch Tests
+// =============================================================================
+
+func TestHandleRepoPrCreate_IdempotencyMismatch(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	// First request
+	msg1 := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pr-mm",
+			"title":      "Title A",
+		},
+	}
+	data1, _ := json.Marshal(msg1)
+	conn.WriteMessage(websocket.TextMessage, data1)
+	readMessage(t, conn)
+
+	// Same request_id, different title
+	msg2 := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pr-mm",
+			"title":      "Title B",
+		},
+	}
+	data2, _ := json.Marshal(msg2)
+	conn.WriteMessage(websocket.TextMessage, data2)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["success"] != false {
+		t.Error("expected success=false for mismatch")
+	}
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+func TestHandleRepoPrCheckout_IdempotencyMismatch(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	// First request
+	msg1 := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": "idem-prco-mm",
+			"number":     42,
+		},
+	}
+	data1, _ := json.Marshal(msg1)
+	conn.WriteMessage(websocket.TextMessage, data1)
+	readMessage(t, conn)
+
+	// Same request_id, different number
+	msg2 := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": "idem-prco-mm",
+			"number":     99,
+		},
+	}
+	data2, _ := json.Marshal(msg2)
+	conn.WriteMessage(websocket.TextMessage, data2)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["success"] != false {
+		t.Error("expected success=false for mismatch")
+	}
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+// =============================================================================
+// P9U5: Normalized Replay/Mismatch Tests (AC18)
+// =============================================================================
+
+func TestHandleRepoPrCreate_IdempotencyNormalizedReplay(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	// First request: draft omitted (nil -> false), title with trailing space
+	msg1 := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pr-norm",
+			"title":      "Normalized Title ",
+		},
+	}
+	data1, _ := json.Marshal(msg1)
+	conn.WriteMessage(websocket.TextMessage, data1)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+
+	// Replay with draft=false explicitly, trimmed title
+	msg2 := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pr-norm",
+			"title":      "Normalized Title",
+			"draft":      false,
+		},
+	}
+	data2, _ := json.Marshal(msg2)
+	conn.WriteMessage(websocket.TextMessage, data2)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+
+	// Should replay (same fingerprint after normalization)
+	if p1["success"] != p2["success"] {
+		t.Errorf("normalized replay success mismatch: first=%v replay=%v", p1["success"], p2["success"])
+	}
+}
+
+func TestHandleRepoPrCreate_IdempotencyNormalizedMismatch(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	// First request
+	msg1 := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pr-norm-mm",
+			"title":      "Title Alpha",
+		},
+	}
+	data1, _ := json.Marshal(msg1)
+	conn.WriteMessage(websocket.TextMessage, data1)
+	readMessage(t, conn)
+
+	// Same request_id, semantically different after trim
+	msg2 := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pr-norm-mm",
+			"title":      "Title Beta",
+		},
+	}
+	data2, _ := json.Marshal(msg2)
+	conn.WriteMessage(websocket.TextMessage, data2)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["success"] != false {
+		t.Error("expected success=false for normalized mismatch")
+	}
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+func TestHandleRepoPrCreate_IdempotencyBaseBranchPresenceMismatch(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	// First request omits base_branch (default behavior).
+	msg1 := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "idem-pr-base-presence-mm",
+			"title":      "Presence Test",
+		},
+	}
+	data1, _ := json.Marshal(msg1)
+	conn.WriteMessage(websocket.TextMessage, data1)
+	readMessage(t, conn)
+
+	// Same request_id with whitespace-only base_branch is semantically different:
+	// it should not replay the previous result and must fail mismatch.
+	msg2 := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id":  "idem-pr-base-presence-mm",
+			"title":       "Presence Test",
+			"base_branch": "   ",
+		},
+	}
+	data2, _ := json.Marshal(msg2)
+	conn.WriteMessage(websocket.TextMessage, data2)
+
+	resp := readMessage(t, conn)
+	payload, _ := resp.Payload.(map[string]interface{})
+	if payload["success"] != false {
+		t.Error("expected success=false for base_branch presence mismatch")
+	}
+	if payload["error_code"] != apperrors.CodeServerInvalidMessage {
+		t.Errorf("expected %s, got %v", apperrors.CodeServerInvalidMessage, payload["error_code"])
+	}
+}
+
+// =============================================================================
+// P9U5: In-Flight Coalesce Tests
+// =============================================================================
+
+func TestHandleRepoFetch_InFlightCoalesce(t *testing.T) {
+	client := &Client{
+		send:   make(chan Message, 4),
+		done:   make(chan struct{}),
+		server: NewServer("unused"),
+	}
+
+	requestID := "in-flight-fetch-1"
+	fingerprint := fetchFingerprint()
+	resultMsg := NewRepoFetchResultMessage(requestID, true, "From origin", "", "")
+
+	// First request becomes the in-flight owner.
+	if _, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoFetch, requestID, fingerprint); err != nil {
+		t.Fatalf("first idempotencyCheckOrBegin failed: %v", err)
+	} else if replay {
+		t.Fatal("first request should not replay from cache")
+	} else if inFlight != nil {
+		t.Fatal("first request should not coalesce onto existing in-flight entry")
+	}
+
+	// Exact duplicate should coalesce and wait for completion.
+	_, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoFetch, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("duplicate idempotencyCheckOrBegin failed: %v", err)
+	}
+	if replay {
+		t.Fatal("duplicate should not replay before owner completes")
+	}
+	if inFlight == nil {
+		t.Fatal("duplicate should coalesce onto in-flight request")
+	}
+
+	// Owner completes; coalesced duplicate observes exact final result.
+	client.idempotencyComplete(MessageTypeRepoFetch, requestID, fingerprint, resultMsg)
+	select {
+	case <-inFlight.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight completion")
+	}
+	if inFlight.Result.Type != MessageTypeRepoFetchResult {
+		t.Fatalf("expected result type %s, got %s", MessageTypeRepoFetchResult, inFlight.Result.Type)
+	}
+
+	// Any later duplicate should replay from completed cache.
+	cached, replay, waiting, err := client.idempotencyCheckOrBegin(MessageTypeRepoFetch, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("replay idempotencyCheckOrBegin failed: %v", err)
+	}
+	if !replay {
+		t.Fatal("expected completed replay hit")
+	}
+	if waiting != nil {
+		t.Fatal("expected no in-flight entry after completion")
+	}
+	if cached.Type != MessageTypeRepoFetchResult {
+		t.Fatalf("expected replay type %s, got %s", MessageTypeRepoFetchResult, cached.Type)
+	}
+}
+
+func TestHandleRepoPull_InFlightCoalesce(t *testing.T) {
+	client := &Client{
+		send:   make(chan Message, 4),
+		done:   make(chan struct{}),
+		server: NewServer("unused"),
+	}
+
+	requestID := "in-flight-pull-1"
+	fingerprint := pullFingerprint()
+	resultMsg := NewRepoPullResultMessage(requestID, true, "Already up to date.", "", "")
+
+	if _, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoPull, requestID, fingerprint); err != nil {
+		t.Fatalf("first idempotencyCheckOrBegin failed: %v", err)
+	} else if replay {
+		t.Fatal("first request should not replay from cache")
+	} else if inFlight != nil {
+		t.Fatal("first request should not coalesce onto existing in-flight entry")
+	}
+
+	_, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoPull, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("duplicate idempotencyCheckOrBegin failed: %v", err)
+	}
+	if replay {
+		t.Fatal("duplicate should not replay before owner completes")
+	}
+	if inFlight == nil {
+		t.Fatal("duplicate should coalesce onto in-flight request")
+	}
+
+	client.idempotencyComplete(MessageTypeRepoPull, requestID, fingerprint, resultMsg)
+	select {
+	case <-inFlight.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight completion")
+	}
+	if inFlight.Result.Type != MessageTypeRepoPullResult {
+		t.Fatalf("expected result type %s, got %s", MessageTypeRepoPullResult, inFlight.Result.Type)
+	}
+
+	cached, replay, waiting, err := client.idempotencyCheckOrBegin(MessageTypeRepoPull, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("replay idempotencyCheckOrBegin failed: %v", err)
+	}
+	if !replay {
+		t.Fatal("expected completed replay hit")
+	}
+	if waiting != nil {
+		t.Fatal("expected no in-flight entry after completion")
+	}
+	if cached.Type != MessageTypeRepoPullResult {
+		t.Fatalf("expected replay type %s, got %s", MessageTypeRepoPullResult, cached.Type)
+	}
+}
+
+func TestHandleRepoPrCreate_InFlightCoalesce(t *testing.T) {
+	client := &Client{
+		send:   make(chan Message, 4),
+		done:   make(chan struct{}),
+		server: NewServer("unused"),
+	}
+
+	requestID := "in-flight-pr-create-1"
+	fingerprint := prCreateFingerprint("Test PR", "body", "", false, false)
+	resultMsg := NewRepoPrCreateResultMessage(requestID, true, &RepoPrDetailPayload{Number: 1, Title: "Test PR"}, "", "")
+
+	if _, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoPrCreate, requestID, fingerprint); err != nil {
+		t.Fatalf("first idempotencyCheckOrBegin failed: %v", err)
+	} else if replay {
+		t.Fatal("first request should not replay from cache")
+	} else if inFlight != nil {
+		t.Fatal("first request should not coalesce onto existing in-flight entry")
+	}
+
+	_, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoPrCreate, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("duplicate idempotencyCheckOrBegin failed: %v", err)
+	}
+	if replay {
+		t.Fatal("duplicate should not replay before owner completes")
+	}
+	if inFlight == nil {
+		t.Fatal("duplicate should coalesce onto in-flight request")
+	}
+
+	// Mismatch while in-flight remains invalid.
+	if _, _, _, mismatchErr := client.idempotencyCheckOrBegin(
+		MessageTypeRepoPrCreate,
+		requestID,
+		prCreateFingerprint("Different Title", "body", "", false, false),
+	); mismatchErr == nil {
+		t.Fatal("expected mismatch error for same request_id with different fingerprint while in-flight")
+	}
+
+	client.idempotencyComplete(MessageTypeRepoPrCreate, requestID, fingerprint, resultMsg)
+	select {
+	case <-inFlight.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight completion")
+	}
+	if inFlight.Result.Type != MessageTypeRepoPrCreateResult {
+		t.Fatalf("expected result type %s, got %s", MessageTypeRepoPrCreateResult, inFlight.Result.Type)
+	}
+
+	cached, replay, waiting, err := client.idempotencyCheckOrBegin(MessageTypeRepoPrCreate, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("replay idempotencyCheckOrBegin failed: %v", err)
+	}
+	if !replay {
+		t.Fatal("expected completed replay hit")
+	}
+	if waiting != nil {
+		t.Fatal("expected no in-flight entry after completion")
+	}
+	if cached.Type != MessageTypeRepoPrCreateResult {
+		t.Fatalf("expected replay type %s, got %s", MessageTypeRepoPrCreateResult, cached.Type)
+	}
+}
+
+func TestHandleRepoPrCheckout_InFlightCoalesce(t *testing.T) {
+	client := &Client{
+		send:   make(chan Message, 4),
+		done:   make(chan struct{}),
+		server: NewServer("unused"),
+	}
+
+	requestID := "in-flight-pr-checkout-1"
+	fingerprint := prCheckoutFingerprint(42)
+	resultMsg := NewRepoPrCheckoutResultMessage(requestID, true, "pr-42", true, nil, "", "")
+
+	if _, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoPrCheckout, requestID, fingerprint); err != nil {
+		t.Fatalf("first idempotencyCheckOrBegin failed: %v", err)
+	} else if replay {
+		t.Fatal("first request should not replay from cache")
+	} else if inFlight != nil {
+		t.Fatal("first request should not coalesce onto existing in-flight entry")
+	}
+
+	_, replay, inFlight, err := client.idempotencyCheckOrBegin(MessageTypeRepoPrCheckout, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("duplicate idempotencyCheckOrBegin failed: %v", err)
+	}
+	if replay {
+		t.Fatal("duplicate should not replay before owner completes")
+	}
+	if inFlight == nil {
+		t.Fatal("duplicate should coalesce onto in-flight request")
+	}
+
+	// Mismatch while in-flight remains invalid.
+	if _, _, _, mismatchErr := client.idempotencyCheckOrBegin(
+		MessageTypeRepoPrCheckout,
+		requestID,
+		prCheckoutFingerprint(99),
+	); mismatchErr == nil {
+		t.Fatal("expected mismatch error for same request_id with different fingerprint while in-flight")
+	}
+
+	client.idempotencyComplete(MessageTypeRepoPrCheckout, requestID, fingerprint, resultMsg)
+	select {
+	case <-inFlight.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight completion")
+	}
+	if inFlight.Result.Type != MessageTypeRepoPrCheckoutResult {
+		t.Fatalf("expected result type %s, got %s", MessageTypeRepoPrCheckoutResult, inFlight.Result.Type)
+	}
+
+	cached, replay, waiting, err := client.idempotencyCheckOrBegin(MessageTypeRepoPrCheckout, requestID, fingerprint)
+	if err != nil {
+		t.Fatalf("replay idempotencyCheckOrBegin failed: %v", err)
+	}
+	if !replay {
+		t.Fatal("expected completed replay hit")
+	}
+	if waiting != nil {
+		t.Fatal("expected no in-flight entry after completion")
+	}
+	if cached.Type != MessageTypeRepoPrCheckoutResult {
+		t.Fatalf("expected replay type %s, got %s", MessageTypeRepoPrCheckoutResult, cached.Type)
+	}
+}
+
+// =============================================================================
+// P9U5: Cross-Op Isolation Tests
+// =============================================================================
+
+func TestHandleRepoFetchPull_CrossOpIsolation(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	sharedID := "shared-sync-id"
+
+	// Fetch with shared ID
+	fetchMsg := map[string]interface{}{
+		"type": "repo.fetch",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+		},
+	}
+	fetchData, _ := json.Marshal(fetchMsg)
+	conn.WriteMessage(websocket.TextMessage, fetchData)
+	fetchResp := readMessage(t, conn)
+	if fetchResp.Type != MessageTypeRepoFetchResult {
+		t.Fatalf("expected repo.fetch_result, got %s", fetchResp.Type)
+	}
+
+	// Pull with same request_id should NOT be treated as replay of fetch
+	pullMsg := map[string]interface{}{
+		"type": "repo.pull",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+		},
+	}
+	pullData, _ := json.Marshal(pullMsg)
+	conn.WriteMessage(websocket.TextMessage, pullData)
+	pullResp := readMessage(t, conn)
+	if pullResp.Type != MessageTypeRepoPullResult {
+		t.Fatalf("expected repo.pull_result, got %s", pullResp.Type)
+	}
+}
+
+func TestHandleRepoPrCreateCheckout_CrossOpIsolation(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	sharedID := "shared-pr-id"
+
+	// PR create with shared ID
+	createMsg := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+			"title":      "Cross-op PR",
+		},
+	}
+	createData, _ := json.Marshal(createMsg)
+	conn.WriteMessage(websocket.TextMessage, createData)
+	createResp := readMessage(t, conn)
+	if createResp.Type != MessageTypeRepoPrCreateResult {
+		t.Fatalf("expected repo.pr_create_result, got %s", createResp.Type)
+	}
+
+	// PR checkout with same request_id should NOT be treated as replay
+	checkoutMsg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+			"number":     42,
+		},
+	}
+	checkoutData, _ := json.Marshal(checkoutMsg)
+	conn.WriteMessage(websocket.TextMessage, checkoutData)
+	checkoutResp := readMessage(t, conn)
+	if checkoutResp.Type != MessageTypeRepoPrCheckoutResult {
+		t.Fatalf("expected repo.pr_checkout_result, got %s", checkoutResp.Type)
+	}
+}
+
+// =============================================================================
+// P9U5: Cross-Client Isolation Tests
+// =============================================================================
+
+func TestHandleRepoFetch_CrossClientIsolation(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	sharedID := "cross-client-fetch"
+
+	// Client 1 sends fetch
+	msg := map[string]interface{}{
+		"type": "repo.fetch",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+	readMessage(t, conn1)
+
+	// Client 2 sends fetch with same request_id - should get independent response
+	conn2.WriteMessage(websocket.TextMessage, data)
+	resp := readMessage(t, conn2)
+	if resp.Type != MessageTypeRepoFetchResult {
+		t.Fatalf("client 2 expected repo.fetch_result, got %s", resp.Type)
+	}
+}
+
+func TestHandleRepoPull_CrossClientIsolation(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	sharedID := "cross-client-pull"
+
+	msg := map[string]interface{}{
+		"type": "repo.pull",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+	readMessage(t, conn1)
+
+	conn2.WriteMessage(websocket.TextMessage, data)
+	resp := readMessage(t, conn2)
+	if resp.Type != MessageTypeRepoPullResult {
+		t.Fatalf("client 2 expected repo.pull_result, got %s", resp.Type)
+	}
+}
+
+func TestHandleRepoPrCreate_CrossClientIsolation(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	sharedID := "cross-client-pr-create"
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+			"title":      "Cross-client PR",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+	readMessage(t, conn1)
+
+	conn2.WriteMessage(websocket.TextMessage, data)
+	resp := readMessage(t, conn2)
+	if resp.Type != MessageTypeRepoPrCreateResult {
+		t.Fatalf("client 2 expected repo.pr_create_result, got %s", resp.Type)
+	}
+}
+
+func TestHandleRepoPrCheckout_CrossClientIsolation(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	sharedID := "cross-client-pr-checkout"
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": sharedID,
+			"number":     42,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+	readMessage(t, conn1)
+
+	conn2.WriteMessage(websocket.TextMessage, data)
+	resp := readMessage(t, conn2)
+	if resp.Type != MessageTypeRepoPrCheckoutResult {
+		t.Fatalf("client 2 expected repo.pr_checkout_result, got %s", resp.Type)
+	}
+}
+
+// =============================================================================
+// P9U5: Duplicate-Under-Gate Tests (AC3)
+// =============================================================================
+
+func TestHandleRepoFetch_DuplicateUnderGate(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	// Lock the mutation gate
+	s.repoMutationMu.Lock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.fetch",
+		"payload": map[string]interface{}{
+			"request_id": "gate-busy-fetch",
+		},
+	}
+	data, _ := json.Marshal(msg)
+
+	// First send: gate busy -> action.invalid cached
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+	if p1["error_code"] != apperrors.CodeActionInvalid {
+		t.Fatalf("expected %s, got %v", apperrors.CodeActionInvalid, p1["error_code"])
+	}
+
+	// Second send: replays cached error
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+	if p2["error_code"] != apperrors.CodeActionInvalid {
+		t.Errorf("expected replayed %s, got %v", apperrors.CodeActionInvalid, p2["error_code"])
+	}
+
+	s.repoMutationMu.Unlock()
+}
+
+func TestHandleRepoPull_DuplicateUnderGate(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	s.repoMutationMu.Lock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pull",
+		"payload": map[string]interface{}{
+			"request_id": "gate-busy-pull",
+		},
+	}
+	data, _ := json.Marshal(msg)
+
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+	if p1["error_code"] != apperrors.CodeActionInvalid {
+		t.Fatalf("expected %s, got %v", apperrors.CodeActionInvalid, p1["error_code"])
+	}
+
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+	if p2["error_code"] != apperrors.CodeActionInvalid {
+		t.Errorf("expected replayed %s, got %v", apperrors.CodeActionInvalid, p2["error_code"])
+	}
+
+	s.repoMutationMu.Unlock()
+}
+
+func TestHandleRepoPrCreate_DuplicateUnderGate(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	s.repoMutationMu.Lock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "gate-busy-pr-create",
+			"title":      "Gate busy PR",
+		},
+	}
+	data, _ := json.Marshal(msg)
+
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+	if p1["error_code"] != apperrors.CodeActionInvalid {
+		t.Fatalf("expected %s, got %v", apperrors.CodeActionInvalid, p1["error_code"])
+	}
+
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+	if p2["error_code"] != apperrors.CodeActionInvalid {
+		t.Errorf("expected replayed %s, got %v", apperrors.CodeActionInvalid, p2["error_code"])
+	}
+
+	s.repoMutationMu.Unlock()
+}
+
+func TestHandleRepoPrCheckout_DuplicateUnderGate(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	s.repoMutationMu.Lock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readMessage(t, conn)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": "gate-busy-pr-checkout",
+			"number":     42,
+		},
+	}
+	data, _ := json.Marshal(msg)
+
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp1 := readMessage(t, conn)
+	p1, _ := resp1.Payload.(map[string]interface{})
+	if p1["error_code"] != apperrors.CodeActionInvalid {
+		t.Fatalf("expected %s, got %v", apperrors.CodeActionInvalid, p1["error_code"])
+	}
+
+	conn.WriteMessage(websocket.TextMessage, data)
+	resp2 := readMessage(t, conn)
+	p2, _ := resp2.Payload.(map[string]interface{})
+	if p2["error_code"] != apperrors.CodeActionInvalid {
+		t.Errorf("expected replayed %s, got %v", apperrors.CodeActionInvalid, p2["error_code"])
+	}
+
+	s.repoMutationMu.Unlock()
+}
+
+// =============================================================================
+// P9U5: Requester-Only Tests (PR ops)
+// =============================================================================
+
+func TestHandleRepoPrCreate_RequesterOnly(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_create",
+		"payload": map[string]interface{}{
+			"request_id": "requester-pr-create",
+			"title":      "Requester-only PR",
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoPrCreateResult {
+		t.Fatalf("client 1 expected repo.pr_create_result, got %s", resp1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.pr_create_result")
+	}
+}
+
+func TestHandleRepoPrCheckout_RequesterOnly(t *testing.T) {
+	repoDir := setupGitRepoForCommitHandlerTest(t)
+
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+	s.SetGitOperations(NewGitOperations(repoDir, false, false, false))
+
+	conn1, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 1: %v", err)
+	}
+	defer conn1.Close()
+	readMessage(t, conn1)
+
+	conn2, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial client 2: %v", err)
+	}
+	defer conn2.Close()
+	readMessage(t, conn2)
+
+	msg := map[string]interface{}{
+		"type": "repo.pr_checkout",
+		"payload": map[string]interface{}{
+			"request_id": "requester-pr-checkout",
+			"number":     42,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	conn1.WriteMessage(websocket.TextMessage, data)
+
+	resp1 := readMessage(t, conn1)
+	if resp1.Type != MessageTypeRepoPrCheckoutResult {
+		t.Fatalf("client 1 expected repo.pr_checkout_result, got %s", resp1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, _, err = conn2.ReadMessage()
+	if err == nil {
+		t.Error("client 2 should NOT receive repo.pr_checkout_result")
 	}
 }

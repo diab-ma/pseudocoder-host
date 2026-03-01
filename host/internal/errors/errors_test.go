@@ -2,6 +2,7 @@ package errors
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -234,6 +235,26 @@ func TestErrorConstructors(t *testing.T) {
 			t.Error("Internal() should preserve cause")
 		}
 	})
+
+	t.Run("CommitReadinessBlocked", func(t *testing.T) {
+		err := CommitReadinessBlocked([]string{"no_staged_changes"})
+		if !IsCode(err, CodeCommitReadinessBlocked) {
+			t.Errorf("CommitReadinessBlocked() code = %q, want %q", GetCode(err), CodeCommitReadinessBlocked)
+		}
+		if !strings.Contains(err.Message, "no_staged_changes") {
+			t.Errorf("CommitReadinessBlocked() message = %q", err.Message)
+		}
+	})
+
+	t.Run("CommitOverrideRequired", func(t *testing.T) {
+		err := CommitOverrideRequired([]string{"unstaged_changes_present"})
+		if !IsCode(err, CodeCommitOverrideRequired) {
+			t.Errorf("CommitOverrideRequired() code = %q, want %q", GetCode(err), CodeCommitOverrideRequired)
+		}
+		if !strings.Contains(err.Message, "unstaged_changes_present") {
+			t.Errorf("CommitOverrideRequired() message = %q", err.Message)
+		}
+	})
 }
 
 func TestErrorsAs(t *testing.T) {
@@ -279,6 +300,14 @@ func TestErrorCodes(t *testing.T) {
 		CodeAuthInvalid,
 		CodeAuthExpired,
 		CodeAuthDeviceRevoked,
+		CodeCommitReadinessBlocked,
+		CodeCommitOverrideRequired,
+		CodeKeepAwakePolicyDisabled,
+		CodeKeepAwakeUnauthorized,
+		CodeKeepAwakeUnsupportedEnvironment,
+		CodeKeepAwakeAcquireFailed,
+		CodeKeepAwakeConflict,
+		CodeKeepAwakeExpired,
 		CodeUnknown,
 		CodeInternal,
 	}
@@ -300,5 +329,53 @@ func TestErrorCodes(t *testing.T) {
 		if !hasDot {
 			t.Errorf("error code %q should be in format {domain}.{error}", code)
 		}
+	}
+}
+
+func TestKeepAwakeNextActions(t *testing.T) {
+	codes := []string{
+		CodeKeepAwakePolicyDisabled,
+		CodeKeepAwakeUnauthorized,
+		CodeKeepAwakeUnsupportedEnvironment,
+		CodeKeepAwakeAcquireFailed,
+		CodeKeepAwakeConflict,
+		CodeKeepAwakeExpired,
+	}
+
+	for _, code := range codes {
+		if NextAction[code] == "" {
+			t.Fatalf("missing NextAction mapping for %s", code)
+		}
+	}
+}
+
+func TestPairingNextActions(t *testing.T) {
+	codes := []string{
+		CodeAuthPairMethodNotAllowed,
+		CodeAuthPairMissingCode,
+		CodeAuthPairInvalidRequest,
+		CodeAuthPairInvalidCode,
+		CodeAuthPairExpiredCode,
+		CodeAuthPairUsedCode,
+		CodeAuthPairRateLimited,
+		CodeAuthPairInternal,
+		CodeAuthPairGenerateForbidden,
+		CodeAuthPairGenerateMethodNotAllowed,
+		CodeAuthPairGenerateInternal,
+	}
+
+	for _, code := range codes {
+		if NextAction[code] == "" {
+			t.Fatalf("missing NextAction mapping for %s", code)
+		}
+	}
+
+	// Verify expired code says "2 minutes" not "5 minutes"
+	expiredAction := NextAction[CodeAuthPairExpiredCode]
+	if !strings.Contains(expiredAction, "2 minutes") {
+		t.Errorf("expired code NextAction should say '2 minutes', got: %s", expiredAction)
+	}
+	if strings.Contains(expiredAction, "5 minutes") {
+		t.Errorf("expired code NextAction should NOT say '5 minutes', got: %s", expiredAction)
 	}
 }

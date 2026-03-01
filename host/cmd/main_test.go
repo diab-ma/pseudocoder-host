@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/pseudocoder/host/internal/server"
 )
 
 func runWithArgs(args []string) (int, string, string) {
@@ -131,6 +134,28 @@ func TestHostStatusInvalidPort(t *testing.T) {
 	code := runHostStatus([]string{"--port", "0"}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("expected exit code 1, got %d", code)
+	}
+}
+
+func TestRunDoctorDispatch(t *testing.T) {
+	// Verify the top-level CLI routes "doctor" to runDoctor.
+	// The command will fail (no host running) but should not show "Unknown command".
+	code, out, _ := runWithArgs([]string{"pseudocoder", "doctor", "--help"})
+	if code != 0 {
+		t.Fatalf("expected exit code 0 for doctor --help, got %d", code)
+	}
+	if strings.Contains(out, "Unknown command") {
+		t.Fatal("doctor command should be recognized, got Unknown command")
+	}
+}
+
+func TestRunUsageContainsDoctor(t *testing.T) {
+	code, out, _ := runWithArgs([]string{"pseudocoder"})
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d", code)
+	}
+	if !strings.Contains(out, "doctor") {
+		t.Fatal("usage text should contain 'doctor' command")
 	}
 }
 
@@ -462,6 +487,113 @@ func TestHostStartPairFlag(t *testing.T) {
 	code := runHostStart([]string{"--pair", "--help"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("expected exit code 0 with --help, got %d", code)
+	}
+}
+
+// TestHostStatusKeepAwakeOutputFormatting verifies that the keep-awake section
+// is correctly formatted in CLI output and that nil keep_awake doesn't panic.
+func TestHostStatusKeepAwakeOutputFormatting(t *testing.T) {
+	status := &server.StatusResponse{
+		ListeningAddress: "127.0.0.1:7070",
+		TLSEnabled:       true,
+		RequireAuth:      true,
+		ConnectedClients: 1,
+		SessionID:        "session-1",
+		RepositoryPath:   "/repo",
+		CurrentBranch:    "main",
+		UptimeSeconds:    42,
+		KeepAwake: &server.KeepAwakeStatusSummary{
+			State:            "ON",
+			ActiveLeaseCount: 2,
+			RemoteEnabled:    true,
+			AllowAdminRevoke: false,
+			NextExpiryMs:     time.Now().Add(3 * time.Minute).UnixMilli(),
+			DegradedReason:   "runtime unavailable",
+			ServerBootID:     "boot-test",
+			StatusRevision:   5,
+		},
+	}
+
+	var stdout bytes.Buffer
+	writeHostStatusOutput(&stdout, status)
+	output := stdout.String()
+	if !strings.Contains(output, "Keep-Awake") {
+		t.Fatalf("expected Keep-Awake section, got %q", output)
+	}
+	if !strings.Contains(output, "State:        ON") {
+		t.Fatalf("expected state ON line, got %q", output)
+	}
+	if !strings.Contains(output, "Leases:       2 active") {
+		t.Fatalf("expected lease count line, got %q", output)
+	}
+	if !strings.Contains(output, "Degraded:     runtime unavailable") {
+		t.Fatalf("expected degraded reason line, got %q", output)
+	}
+
+	// Verify nil keep_awake does not render the keep-awake section.
+	status.KeepAwake = nil
+	stdout.Reset()
+	writeHostStatusOutput(&stdout, status)
+	if strings.Contains(stdout.String(), "Keep-Awake") {
+		t.Fatalf("did not expect Keep-Awake section when keep_awake is nil, got %q", stdout.String())
+	}
+
+	// P17U6: Verify recovery hint renders when present.
+	status.KeepAwake = &server.KeepAwakeStatusSummary{
+		State:        "OFF",
+		RecoveryHint: "Audit storage migration failed. Restart host to retry.",
+	}
+	stdout.Reset()
+	writeHostStatusOutput(&stdout, status)
+	if !strings.Contains(stdout.String(), "Hint:") {
+		t.Fatalf("expected Hint line in output, got %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Audit storage migration failed") {
+		t.Fatalf("expected recovery hint text, got %q", stdout.String())
+	}
+
+	// P17U6: Verify recovery hint absent when empty.
+	status.KeepAwake = &server.KeepAwakeStatusSummary{
+		State: "OFF",
+	}
+	stdout.Reset()
+	writeHostStatusOutput(&stdout, status)
+	if strings.Contains(stdout.String(), "Hint:") {
+		t.Fatalf("did not expect Hint line when recovery hint is empty, got %q", stdout.String())
+	}
+}
+
+// -----------------------------------------------------------------------
+// P18U3: Keep-Awake CLI Dispatch Tests
+// -----------------------------------------------------------------------
+
+func TestRunUsageContainsKeepAwake(t *testing.T) {
+	code, out, _ := runWithArgs([]string{"pseudocoder"})
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d", code)
+	}
+	if !strings.Contains(out, "keep-awake") {
+		t.Fatal("usage text should contain 'keep-awake' command")
+	}
+}
+
+func TestRunKeepAwakeDispatch(t *testing.T) {
+	code, _, errOut := runWithArgs([]string{"pseudocoder", "keep-awake", "enable-remote", "--help"})
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d", code)
+	}
+	if !strings.Contains(errOut, "Usage: pseudocoder keep-awake enable-remote") {
+		t.Fatalf("expected enable-remote usage, got %q", errOut)
+	}
+}
+
+func TestRunKeepAwakeMissingSubcommand(t *testing.T) {
+	code, out, _ := runWithArgs([]string{"pseudocoder", "keep-awake"})
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(out, "Usage: pseudocoder keep-awake") {
+		t.Fatalf("expected keep-awake usage, got %q", out)
 	}
 }
 

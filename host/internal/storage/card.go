@@ -353,6 +353,10 @@ type Session struct {
 
 	// Status is the current state of the session (running, complete, error).
 	Status SessionStatus `json:"status"`
+
+	// IsSystem marks host-managed internal sessions that should be hidden from
+	// user-facing session lists in mobile UI.
+	IsSystem bool `json:"is_system,omitempty"`
 }
 
 // SessionStore defines the interface for persisting session history.
@@ -376,4 +380,9 @@ type SessionStore interface {
 
 	// UpdateSessionStatus updates the status field for a session.
 	UpdateSessionStatus(id string, status SessionStatus) error
+
+	// ClearArchivedSessions deletes archived sessions from history storage.
+	// Archived means status is "complete" or "error".
+	// Returns the number of deleted rows.
+	ClearArchivedSessions() (int, error)
 }

@@ -1,10 +1,14 @@
 package server
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
+	"time"
 
+	"github.com/pseudocoder/host/internal/keepawake"
 	"github.com/pseudocoder/host/internal/pty"
 	"github.com/pseudocoder/host/internal/storage"
 	"github.com/pseudocoder/host/internal/tmux"
@@ -36,6 +40,9 @@ func (s *Server) CloseDeviceConnections(deviceID string) int {
 		return 0
 	}
 
+	// Keep-awake leases for a revoked device are expired immediately with no grace.
+	s.revokeKeepAwakeLeasesForDevice(deviceID)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -49,6 +56,195 @@ func (s *Server) CloseDeviceConnections(deviceID string) int {
 	}
 
 	return closed
+}
+
+// KeepAwakeSummary returns a snapshot of the current keep-awake status.
+// It uses the same prune/runtime reconciliation path as websocket keep-awake
+// flows so /status cannot drift from host-authoritative runtime state.
+func (s *Server) KeepAwakeSummary() KeepAwakeStatusPayload {
+	s.keepAwake.mu.Lock()
+	now := time.Now()
+	if s.keepAwake.now != nil {
+		now = s.keepAwake.now()
+	}
+
+	changed := s.keepAwakePruneExpiredLocked(now)
+	thresholdRevoked := s.keepAwakeCheckBatteryThresholdLocked(now)
+	if changed || thresholdRevoked {
+		if changed && !thresholdRevoked {
+			s.keepAwake.statusRevision++
+		}
+		s.keepAwakeSetRuntimeStateLocked(len(s.keepAwake.leases) > 0)
+	}
+	status := s.keepAwakeStatusPayloadLocked(now)
+	s.keepAwake.mu.Unlock()
+
+	if changed || thresholdRevoked {
+		go s.broadcastKeepAwakeChanged(NewKeepAwakeChangedMessage(status), nil, true)
+	}
+	return status
+}
+
+// SetKeepAwakeRuntimeManager wires the host keep-awake runtime seam.
+func (s *Server) SetKeepAwakeRuntimeManager(manager KeepAwakeRuntimeManager) {
+	s.keepAwake.mu.Lock()
+	defer s.keepAwake.mu.Unlock()
+	s.keepAwake.runtime = manager
+}
+
+// SetKeepAwakeAuditWriter wires the process-local keep-awake audit seam.
+func (s *Server) SetKeepAwakeAuditWriter(writer KeepAwakeAuditWriter) {
+	s.keepAwake.mu.Lock()
+	defer s.keepAwake.mu.Unlock()
+	s.keepAwake.auditWriter = writer
+}
+
+// SetKeepAwakePolicy updates keep-awake authorization policy flags.
+// If remote becomes disabled, all existing leases are revoked.
+func (s *Server) SetKeepAwakePolicy(policy KeepAwakePolicyConfig) {
+	s.keepAwake.mu.Lock()
+	// Bootstrap policy seed should not emit a policy-change revision/audit event.
+	// This preserves status_revision baseline semantics across server boot IDs.
+	if !s.keepAwake.policySet {
+		s.keepAwake.policy = policy
+		s.keepAwake.policySet = true
+		s.keepAwake.mu.Unlock()
+		return
+	}
+	oldPolicy := s.keepAwake.policy
+	policyChanged := keepAwakePolicyChanged(oldPolicy, policy)
+	s.keepAwake.policy = policy
+	now := s.keepAwake.now()
+
+	// If remote was just disabled, revoke all leases.
+	if oldPolicy.RemoteEnabled && !policy.RemoteEnabled && len(s.keepAwake.leases) > 0 {
+		for key, lease := range s.keepAwake.leases {
+			if err := s.keepAwakeWriteAuditLocked(KeepAwakeAuditEvent{
+				Operation:      "policy_revoke",
+				ActorDeviceID:  "system",
+				TargetDeviceID: lease.DeviceID,
+				SessionID:      lease.SessionID,
+				LeaseID:        lease.LeaseID,
+				Reason:         "remote_disabled",
+				At:             now,
+			}); err != nil {
+				status := s.keepAwakeFailClosedOnPolicyAuditErrorLocked(now, err)
+				s.keepAwake.mu.Unlock()
+				s.broadcastKeepAwakeChanged(NewKeepAwakeChangedMessage(status), nil, true)
+				return
+			}
+			if timer := s.keepAwake.timers[key]; timer != nil {
+				timer.Stop()
+				delete(s.keepAwake.timers, key)
+			}
+			delete(s.keepAwake.leases, key)
+		}
+		s.keepAwakeSetRuntimeStateLocked(false)
+	}
+
+	if policyChanged {
+		if err := s.keepAwakeWriteAuditLocked(KeepAwakeAuditEvent{
+			Operation:     "policy_change",
+			ActorDeviceID: "system",
+			Reason:        keepAwakePolicyChangeReason(oldPolicy, policy),
+			At:            now,
+		}); err != nil {
+			status := s.keepAwakeFailClosedOnPolicyAuditErrorLocked(now, err)
+			s.keepAwake.mu.Unlock()
+			s.broadcastKeepAwakeChanged(NewKeepAwakeChangedMessage(status), nil, true)
+			return
+		}
+		s.keepAwake.statusRevision++
+		status := s.keepAwakeStatusPayloadLocked(now)
+		s.keepAwake.mu.Unlock()
+		s.broadcastKeepAwakeChanged(NewKeepAwakeChangedMessage(status), nil, true)
+		return
+	}
+
+	s.keepAwake.mu.Unlock()
+}
+
+// keepAwakeFailClosedOnPolicyAuditErrorLocked enforces a fail-closed keep-awake
+// posture when policy audit persistence fails.
+// Must be called with keepAwake mutex held.
+func (s *Server) keepAwakeFailClosedOnPolicyAuditErrorLocked(now time.Time, auditErr error) KeepAwakeStatusPayload {
+	log.Printf("keep-awake policy audit write failed; forcing fail-closed policy state: %v", auditErr)
+	s.keepAwake.migrationFailed = true
+	s.keepAwake.policy.RemoteEnabled = false
+
+	for key := range s.keepAwake.timers {
+		if timer := s.keepAwake.timers[key]; timer != nil {
+			timer.Stop()
+		}
+		delete(s.keepAwake.timers, key)
+	}
+	for key := range s.keepAwake.leases {
+		delete(s.keepAwake.leases, key)
+	}
+
+	s.keepAwakeSetRuntimeStateLocked(false)
+	s.keepAwake.statusRevision++
+	return s.keepAwakeStatusPayloadLocked(now)
+}
+
+func keepAwakePolicyChanged(oldPolicy, newPolicy KeepAwakePolicyConfig) bool {
+	if oldPolicy.RemoteEnabled != newPolicy.RemoteEnabled {
+		return true
+	}
+	if oldPolicy.AllowAdminRevoke != newPolicy.AllowAdminRevoke {
+		return true
+	}
+	if oldPolicy.AllowOnBattery != newPolicy.AllowOnBattery {
+		return true
+	}
+	if oldPolicy.AutoDisableBatteryPercent != newPolicy.AutoDisableBatteryPercent {
+		return true
+	}
+	if len(oldPolicy.AdminDeviceIDs) != len(newPolicy.AdminDeviceIDs) {
+		return true
+	}
+	for i := range oldPolicy.AdminDeviceIDs {
+		if oldPolicy.AdminDeviceIDs[i] != newPolicy.AdminDeviceIDs[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func keepAwakePolicyChangeReason(oldPolicy, newPolicy KeepAwakePolicyConfig) string {
+	return strings.Join([]string{
+		fmt.Sprintf("remote_enabled:%t->%t", oldPolicy.RemoteEnabled, newPolicy.RemoteEnabled),
+		fmt.Sprintf("allow_admin_revoke:%t->%t", oldPolicy.AllowAdminRevoke, newPolicy.AllowAdminRevoke),
+		fmt.Sprintf("allow_on_battery:%t->%t", oldPolicy.AllowOnBattery, newPolicy.AllowOnBattery),
+		fmt.Sprintf("auto_disable_battery_percent:%d->%d", oldPolicy.AutoDisableBatteryPercent, newPolicy.AutoDisableBatteryPercent),
+		fmt.Sprintf("admin_device_ids:%d->%d", len(oldPolicy.AdminDeviceIDs), len(newPolicy.AdminDeviceIDs)),
+	}, ",")
+}
+
+// SetKeepAwakePowerProvider wires the host power state seam.
+func (s *Server) SetKeepAwakePowerProvider(provider keepawake.PowerProvider) {
+	s.keepAwake.mu.Lock()
+	defer s.keepAwake.mu.Unlock()
+	s.keepAwake.powerProvider = provider
+}
+
+// SetKeepAwakeMigrationFailed sets the migration-failed flag for fail-closed audit.
+func (s *Server) SetKeepAwakeMigrationFailed(failed bool) {
+	s.keepAwake.mu.Lock()
+	defer s.keepAwake.mu.Unlock()
+	s.keepAwake.migrationFailed = failed
+}
+
+// SetKeepAwakeDisconnectGrace configures the disconnect grace duration.
+// Valid range is 0ms to 300000ms inclusive.
+func (s *Server) SetKeepAwakeDisconnectGrace(grace time.Duration) error {
+	if grace < 0 || grace.Milliseconds() > maxKeepAwakeGraceMs {
+		return fmt.Errorf("keep-awake grace out of range: %dms", grace.Milliseconds())
+	}
+	s.keepAwake.mu.Lock()
+	defer s.keepAwake.mu.Unlock()
+	s.keepAwake.grace = grace
+	return nil
 }
 
 // SetDecisionHandler sets the callback for processing review decisions.
@@ -229,12 +425,35 @@ func (s *Server) SetSessionManager(mgr *pty.SessionManager) {
 	s.sessionManager = mgr
 }
 
+// SetSessionStore sets the persistent session history store.
+// This enables handlers that read/mutate archived session history.
+func (s *Server) SetSessionStore(store storage.SessionStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionStore = store
+}
+
 // GetSessionManager returns the session manager for external access.
 // This allows the host command to manage sessions directly.
 func (s *Server) GetSessionManager() *pty.SessionManager {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.sessionManager
+}
+
+// NextCreatedSessionSequence increments and returns the global sequence
+// number for successful session.create operations.
+//
+// The sequence is server-local and monotonic for the host process lifetime.
+// It is intentionally independent from SessionManager.Count() so that:
+// - pre-registered default sessions do not offset auto names,
+// - closed sessions do not cause name reuse,
+// - named creates still advance numbering for later unnamed creates.
+func (s *Server) NextCreatedSessionSequence() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.createdSessionSequence++
+	return s.createdSessionSequence
 }
 
 // SetSessionAPIHandler sets the HTTP handler for the /api/session/ endpoints.
@@ -270,3 +489,30 @@ func (s *Server) SetTmuxAPIHandler(handler http.Handler) {
 	defer s.mu.Unlock()
 	s.tmuxAPIHandler = handler
 }
+
+// SetKeepAwakePolicyHandler sets the HTTP handler for the /api/keep-awake/policy endpoint.
+// This enables CLI-driven keep-awake policy mutation.
+// Phase 18: Enables "pseudocoder keep-awake enable/disable" commands.
+func (s *Server) SetKeepAwakePolicyHandler(handler http.Handler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keepAwakePolicyHandler = handler
+}
+
+// SetFileOperations sets the file operations handler for the file explorer.
+// This enables mobile clients to list directories and read files within the repo.
+// Phase 3: Enables file explorer protocol.
+func (s *Server) SetFileOperations(ops FileOperations) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fileOps = ops
+}
+
+// SetMetricsStore sets the metrics store for rollout metrics collection.
+// Phase 7: Enables recording of crash, latency, and pairing metrics.
+func (s *Server) SetMetricsStore(store storage.MetricsStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.metricsStore = store
+}
+

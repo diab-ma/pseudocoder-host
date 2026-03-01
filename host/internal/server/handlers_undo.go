@@ -73,22 +73,10 @@ func (c *Client) handleReviewUndo(data []byte) {
 	var serverChunks []ChunkInfo
 	var serverStats *DiffStats
 
+	var serverSemanticGroups []SemanticGroupInfo
+
 	if !isBinary {
 		chunkInfoList := stream.ParseChunkInfoFromDiff(result.OriginalDiff)
-		serverChunks = make([]ChunkInfo, len(chunkInfoList))
-		for i, h := range chunkInfoList {
-			serverChunks[i] = ChunkInfo{
-				Index:       h.Index,
-				OldStart:    h.OldStart,
-				OldCount:    h.OldCount,
-				NewStart:    h.NewStart,
-				NewCount:    h.NewCount,
-				Offset:      h.Offset,
-				Length:      h.Length,
-				Content:     h.Content,
-				ContentHash: h.ContentHash,
-			}
-		}
 
 		// Calculate diff stats for the re-emitted card
 		if len(result.OriginalDiff) > 0 {
@@ -105,6 +93,38 @@ func (c *Client) handleReviewUndo(data []byte) {
 				}
 			}
 		}
+
+		// Detect deletion from stats before enrichment.
+		isDeletedLocal := serverStats != nil && serverStats.AddedLines == 0 && serverStats.DeletedLines > 0
+
+		// Semantic enrichment (non-blocking).
+		enrichedChunks, semGroups := stream.EnrichChunksWithSemantics(result.CardID, result.File, chunkInfoList, isBinary, isDeletedLocal)
+
+		serverChunks = make([]ChunkInfo, len(enrichedChunks))
+		for i, h := range enrichedChunks {
+			serverChunks[i] = ChunkInfo{
+				Index:           h.Index,
+				OldStart:        h.OldStart,
+				OldCount:        h.OldCount,
+				NewStart:        h.NewStart,
+				NewCount:        h.NewCount,
+				Offset:          h.Offset,
+				Length:          h.Length,
+				Content:         h.Content,
+				ContentHash:     h.ContentHash,
+				SemanticKind:    h.SemanticKind,
+				SemanticLabel:   h.SemanticLabel,
+				SemanticGroupID: h.SemanticGroupID,
+			}
+		}
+
+		serverSemanticGroups = mapSemanticGroupsToServer(semGroups)
+	} else {
+		// Binary cards: run semantic enrichment to get binary group metadata.
+		// EnrichChunksWithSemantics handles binary cards via synthetic chunk,
+		// producing a semantic group with kind "binary".
+		_, semGroups := stream.EnrichChunksWithSemantics(result.CardID, result.File, nil, isBinary, false)
+		serverSemanticGroups = mapSemanticGroupsToServer(semGroups)
 	}
 
 	// Detect deletion from stats: no added lines but has deleted lines.
@@ -118,6 +138,7 @@ func (c *Client) handleReviewUndo(data []byte) {
 		result.OriginalDiff,
 		serverChunks,
 		nil, // chunkGroups: not recomputed during undo
+		serverSemanticGroups,
 		isBinary,
 		isDeleted,
 		serverStats,

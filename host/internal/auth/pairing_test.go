@@ -370,7 +370,7 @@ func TestGetCodeExpiry(t *testing.T) {
 	currentTime := time.Now()
 	pm := NewPairingManager(PairingConfig{
 		DeviceStore: store,
-		CodeExpiry:  5 * time.Minute,
+		CodeExpiry:  2 * time.Minute,
 		TimeNow: func() time.Time {
 			return currentTime
 		},
@@ -390,7 +390,7 @@ func TestGetCodeExpiry(t *testing.T) {
 
 	// Expiry should be set
 	expiry = pm.GetCodeExpiry()
-	expected := currentTime.Add(5 * time.Minute)
+	expected := currentTime.Add(2 * time.Minute)
 	if !expiry.Equal(expected) {
 		t.Errorf("expected expiry %v, got %v", expected, expiry)
 	}

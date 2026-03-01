@@ -3,11 +3,51 @@ package auth
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	hostErrors "github.com/pseudocoder/host/internal/errors"
 )
+
+// failingSaveDeviceStore wraps mockDeviceStore but returns an error from SaveDevice.
+// This triggers the internal_error (default) branch in the pair handler.
+type failingSaveDeviceStore struct {
+	*mockDeviceStore
+}
+
+func (s *failingSaveDeviceStore) SaveDevice(device *Device) error {
+	return fmt.Errorf("simulated storage failure")
+}
+
+// assertTaxonomyResponse verifies error, error_code, and next_action fields
+// in a non-200 handler response.
+func assertTaxonomyResponse(t *testing.T, w *httptest.ResponseRecorder, expectedStatus int, expectedError, expectedCode string) {
+	t.Helper()
+	if w.Code != expectedStatus {
+		t.Errorf("status: got %d, want %d (%s)", w.Code, expectedStatus, w.Body.String())
+	}
+	var resp ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Error != expectedError {
+		t.Errorf("error: got %q, want %q", resp.Error, expectedError)
+	}
+	if resp.ErrorCode != expectedCode {
+		t.Errorf("error_code: got %q, want %q", resp.ErrorCode, expectedCode)
+	}
+	if resp.NextAction == "" {
+		t.Error("next_action: expected non-empty, got empty")
+	}
+	if expected := hostErrors.GetNextAction(expectedCode); resp.NextAction != expected {
+		t.Errorf("next_action: got %q, want %q", resp.NextAction, expected)
+	}
+}
 
 // TestPairHandlerSuccess tests successful pairing.
 func TestPairHandlerSuccess(t *testing.T) {
@@ -457,4 +497,308 @@ func TestPairHandlerDefaultDeviceName(t *testing.T) {
 	if devices[0].Name != "Unknown Device" {
 		t.Errorf("expected default name 'Unknown Device', got '%s'", devices[0].Name)
 	}
+}
+
+// TestPairHandlerTaxonomyMapping verifies that every /pair non-200 response
+// includes the correct error, error_code, and next_action fields per the A3
+// taxonomy table.
+func TestPairHandlerTaxonomyMapping(t *testing.T) {
+	tests := []struct {
+		name             string
+		method           string
+		body             any
+		setupCode        bool // whether to generate a code first
+		useCorrectCode   bool
+		maxAttempts      int // 0 = default
+		exhaustAttempts  int // how many wrong-code attempts to make first
+		expectedStatus   int
+		expectedError    string
+		expectedCode     string
+		expectedHasNext  bool
+	}{
+		{
+			name:            "method not allowed",
+			method:          http.MethodGet,
+			expectedStatus:  http.StatusMethodNotAllowed,
+			expectedError:   "method_not_allowed",
+			expectedCode:    hostErrors.CodeAuthPairMethodNotAllowed,
+			expectedHasNext: true,
+		},
+		{
+			name:            "missing code",
+			method:          http.MethodPost,
+			body:            PairRequest{DeviceName: "Test"},
+			expectedStatus:  http.StatusBadRequest,
+			expectedError:   "missing_code",
+			expectedCode:    hostErrors.CodeAuthPairMissingCode,
+			expectedHasNext: true,
+		},
+		{
+			name:            "invalid JSON",
+			method:          http.MethodPost,
+			body:            "not json",
+			expectedStatus:  http.StatusBadRequest,
+			expectedError:   "invalid_request",
+			expectedCode:    hostErrors.CodeAuthPairInvalidRequest,
+			expectedHasNext: true,
+		},
+		{
+			name:            "invalid code",
+			method:          http.MethodPost,
+			body:            PairRequest{Code: "000000"},
+			setupCode:       true,
+			expectedStatus:  http.StatusUnauthorized,
+			expectedError:   "invalid_code",
+			expectedCode:    hostErrors.CodeAuthPairInvalidCode,
+			expectedHasNext: true,
+		},
+		{
+			name:            "rate limited",
+			method:          http.MethodPost,
+			body:            PairRequest{Code: "000000"},
+			setupCode:       true,
+			maxAttempts:     2,
+			exhaustAttempts: 2,
+			expectedStatus:  http.StatusTooManyRequests,
+			expectedError:   "rate_limited",
+			expectedCode:    hostErrors.CodeAuthPairRateLimited,
+			expectedHasNext: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newMockDeviceStore()
+			cfg := PairingConfig{DeviceStore: store}
+			if tt.maxAttempts > 0 {
+				cfg.MaxAttemptsPerMinute = tt.maxAttempts
+			}
+			pm := NewPairingManager(cfg)
+			handler := NewPairHandler(pm)
+
+			if tt.setupCode {
+				if _, err := pm.GenerateCode(); err != nil {
+					t.Fatalf("GenerateCode: %v", err)
+				}
+			}
+
+			// Exhaust rate limit if needed
+			for i := 0; i < tt.exhaustAttempts; i++ {
+				b, _ := json.Marshal(PairRequest{Code: "000000"})
+				r := httptest.NewRequest(http.MethodPost, "/pair", bytes.NewReader(b))
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, r)
+			}
+
+			// Make the actual request
+			var bodyBytes []byte
+			switch v := tt.body.(type) {
+			case string:
+				bodyBytes = []byte(v)
+			case PairRequest:
+				bodyBytes, _ = json.Marshal(v)
+			case nil:
+				bodyBytes = nil
+			}
+
+			req := httptest.NewRequest(tt.method, "/pair", bytes.NewReader(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			if w.Code != tt.expectedStatus {
+				t.Errorf("status: got %d, want %d (%s)", w.Code, tt.expectedStatus, w.Body.String())
+			}
+
+			var resp ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+
+			if resp.Error != tt.expectedError {
+				t.Errorf("error: got %q, want %q", resp.Error, tt.expectedError)
+			}
+			if resp.ErrorCode != tt.expectedCode {
+				t.Errorf("error_code: got %q, want %q", resp.ErrorCode, tt.expectedCode)
+			}
+			if tt.expectedHasNext && resp.NextAction == "" {
+				t.Errorf("next_action: expected non-empty, got empty")
+			}
+			// Verify next_action matches the taxonomy table
+			if expected := hostErrors.GetNextAction(tt.expectedCode); resp.NextAction != expected {
+				t.Errorf("next_action: got %q, want %q", resp.NextAction, expected)
+			}
+		})
+	}
+
+	// Cases requiring custom setup beyond table-driven parameters.
+
+	t.Run("expired code", func(t *testing.T) {
+		store := newMockDeviceStore()
+		currentTime := time.Now()
+		pm := NewPairingManager(PairingConfig{
+			DeviceStore: store,
+			CodeExpiry:  100 * time.Millisecond,
+			TimeNow: func() time.Time {
+				return currentTime
+			},
+		})
+		handler := NewPairHandler(pm)
+
+		code, err := pm.GenerateCode()
+		if err != nil {
+			t.Fatalf("GenerateCode: %v", err)
+		}
+
+		// Advance time past expiry
+		currentTime = currentTime.Add(200 * time.Millisecond)
+
+		body, _ := json.Marshal(PairRequest{Code: code})
+		req := httptest.NewRequest(http.MethodPost, "/pair", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		assertTaxonomyResponse(t, w, http.StatusUnauthorized, "expired_code",
+			hostErrors.CodeAuthPairExpiredCode)
+
+		// P6U2 regression guard: verify TTL says "2 minutes" not "5 minutes"
+		nextAction := hostErrors.GetNextAction(hostErrors.CodeAuthPairExpiredCode)
+		if !strings.Contains(nextAction, "2 minutes") {
+			t.Errorf("expired code next_action should say '2 minutes', got: %s", nextAction)
+		}
+	})
+
+	t.Run("used code", func(t *testing.T) {
+		store := newMockDeviceStore()
+		pm := NewPairingManager(PairingConfig{DeviceStore: store})
+		handler := NewPairHandler(pm)
+
+		code, err := pm.GenerateCode()
+		if err != nil {
+			t.Fatalf("GenerateCode: %v", err)
+		}
+
+		// Use the code once (should succeed)
+		body, _ := json.Marshal(PairRequest{Code: code, DeviceName: "First"})
+		req := httptest.NewRequest(http.MethodPost, "/pair", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("first use: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		// Second use should return used_code
+		body, _ = json.Marshal(PairRequest{Code: code, DeviceName: "Second"})
+		req = httptest.NewRequest(http.MethodPost, "/pair", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w = httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		assertTaxonomyResponse(t, w, http.StatusUnauthorized, "used_code",
+			hostErrors.CodeAuthPairUsedCode)
+	})
+
+	t.Run("internal error", func(t *testing.T) {
+		// Use a device store that fails on SaveDevice to trigger the default
+		// error branch (internal_error) in the handler.
+		store := &failingSaveDeviceStore{mockDeviceStore: newMockDeviceStore()}
+		pm := NewPairingManager(PairingConfig{DeviceStore: store})
+		handler := NewPairHandler(pm)
+
+		code, err := pm.GenerateCode()
+		if err != nil {
+			t.Fatalf("GenerateCode: %v", err)
+		}
+
+		body, _ := json.Marshal(PairRequest{Code: code, DeviceName: "FailTest"})
+		req := httptest.NewRequest(http.MethodPost, "/pair", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		assertTaxonomyResponse(t, w, http.StatusInternalServerError, "internal_error",
+			hostErrors.CodeAuthPairInternal)
+	})
+}
+
+// TestGenerateCodeHandlerTaxonomyMapping verifies that /pair/generate non-200
+// responses include the correct error_code and next_action per A3 taxonomy.
+func TestGenerateCodeHandlerTaxonomyMapping(t *testing.T) {
+	tests := []struct {
+		name           string
+		method         string
+		remoteAddr     string
+		expectedStatus int
+		expectedError  string
+		expectedCode   string
+	}{
+		{
+			name:           "forbidden - non-loopback",
+			method:         http.MethodPost,
+			remoteAddr:     "192.0.2.10:54321",
+			expectedStatus: http.StatusForbidden,
+			expectedError:  "forbidden",
+			expectedCode:   hostErrors.CodeAuthPairGenerateForbidden,
+		},
+		{
+			name:           "method not allowed",
+			method:         http.MethodGet,
+			remoteAddr:     "127.0.0.1:54321",
+			expectedStatus: http.StatusMethodNotAllowed,
+			expectedError:  "method_not_allowed",
+			expectedCode:   hostErrors.CodeAuthPairGenerateMethodNotAllowed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newMockDeviceStore()
+			pm := NewPairingManager(PairingConfig{DeviceStore: store})
+			handler := NewGenerateCodeHandler(pm)
+
+			req := httptest.NewRequest(tt.method, "/pair/generate", nil)
+			req.RemoteAddr = tt.remoteAddr
+			w := httptest.NewRecorder()
+
+			handler.ServeHTTP(w, req)
+
+			if w.Code != tt.expectedStatus {
+				t.Errorf("status: got %d, want %d (%s)", w.Code, tt.expectedStatus, w.Body.String())
+			}
+
+			var resp ErrorResponse
+			if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+
+			if resp.Error != tt.expectedError {
+				t.Errorf("error: got %q, want %q", resp.Error, tt.expectedError)
+			}
+			if resp.ErrorCode != tt.expectedCode {
+				t.Errorf("error_code: got %q, want %q", resp.ErrorCode, tt.expectedCode)
+			}
+			if resp.NextAction == "" {
+				t.Error("next_action: expected non-empty, got empty")
+			}
+			if expected := hostErrors.GetNextAction(tt.expectedCode); resp.NextAction != expected {
+				t.Errorf("next_action: got %q, want %q", resp.NextAction, expected)
+			}
+		})
+	}
+
+	// internal_error: GenerateCode only fails on crypto/rand failure which
+	// cannot be injected at the unit level. Verify the handler's writeError
+	// output produces the correct taxonomy mapping for this code path.
+	t.Run("internal error (writeError path)", func(t *testing.T) {
+		pm := NewPairingManager(PairingConfig{DeviceStore: newMockDeviceStore()})
+		handler := NewGenerateCodeHandler(pm)
+		w := httptest.NewRecorder()
+		handler.writeError(w, http.StatusInternalServerError, "internal_error",
+			hostErrors.CodeAuthPairGenerateInternal, "Failed to generate pairing code")
+
+		assertTaxonomyResponse(t, w, http.StatusInternalServerError, "internal_error",
+			hostErrors.CodeAuthPairGenerateInternal)
+	})
 }
