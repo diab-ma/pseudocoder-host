@@ -147,7 +147,7 @@ run `pseudocoder doctor` first — it checks host health, TLS certs, and network
 
 ## Links
 
-- [website](https://pseudocoder.dev)
+- [website](https://pseudocoder.xyz)
 - [discord](https://discord.gg/e7TaHYTxBC)
 - [contributing](CONTRIBUTING.md)
 - [privacy policy](PRIVACY.md)
