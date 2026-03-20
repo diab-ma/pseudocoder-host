@@ -72,7 +72,7 @@ also install Tailscale on your phone and sign in with the same account.
 
 ## Quick Start
 
-1. get the mobile app (check your email for TestFlight invite)
+1. get the mobile app from the [App Store](https://apps.apple.com/us/app/pseudocoder/id6757658447)
 2. note your Tailscale IP: `tailscale ip -4` (starts with `100.`)
 3. start the host:
    ```bash
@@ -93,9 +93,9 @@ create multiple terminal sessions, easily switch via the session pill, and attac
   <img src="assets/screenshot-new-session.png" alt="New Session" width="300">
 </p>
 
-<h3 align="center">Terminal</h3>
+<h3 align="center">Terminal & Structured Chat</h3>
 
-real-time terminal output streaming. send terminal commands, monitor CLI tools as they work, and accept changes from wherever you are.
+real-time terminal output streaming with a structured chat view for AI agent sessions. see the agent's plan, tool calls, and responses in a normalized chat timeline — or switch to raw terminal mode for full control.
 
 <p align="center">
   <img src="assets/screenshot-terminal.png" alt="Terminal" width="300">
@@ -183,7 +183,7 @@ pseudocoder devices revoke <id>   # remove access
 |---------|----------|
 | connection refused | use Tailscale IP (`100.x.x.x`), check `tailscale status` |
 | certificate errors | tap **Trust** on first connection, or re-pair |
-| pairing code expired | run `pseudocoder pair --qr` (codes last 5 min) |
+| pairing code expired | run `pseudocoder pair --qr` (codes last 2 min) |
 | `pseudocoder pair` fails | ensure the host is running and `~/.pseudocoder/pair.sock` is accessible |
 | QR won't scan | enter manually: host IP, port `7070`, 6-digit code |
 | keep-awake not activating | check `pseudocoder keep-awake status`, ensure `keep_awake_remote_enabled = true` in config |
