@@ -1,0 +1,84 @@
+{
+  "fixture_name": "chunk_fragmentation",
+  "session_id": "session-claude-1",
+  "steps": [
+    {
+      "label": "fragmented user prompt",
+      "chunk_observed_at": 1000,
+      "chunks": ["Hum", "an: fragmented input\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "fragmented input"
+        }
+      ]
+    },
+    {
+      "label": "fragmented thinking",
+      "chunk_observed_at": 1500,
+      "chunks": ["Think", "ing: partial thought\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "fragmented input"
+        },
+        {
+          "id": "claude-thinking:turn-1",
+          "session_id": "session-claude-1",
+          "kind": "thinking",
+          "created_at": 1500,
+          "provider": "claude",
+          "status": "in_progress",
+          "text": "partial thought"
+        }
+      ]
+    },
+    {
+      "label": "fragmented assistant",
+      "chunk_observed_at": 2200,
+      "chunks": ["Assist", "ant: resolved\n", "\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "fragmented input"
+        },
+        {
+          "id": "claude-thinking:turn-1",
+          "session_id": "session-claude-1",
+          "kind": "thinking",
+          "created_at": 1500,
+          "provider": "claude",
+          "status": "completed",
+          "text": "partial thought"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-1",
+          "kind": "assistant_message",
+          "created_at": 2200,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "resolved"
+        }
+      ]
+    }
+  ]
+}

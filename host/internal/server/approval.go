@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	apperrors "github.com/pseudocoder/host/internal/errors"
+	"github.com/pseudocoder/host/internal/storage"
 )
 
 // ApprovalRequest holds the data for an approval request from a CLI tool.
@@ -131,6 +132,12 @@ type ApprovalQueue struct {
 
 	// auditStore persists audit entries. Nil means no audit logging.
 	auditStore ApprovalAuditStore
+
+	// onPending projects a newly queued approval request into other host-owned surfaces.
+	onPending func(req ApprovalRequest, expiresAt time.Time)
+
+	// onResolved projects the final approval decision into other host-owned surfaces.
+	onResolved func(req ApprovalRequest, decision string)
 }
 
 // NewApprovalQueue creates a new approval queue.
@@ -208,6 +215,9 @@ func (q *ApprovalQueue) Queue(ctx context.Context, req ApprovalRequest) (Approva
 		q.broadcaster(msg)
 		log.Printf("approval: request %s forwarded to clients (expires %s)", req.RequestID, expiresAt.Format(time.RFC3339))
 	}
+	if q.onPending != nil {
+		q.onPending(req, expiresAt)
+	}
 
 	// Wait for response with timeout
 	timeout := time.Until(expiresAt)
@@ -239,6 +249,9 @@ func (q *ApprovalQueue) Queue(ctx context.Context, req ApprovalRequest) (Approva
 
 		// Record audit entry for timeout
 		q.recordAudit(req, "denied", nil, "", "timeout")
+		if q.onResolved != nil {
+			q.onResolved(req, "deny")
+		}
 
 		log.Printf("approval: request %s timed out", req.RequestID)
 		return ApprovalResponse{Decision: "deny"}, apperrors.ApprovalTimeout(req.RequestID)
@@ -290,6 +303,9 @@ func (q *ApprovalQueue) DecideWithDevice(requestID, decision string, tempAllowUn
 		auditDecision = "approved"
 	}
 	q.recordAudit(req, auditDecision, tempAllowUntil, deviceID, "mobile")
+	if q.onResolved != nil {
+		q.onResolved(req, decision)
+	}
 
 	// If approved with temporary allow, add the rule
 	if decision == "approve" && tempAllowUntil != nil {
@@ -310,6 +326,127 @@ func (q *ApprovalQueue) DecideWithDevice(requestID, decision string, tempAllowUn
 	}
 
 	return nil
+}
+
+// SetLifecycleHooks wires additive host-owned observers for approval queue events.
+func (q *ApprovalQueue) SetLifecycleHooks(onPending func(req ApprovalRequest, expiresAt time.Time), onResolved func(req ApprovalRequest, decision string)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.onPending = onPending
+	q.onResolved = onResolved
+}
+
+func (s *Server) projectApprovalRequest(req ApprovalRequest, expiresAt time.Time) {
+	s.projectApprovalLifecycle(req, "pending", expiresAt)
+}
+
+func (s *Server) projectApprovalDecision(req ApprovalRequest, decision string) {
+	s.projectApprovalLifecycle(req, decision, time.Time{})
+}
+
+func (s *Server) projectApprovalLifecycle(req ApprovalRequest, decision string, expiresAt time.Time) {
+	sessionID, items, controller, ok := s.loadPrimaryStructuredTimeline()
+	if !ok {
+		log.Printf("approval: projectApprovalLifecycle skipped for %s (structured chat not available)", req.RequestID)
+		return
+	}
+
+	now := time.Now().UnixMilli()
+	itemID := "approval:" + req.RequestID
+	existing := findChatItem(items, itemID)
+	createdAt := now
+	if existing != nil {
+		createdAt = existing.CreatedAt
+	}
+
+	item := ChatItem{
+		ID:                itemID,
+		SessionID:         sessionID,
+		Kind:              ChatItemKindApprovalRequest,
+		CreatedAt:         createdAt,
+		Provider:          ChatItemProviderSystem,
+		Status:            ChatItemStatusPending,
+		RequestID:         req.RequestID,
+		ApprovalRequestID: req.RequestID,
+		Command:           req.Command,
+		Reason:            req.Rationale,
+	}
+	if existing != nil && existing.ExpiresAt != "" {
+		item.ExpiresAt = existing.ExpiresAt
+	}
+	if !expiresAt.IsZero() {
+		item.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
+	}
+
+	switch decision {
+	case "approve":
+		item.Decision = "approve"
+		item.Status = ChatItemStatusCompleted
+	case "deny":
+		item.Decision = "deny"
+		item.Status = ChatItemStatusFailed
+	default:
+		item.Status = ChatItemStatusPending
+	}
+
+	upsertTimelineItemByID(&items, item)
+	s.applyStructuredTimeline(controller, sessionID, items)
+}
+
+func (s *Server) loadPrimaryStructuredTimeline() (string, []ChatItem, StructuredChatController, bool) {
+	s.mu.RLock()
+	sessionID := s.sessionID
+	store := s.sessionStore
+	controller := s.structuredChatController
+	enabled := s.structuredChatEnabled
+	s.mu.RUnlock()
+
+	if !enabled || sessionID == "" || store == nil || controller == nil {
+		return "", nil, nil, false
+	}
+
+	session, err := store.GetSession(sessionID)
+	if err != nil || session == nil {
+		return "", nil, nil, false
+	}
+	info, err := SessionInfoFromStoredSession(session)
+	if err != nil || info.ChatCapabilities == nil || !info.ChatCapabilities.StructuredTimeline {
+		return "", nil, nil, false
+	}
+
+	structuredStore, ok := store.(storage.StructuredChatStore)
+	if !ok {
+		return "", nil, nil, false
+	}
+	snapshot, err := structuredStore.LoadStructuredChatSnapshot(sessionID)
+	if err != nil || snapshot == nil {
+		return sessionID, nil, controller, true
+	}
+	items, err := decodeStoredChatItems(snapshot.Items)
+	if err != nil {
+		return "", nil, nil, false
+	}
+	return sessionID, items, controller, true
+}
+
+func (s *Server) applyStructuredTimeline(controller StructuredChatController, sessionID string, items []ChatItem) {
+	messages, err := controller.ApplyAuthoritativeTimeline(sessionID, items)
+	if err != nil {
+		return
+	}
+	for _, msg := range messages {
+		s.Broadcast(msg)
+	}
+}
+
+func upsertTimelineItemByID(items *[]ChatItem, item ChatItem) {
+	for i := range *items {
+		if (*items)[i].ID == item.ID {
+			(*items)[i] = item
+			return
+		}
+	}
+	*items = append(*items, item)
 }
 
 // Cancel removes a pending approval without making a decision.

@@ -1,0 +1,204 @@
+{
+  "fixture_name": "pty_rerender_dedup",
+  "session_id": "session-claude-pty-dedup",
+  "steps": [
+    {
+      "label": "turn 1: user prompt via Observe (Human: prefix)",
+      "chunk_observed_at": 1000,
+      "chunks": ["Human: hi\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "hi"
+        }
+      ]
+    },
+    {
+      "label": "turn 1: assistant response",
+      "chunk_observed_at": 2000,
+      "chunks": ["\u25cf hello!\n", "\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "hi"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "hello!"
+        }
+      ]
+    },
+    {
+      "label": "turn 2: user prompt via SeedPrompt (sets re-render guard)",
+      "action": "seed_prompt",
+      "text": "what is 2+2?",
+      "request_id": "req-2",
+      "chunk_observed_at": 3000,
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "hi"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "hello!"
+        },
+        {
+          "id": "claude-user:turn-2",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 3000,
+          "provider": "claude",
+          "status": "completed",
+          "request_id": "req-2",
+          "text": "what is 2+2?"
+        }
+      ]
+    },
+    {
+      "label": "TUI re-render: old assistant bullet is skipped by seeded guard",
+      "chunk_observed_at": 3100,
+      "chunks": ["\u25cf hello!\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "hi"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "hello!"
+        },
+        {
+          "id": "claude-user:turn-2",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 3000,
+          "provider": "claude",
+          "status": "completed",
+          "request_id": "req-2",
+          "text": "what is 2+2?"
+        }
+      ]
+    },
+    {
+      "label": "TUI re-render: prompt marker clears seeded guard",
+      "chunk_observed_at": 3200,
+      "chunks": ["\u276f what is 2+2?\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "hi"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "hello!"
+        },
+        {
+          "id": "claude-user:turn-2",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 3000,
+          "provider": "claude",
+          "status": "completed",
+          "request_id": "req-2",
+          "text": "what is 2+2?"
+        }
+      ]
+    },
+    {
+      "label": "genuine new response accepted after guard cleared",
+      "chunk_observed_at": 4000,
+      "chunks": ["\u25cf The answer is 4.\n", "\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "hi"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "hello!"
+        },
+        {
+          "id": "claude-user:turn-2",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "user_message",
+          "created_at": 3000,
+          "provider": "claude",
+          "status": "completed",
+          "request_id": "req-2",
+          "text": "what is 2+2?"
+        },
+        {
+          "id": "claude-assistant:turn-2",
+          "session_id": "session-claude-pty-dedup",
+          "kind": "assistant_message",
+          "created_at": 4000,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "The answer is 4."
+        }
+      ]
+    }
+  ]
+}

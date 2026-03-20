@@ -1,0 +1,49 @@
+{
+  "fixture_name": "chunk_fragmentation",
+  "session_id": "session-gemini-1",
+  "steps": [
+    {
+      "label": "fragmented user prompt",
+      "chunk_observed_at": 1000,
+      "chunks": ["Us", "er: fragmented input\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "fragmented input"
+        }
+      ]
+    },
+    {
+      "label": "fragmented gemini response",
+      "chunk_observed_at": 2000,
+      "chunks": ["Gem", "ini: fragmented reply\n", "\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "fragmented input"
+        },
+        {
+          "id": "gemini-assistant:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "gemini",
+          "status": "completed",
+          "markdown": "fragmented reply"
+        }
+      ]
+    }
+  ]
+}

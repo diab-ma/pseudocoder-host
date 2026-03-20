@@ -40,8 +40,8 @@ func (s *SQLiteStore) SaveSession(session *Session) error {
 
 	const query = `
 		INSERT OR REPLACE INTO sessions
-			(id, repo, branch, started_at, last_seen, last_commit, status, is_system)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			(id, repo, branch, started_at, last_seen, last_commit, status, is_system, session_kind, agent_provider, chat_capabilities_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	isSystem := 0
@@ -49,7 +49,12 @@ func (s *SQLiteStore) SaveSession(session *Session) error {
 		isSystem = 1
 	}
 
-	_, err := s.db.Exec(query,
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin save session transaction: %w", err)
+	}
+
+	_, err = tx.Exec(query,
 		session.ID,
 		session.Repo,
 		session.Branch,
@@ -58,21 +63,39 @@ func (s *SQLiteStore) SaveSession(session *Session) error {
 		lastCommit,
 		string(session.Status),
 		isSystem,
+		session.SessionKind,
+		session.AgentProvider,
+		session.ChatCapabilitiesJSON,
 	)
 	if err != nil {
+		tx.Rollback()
 		return fmt.Errorf("save session: %w", err)
 	}
 
 	// Enforce retention: delete oldest sessions beyond limit.
 	// Uses subquery to select sessions to delete (all beyond first maxSessions by started_at).
-	const cleanupQuery = `
-		DELETE FROM sessions WHERE id IN (
-			SELECT id FROM sessions ORDER BY started_at DESC LIMIT -1 OFFSET ?
-		)
+	const cleanupTargetQuery = `
+		SELECT id FROM sessions ORDER BY started_at DESC LIMIT -1 OFFSET ?
 	`
-	_, err = s.db.Exec(cleanupQuery, maxSessions)
+	const cleanupStructuredQuery = `
+		DELETE FROM structured_chat_sessions WHERE session_id IN (` + cleanupTargetQuery + `)
+	`
+	if _, err := tx.Exec(cleanupStructuredQuery, maxSessions); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("enforce session retention structured snapshots: %w", err)
+	}
+
+	const cleanupQuery = `
+		DELETE FROM sessions WHERE id IN (` + cleanupTargetQuery + `)
+	`
+	_, err = tx.Exec(cleanupQuery, maxSessions)
 	if err != nil {
+		tx.Rollback()
 		return fmt.Errorf("enforce session retention: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit save session transaction: %w", err)
 	}
 
 	return nil
@@ -85,7 +108,7 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	defer s.mu.RUnlock()
 
 	const query = `
-		SELECT id, repo, branch, started_at, last_seen, last_commit, status, is_system
+		SELECT id, repo, branch, started_at, last_seen, last_commit, status, is_system, session_kind, agent_provider, chat_capabilities_json
 		FROM sessions
 		WHERE id = ?
 	`
@@ -113,7 +136,7 @@ func (s *SQLiteStore) ListSessions(limit int) ([]*Session, error) {
 	}
 
 	const query = `
-		SELECT id, repo, branch, started_at, last_seen, last_commit, status, is_system
+		SELECT id, repo, branch, started_at, last_seen, last_commit, status, is_system, session_kind, agent_provider, chat_capabilities_json
 		FROM sessions
 		ORDER BY started_at DESC
 		LIMIT ?
@@ -175,26 +198,158 @@ func (s *SQLiteStore) ClearArchivedSessions() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	const query = `
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin clear archived sessions transaction: %w", err)
+	}
+
+	const deleteStructuredSnapshots = `
+		DELETE FROM structured_chat_sessions
+		WHERE session_id IN (
+			SELECT id FROM sessions
+			WHERE status IN (?, ?)
+			  AND is_system = 0
+		)
+	`
+	if _, err := tx.Exec(
+		deleteStructuredSnapshots,
+		string(SessionStatusComplete),
+		string(SessionStatusError),
+	); err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("clear archived structured snapshots: %w", err)
+	}
+
+	const deleteSessions = `
 		DELETE FROM sessions
 		WHERE status IN (?, ?)
 		  AND is_system = 0
 	`
-	result, err := s.db.Exec(
-		query,
+	result, err := tx.Exec(
+		deleteSessions,
 		string(SessionStatusComplete),
 		string(SessionStatusError),
 	)
 	if err != nil {
+		tx.Rollback()
 		return 0, fmt.Errorf("clear archived sessions: %w", err)
 	}
 
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
+		tx.Rollback()
 		return 0, fmt.Errorf("clear archived sessions rows affected: %w", err)
 	}
 
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit clear archived sessions: %w", err)
+	}
+
 	return int(rowsAffected), nil
+}
+
+// ClearAllSessions deletes all non-system sessions from storage,
+// regardless of status, including associated structured chat data.
+// Returns the number of deleted rows.
+func (s *SQLiteStore) ClearAllSessions() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin clear all sessions transaction: %w", err)
+	}
+
+	const deleteStructuredItems = `
+		DELETE FROM structured_chat_items
+		WHERE session_id IN (
+			SELECT id FROM sessions WHERE is_system = 0
+		)
+	`
+	if _, err := tx.Exec(deleteStructuredItems); err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("clear all structured chat items: %w", err)
+	}
+
+	const deleteStructuredSnapshots = `
+		DELETE FROM structured_chat_sessions
+		WHERE session_id IN (
+			SELECT id FROM sessions WHERE is_system = 0
+		)
+	`
+	if _, err := tx.Exec(deleteStructuredSnapshots); err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("clear all structured chat snapshots: %w", err)
+	}
+
+	const deleteSessions = `DELETE FROM sessions WHERE is_system = 0`
+	result, err := tx.Exec(deleteSessions)
+	if err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("clear all sessions: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("clear all sessions rows affected: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit clear all sessions: %w", err)
+	}
+
+	return int(rowsAffected), nil
+}
+
+// DeleteSession deletes a single session by ID, including associated
+// structured chat snapshots and items. Returns an error if the session
+// does not exist.
+func (s *SQLiteStore) DeleteSession(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin delete session transaction: %w", err)
+	}
+
+	// Delete associated structured chat data first (foreign-key-like cleanup).
+	const deleteStructuredItems = `DELETE FROM structured_chat_items WHERE session_id = ?`
+	if _, err := tx.Exec(deleteStructuredItems, id); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete structured chat items for session %s: %w", id, err)
+	}
+
+	const deleteStructuredSessions = `DELETE FROM structured_chat_sessions WHERE session_id = ?`
+	if _, err := tx.Exec(deleteStructuredSessions, id); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete structured chat session for session %s: %w", id, err)
+	}
+
+	const deleteSession = `DELETE FROM sessions WHERE id = ?`
+	result, err := tx.Exec(deleteSession, id)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete session %s: %w", id, err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete session rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		tx.Rollback()
+		return fmt.Errorf("session not found: %s", id)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete session transaction: %w", err)
+	}
+
+	log.Printf("storage: deleted session %s", id)
+	return nil
 }
 
 // scanSessionRow scans a single row from sql.Row into a Session.
@@ -217,6 +372,9 @@ func (s *SQLiteStore) scanSessionRow(row *sql.Row) (*Session, error) {
 		&lastCommit,
 		&status,
 		&isSystem,
+		&session.SessionKind,
+		&session.AgentProvider,
+		&session.ChatCapabilitiesJSON,
 	)
 	if err != nil {
 		return nil, err
@@ -264,6 +422,9 @@ func (s *SQLiteStore) scanSessionRows(rows *sql.Rows) (*Session, error) {
 		&lastCommit,
 		&status,
 		&isSystem,
+		&session.SessionKind,
+		&session.AgentProvider,
+		&session.ChatCapabilitiesJSON,
 	)
 	if err != nil {
 		return nil, err

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +52,24 @@ func readMessage(t *testing.T, conn *websocket.Conn) Message {
 	return msg
 }
 
+func readUntilMessageType(t *testing.T, conn *websocket.Conn, want MessageType, timeout time.Duration) Message {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn.SetReadDeadline(deadline)
+		var msg Message
+		if err := conn.ReadJSON(&msg); err != nil {
+			t.Fatalf("read failed while waiting for %s: %v", want, err)
+		}
+		if msg.Type == want {
+			return msg
+		}
+	}
+	t.Fatalf("timed out waiting for %s", want)
+	return Message{}
+}
+
 func readSessionCreatedName(t *testing.T, conn *websocket.Conn) string {
 	t.Helper()
 
@@ -73,6 +92,42 @@ func readSessionCreatedName(t *testing.T, conn *websocket.Conn) string {
 		t.Fatalf("expected string name payload, got %T", payload["name"])
 	}
 	return name
+}
+
+type failingSessionStore struct {
+	saveErr error
+}
+
+func (s *failingSessionStore) SaveSession(session *storage.Session) error {
+	return s.saveErr
+}
+
+func (s *failingSessionStore) GetSession(id string) (*storage.Session, error) {
+	return nil, nil
+}
+
+func (s *failingSessionStore) ListSessions(limit int) ([]*storage.Session, error) {
+	return nil, nil
+}
+
+func (s *failingSessionStore) UpdateSessionLastSeen(id string) error {
+	return nil
+}
+
+func (s *failingSessionStore) UpdateSessionStatus(id string, status storage.SessionStatus) error {
+	return nil
+}
+
+func (s *failingSessionStore) ClearArchivedSessions() (int, error) {
+	return 0, nil
+}
+
+func (s *failingSessionStore) DeleteSession(id string) error {
+	return nil
+}
+
+func (s *failingSessionStore) ClearAllSessions() (int, error) {
+	return 0, nil
 }
 
 func TestWebSocketSessionStatusAndBroadcast(t *testing.T) {
@@ -314,7 +369,6 @@ func TestComputeDiffCardMeta(t *testing.T) {
 	tests := []struct {
 		name           string
 		file           string
-		chunks         []ChunkInfo
 		isBinary       bool
 		isDeleted      bool
 		stats          *DiffStats
@@ -340,16 +394,7 @@ func TestComputeDiffCardMeta(t *testing.T) {
 			wantReasons: []string{"sensitive_path", "file_deletion"},
 		},
 		{
-			name:        "normal file with chunks and stats",
-			file:        "README.md",
-			chunks:      []ChunkInfo{{Index: 0}, {Index: 1}},
-			stats:       &DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 5, DeletedLines: 3},
-			wantSummary: "2 chunks, +5 / -3",
-			wantLevel:   "low",
-			wantReasons: nil,
-		},
-		{
-			name:        "stats without chunks",
+			name:        "stats present",
 			file:        "docs/notes.txt",
 			stats:       &DiffStats{ByteSize: 50, LineCount: 5, AddedLines: 2, DeletedLines: 1},
 			wantSummary: "+2 / -1",
@@ -375,8 +420,7 @@ func TestComputeDiffCardMeta(t *testing.T) {
 			name:        "high churn on source path",
 			file:        "host/internal/server/handler.go",
 			stats:       &DiffStats{ByteSize: 5000, LineCount: 300, AddedLines: 120, DeletedLines: 80},
-			chunks:      []ChunkInfo{{Index: 0}},
-			wantSummary: "1 chunks, +120 / -80",
+			wantSummary: "+120 / -80",
 			wantLevel:   "medium",
 			wantReasons: []string{"high_churn", "source_change"},
 		},
@@ -398,51 +442,47 @@ func TestComputeDiffCardMeta(t *testing.T) {
 		},
 		// C2: Semantic summary enrichment
 		{
-			name:   "semantic groups present with stats",
-			file:   "src/handler.go",
-			chunks: []ChunkInfo{{Index: 0}, {Index: 1}},
-			stats:  &DiffStats{ByteSize: 200, LineCount: 20, AddedLines: 10, DeletedLines: 5},
+			name:  "semantic groups present with stats",
+			file:  "src/handler.go",
+			stats: &DiffStats{ByteSize: 200, LineCount: 20, AddedLines: 10, DeletedLines: 5},
 			semanticGroups: []SemanticGroupInfo{
 				{GroupID: "sg-aaa", Label: "Function changes", Kind: "function", ChunkIndexes: []int{0, 1}, RiskLevel: "medium"},
 			},
-			wantSummary: "Function changes: 2 chunk(s), +10 / -5",
+			wantSummary: "Function changes: +10 / -5",
 			wantLevel:   "low",
 			wantReasons: nil,
 		},
 		{
-			name:   "semantic groups present without stats",
-			file:   "src/handler.go",
-			chunks: []ChunkInfo{{Index: 0}},
+			name: "semantic groups present without stats",
+			file: "src/handler.go",
 			semanticGroups: []SemanticGroupInfo{
 				{GroupID: "sg-bbb", Label: "Imports", Kind: "import", ChunkIndexes: []int{0}, RiskLevel: "low"},
 			},
-			wantSummary: "Imports: 1 chunk(s)",
+			wantSummary: "Imports",
 			wantLevel:   "low",
 			wantReasons: nil,
 		},
 		{
-			name:   "semantic primary group selection: highest risk wins",
-			file:   "src/handler.go",
-			chunks: []ChunkInfo{{Index: 0}, {Index: 1}, {Index: 2}},
-			stats:  &DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 5, DeletedLines: 2},
+			name:  "semantic primary group selection: highest risk wins",
+			file:  "src/handler.go",
+			stats: &DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 5, DeletedLines: 2},
 			semanticGroups: []SemanticGroupInfo{
 				{GroupID: "sg-low", Label: "Code changes", Kind: "generic", ChunkIndexes: []int{0}, RiskLevel: "low"},
 				{GroupID: "sg-high", Label: "Function changes", Kind: "function", ChunkIndexes: []int{1, 2}, RiskLevel: "high"},
 			},
-			wantSummary: "Function changes: 2 chunk(s), +5 / -2",
+			wantSummary: "Function changes: +5 / -2",
 			wantLevel:   "low",
 			wantReasons: nil,
 		},
 		{
-			name:   "semantic primary group selection: same risk, larger chunk_indexes wins",
-			file:   "README.md",
-			chunks: []ChunkInfo{{Index: 0}, {Index: 1}, {Index: 2}},
-			stats:  &DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 3, DeletedLines: 1},
+			name:  "semantic primary group selection: same risk, larger chunk_indexes wins",
+			file:  "README.md",
+			stats: &DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 3, DeletedLines: 1},
 			semanticGroups: []SemanticGroupInfo{
 				{GroupID: "sg-a", Label: "Imports", Kind: "import", ChunkIndexes: []int{0}, LineStart: 1, RiskLevel: "low"},
 				{GroupID: "sg-b", Label: "Code changes", Kind: "generic", ChunkIndexes: []int{1, 2}, LineStart: 10, RiskLevel: "low"},
 			},
-			wantSummary: "Code changes: 2 chunk(s), +3 / -1",
+			wantSummary: "Code changes: +3 / -1",
 			wantLevel:   "low",
 			wantReasons: nil,
 		},
@@ -453,7 +493,7 @@ func TestComputeDiffCardMeta(t *testing.T) {
 			semanticGroups: []SemanticGroupInfo{
 				{GroupID: "sg-x", Label: "Binary change", Kind: "binary", ChunkIndexes: []int{0}, RiskLevel: "high"},
 			},
-			wantSummary: "Binary change: 1 chunk(s)",
+			wantSummary: "Binary change",
 			wantLevel:   "high",
 			wantReasons: []string{"binary_file"},
 		},
@@ -465,7 +505,7 @@ func TestComputeDiffCardMeta(t *testing.T) {
 			semanticGroups: []SemanticGroupInfo{
 				{GroupID: "sg-del", Label: "Deletion", Kind: "deleted", ChunkIndexes: []int{0}, RiskLevel: "high"},
 			},
-			wantSummary: "Deletion: 1 chunk(s), +0 / -8",
+			wantSummary: "Deletion: +0 / -8",
 			wantLevel:   "high",
 			wantReasons: []string{"file_deletion"},
 		},
@@ -473,7 +513,7 @@ func TestComputeDiffCardMeta(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			summary, level, reasons := computeDiffCardMeta(tt.file, tt.chunks, tt.isBinary, tt.isDeleted, tt.stats, tt.semanticGroups)
+			summary, level, reasons := computeDiffCardMeta(tt.file, tt.isBinary, tt.isDeleted, tt.stats, tt.semanticGroups)
 			if summary != tt.wantSummary {
 				t.Errorf("summary = %q, want %q", summary, tt.wantSummary)
 			}
@@ -495,11 +535,8 @@ func TestComputeDiffCardMeta(t *testing.T) {
 
 // TestNewDiffCardMessage verifies the diff.card message constructor.
 func TestNewDiffCardMessage(t *testing.T) {
-	chunks := []ChunkInfo{
-		{Index: 0, OldStart: 1, OldCount: 3, NewStart: 1, NewCount: 4, Offset: 0, Length: 11},
-	}
 	stats := &DiffStats{ByteSize: 11, LineCount: 1, AddedLines: 1, DeletedLines: 0}
-	msg := NewDiffCardMessage("card-123", "src/main.go", "+added line", chunks, nil, nil, false, false, stats, 1703500000000)
+	msg := NewDiffCardMessage("card-123", "src/main.go", "+added line", nil, false, false, stats, 1703500000000)
 
 	if msg.Type != MessageTypeDiffCard {
 		t.Errorf("expected type %s, got %s", MessageTypeDiffCard, msg.Type)
@@ -519,19 +556,13 @@ func TestNewDiffCardMessage(t *testing.T) {
 	if payload.Diff != "+added line" {
 		t.Errorf("expected Diff +added line, got %s", payload.Diff)
 	}
-	if len(payload.Chunks) != 1 {
-		t.Errorf("expected 1 chunk, got %d", len(payload.Chunks))
-	}
-	if payload.Chunks[0].Index != 0 {
-		t.Errorf("expected chunk index 0, got %d", payload.Chunks[0].Index)
-	}
 	if payload.CreatedAt != 1703500000000 {
 		t.Errorf("expected CreatedAt 1703500000000, got %d", payload.CreatedAt)
 	}
 
 	// B1: metadata fields should be populated
-	if payload.Summary != "1 chunks, +1 / -0" {
-		t.Errorf("expected Summary '1 chunks, +1 / -0', got %q", payload.Summary)
+	if payload.Summary != "+1 / -0" {
+		t.Errorf("expected Summary '+1 / -0', got %q", payload.Summary)
 	}
 	if payload.RiskLevel != "low" {
 		t.Errorf("expected RiskLevel 'low', got %q", payload.RiskLevel)
@@ -639,12 +670,9 @@ func TestBroadcastDiffCard(t *testing.T) {
 	// Read session.status
 	_ = readMessage(t, conn)
 
-	// Broadcast a diff card with chunk info
-	chunks := []stream.ChunkInfo{
-		{Index: 0, OldStart: 1, OldCount: 3, NewStart: 1, NewCount: 4, Offset: 0, Length: 9},
-	}
+	// Broadcast a diff card
 	stats := &stream.DiffStats{ByteSize: 9, LineCount: 1, AddedLines: 1, DeletedLines: 0}
-	s.BroadcastDiffCard("card-abc", "file.go", "+new line", chunks, nil, nil, false, false, stats, 1703500000000)
+	s.BroadcastDiffCard("card-abc", "file.go", "+new line", nil, false, false, stats, 1703500000000)
 
 	msg := readMessage(t, conn)
 	if msg.Type != MessageTypeDiffCard {
@@ -667,8 +695,8 @@ func TestBroadcastDiffCard(t *testing.T) {
 	}
 
 	// B1: metadata should be present in broadcast JSON
-	if payload["summary"] != "1 chunks, +1 / -0" {
-		t.Errorf("expected summary '1 chunks, +1 / -0', got %v", payload["summary"])
+	if payload["summary"] != "+1 / -0" {
+		t.Errorf("expected summary '+1 / -0', got %v", payload["summary"])
 	}
 	if payload["risk_level"] != "low" {
 		t.Errorf("expected risk_level 'low', got %v", payload["risk_level"])
@@ -1241,8 +1269,8 @@ func TestReconnectHandlerWithPendingCards(t *testing.T) {
 
 	s.SetReconnectHandler(func(sendToClient func(Message)) {
 		// Simulate sending pending cards on reconnect
-		sendToClient(NewDiffCardMessage("card-1", "file1.go", "+line1", nil, nil, nil, false, false, nil, 1000))
-		sendToClient(NewDiffCardMessage("card-2", "file2.go", "+line2", nil, nil, nil, false, false, nil, 2000))
+		sendToClient(NewDiffCardMessage("card-1", "file1.go", "+line1", nil, false, false, nil, 1000))
+		sendToClient(NewDiffCardMessage("card-2", "file2.go", "+line2", nil, false, false, nil, 2000))
 	})
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
@@ -1296,7 +1324,7 @@ func TestReconnectHandlerBinaryCardSemanticGroups(t *testing.T) {
 		}
 		sendToClient(NewDiffCardMessage("card-bin", "photo.jpg",
 			"(binary file - content not shown)",
-			nil, nil, groups, true, false, nil, 1000))
+			groups, true, false, nil, 1000))
 	})
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
@@ -1646,52 +1674,6 @@ func TestReconnectHandlerTimeoutDoesNotBlockBroadcast(t *testing.T) {
 }
 
 // TestNewChunkDecisionResultMessage verifies the chunk.decision_result message constructor.
-func TestNewChunkDecisionResultMessage(t *testing.T) {
-	msg := NewChunkDecisionResultMessage("card-123", 2, "accept", true, "", "")
-
-	if msg.Type != MessageTypeChunkDecisionResult {
-		t.Errorf("expected type %s, got %s", MessageTypeChunkDecisionResult, msg.Type)
-	}
-
-	payload, ok := msg.Payload.(ChunkDecisionResultPayload)
-	if !ok {
-		t.Fatalf("expected ChunkDecisionResultPayload, got %T", msg.Payload)
-	}
-
-	if payload.CardID != "card-123" {
-		t.Errorf("expected CardID card-123, got %s", payload.CardID)
-	}
-	if payload.ChunkIndex != 2 {
-		t.Errorf("expected ChunkIndex 2, got %d", payload.ChunkIndex)
-	}
-	if payload.Action != "accept" {
-		t.Errorf("expected Action accept, got %s", payload.Action)
-	}
-	if !payload.Success {
-		t.Errorf("expected Success true, got false")
-	}
-}
-
-// TestNewChunkDecisionResultMessageWithError verifies error case.
-func TestNewChunkDecisionResultMessageWithError(t *testing.T) {
-	msg := NewChunkDecisionResultMessage("card-456", 1, "reject", false, "action.git_failed", "patch conflict")
-
-	payload, ok := msg.Payload.(ChunkDecisionResultPayload)
-	if !ok {
-		t.Fatalf("expected ChunkDecisionResultPayload, got %T", msg.Payload)
-	}
-
-	if payload.Success {
-		t.Errorf("expected Success false, got true")
-	}
-	if payload.ErrorCode != "action.git_failed" {
-		t.Errorf("expected ErrorCode action.git_failed, got %s", payload.ErrorCode)
-	}
-	if payload.Error != "patch conflict" {
-		t.Errorf("expected Error 'patch conflict', got %s", payload.Error)
-	}
-}
-
 // TestUndoResultMessageChunkIndexZero verifies that chunk_index=0 is serialized
 // in undo.result JSON (not omitted due to omitempty). This guards against regressions
 // where the mobile client would misinterpret chunk 0 undo as file-level undo.
@@ -1824,271 +1806,6 @@ func TestUndoResultMessageErrorIncludesContentHash(t *testing.T) {
 	}
 	if payload["error"] != "patch conflict" {
 		t.Errorf("expected error='patch conflict', got %v", payload["error"])
-	}
-}
-
-// TestChunkInfoSerialization verifies ChunkInfo JSON serialization.
-func TestChunkInfoSerialization(t *testing.T) {
-	chunks := []ChunkInfo{
-		{Index: 0, OldStart: 1, OldCount: 3, NewStart: 1, NewCount: 4, Offset: 0, Length: 50},
-		{Index: 1, OldStart: 10, OldCount: 2, NewStart: 11, NewCount: 5, Offset: 50, Length: 75},
-	}
-
-	msg := NewDiffCardMessage("card-test", "file.go", "@@ -1,3 +1,4 @@\n+line", chunks, nil, nil, false, false, nil, 1703500000000)
-
-	payload, ok := msg.Payload.(DiffCardPayload)
-	if !ok {
-		t.Fatalf("expected DiffCardPayload, got %T", msg.Payload)
-	}
-
-	if len(payload.Chunks) != 2 {
-		t.Fatalf("expected 2 chunks, got %d", len(payload.Chunks))
-	}
-
-	h0 := payload.Chunks[0]
-	if h0.Index != 0 || h0.OldStart != 1 || h0.Offset != 0 || h0.Length != 50 {
-		t.Errorf("chunk 0 values incorrect: %+v", h0)
-	}
-
-	h1 := payload.Chunks[1]
-	if h1.Index != 1 || h1.OldStart != 10 || h1.Offset != 50 || h1.Length != 75 {
-		t.Errorf("chunk 1 values incorrect: %+v", h1)
-	}
-}
-
-// TestHandleChunkDecisionValidPayload verifies chunk.decision message handling.
-func TestHandleChunkDecisionValidPayload(t *testing.T) {
-	s, ts := newTestServer()
-	defer ts.Close()
-	defer s.Stop()
-
-	// Track chunk decision calls with mutex for race-safe access
-	var mu sync.Mutex
-	var handlerCalls []struct {
-		CardID      string
-		ChunkIndex  int
-		Action      string
-		ContentHash string
-	}
-	s.SetChunkDecisionHandler(func(cardID string, chunkIndex int, action string, contentHash string) error {
-		mu.Lock()
-		handlerCalls = append(handlerCalls, struct {
-			CardID      string
-			ChunkIndex  int
-			Action      string
-			ContentHash string
-		}{cardID, chunkIndex, action, contentHash})
-		mu.Unlock()
-		return nil
-	})
-
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
-	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-
-	// Read session.status
-	_ = readMessage(t, conn)
-
-	// Send chunk.decision
-	decision := map[string]interface{}{
-		"type": "chunk.decision",
-		"payload": map[string]interface{}{
-			"card_id":     "card-abc",
-			"chunk_index": 1,
-			"action":      "accept",
-		},
-	}
-	if err := conn.WriteJSON(decision); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-
-	// Wait for handler and result
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify handler was called (with mutex protection)
-	mu.Lock()
-	callCount := len(handlerCalls)
-	var firstCall struct {
-		CardID      string
-		ChunkIndex  int
-		Action      string
-		ContentHash string
-	}
-	if callCount > 0 {
-		firstCall = handlerCalls[0]
-	}
-	mu.Unlock()
-
-	if callCount != 1 {
-		t.Fatalf("expected 1 handler call, got %d", callCount)
-	}
-	if firstCall.CardID != "card-abc" {
-		t.Errorf("expected CardID card-abc, got %s", firstCall.CardID)
-	}
-	if firstCall.ChunkIndex != 1 {
-		t.Errorf("expected ChunkIndex 1, got %d", firstCall.ChunkIndex)
-	}
-	if firstCall.Action != "accept" {
-		t.Errorf("expected Action accept, got %s", firstCall.Action)
-	}
-
-	// Read the decision result
-	msg := readMessage(t, conn)
-	if msg.Type != MessageTypeChunkDecisionResult {
-		t.Fatalf("expected chunk.decision_result, got %s", msg.Type)
-	}
-
-	payload, ok := msg.Payload.(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected map payload, got %T", msg.Payload)
-	}
-	if payload["card_id"] != "card-abc" {
-		t.Errorf("expected card_id card-abc, got %v", payload["card_id"])
-	}
-	if int(payload["chunk_index"].(float64)) != 1 {
-		t.Errorf("expected chunk_index 1, got %v", payload["chunk_index"])
-	}
-	if payload["success"] != true {
-		t.Errorf("expected success true, got %v", payload["success"])
-	}
-}
-
-// TestHandleChunkDecisionInvalidAction verifies error on invalid action.
-func TestHandleChunkDecisionInvalidAction(t *testing.T) {
-	s, ts := newTestServer()
-	defer ts.Close()
-	defer s.Stop()
-
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
-	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-
-	// Read session.status
-	_ = readMessage(t, conn)
-
-	// Send chunk.decision with invalid action
-	decision := map[string]interface{}{
-		"type": "chunk.decision",
-		"payload": map[string]interface{}{
-			"card_id":     "card-abc",
-			"chunk_index": 0,
-			"action":      "maybe",
-		},
-	}
-	if err := conn.WriteJSON(decision); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-
-	// Read the error result
-	msg := readMessage(t, conn)
-	if msg.Type != MessageTypeChunkDecisionResult {
-		t.Fatalf("expected chunk.decision_result, got %s", msg.Type)
-	}
-
-	payload, ok := msg.Payload.(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected map payload, got %T", msg.Payload)
-	}
-	if payload["success"] != false {
-		t.Errorf("expected success false, got %v", payload["success"])
-	}
-	if payload["error_code"] != apperrors.CodeActionInvalid {
-		t.Errorf("expected error_code %s, got %v", apperrors.CodeActionInvalid, payload["error_code"])
-	}
-}
-
-// TestHandleChunkDecisionNegativeIndex verifies error on negative chunk index.
-func TestHandleChunkDecisionNegativeIndex(t *testing.T) {
-	s, ts := newTestServer()
-	defer ts.Close()
-	defer s.Stop()
-
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
-	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-
-	// Read session.status
-	_ = readMessage(t, conn)
-
-	// Send chunk.decision with negative index
-	decision := map[string]interface{}{
-		"type": "chunk.decision",
-		"payload": map[string]interface{}{
-			"card_id":     "card-abc",
-			"chunk_index": -1,
-			"action":      "accept",
-		},
-	}
-	if err := conn.WriteJSON(decision); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-
-	// Read the error result
-	msg := readMessage(t, conn)
-	if msg.Type != MessageTypeChunkDecisionResult {
-		t.Fatalf("expected chunk.decision_result, got %s", msg.Type)
-	}
-
-	payload, ok := msg.Payload.(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected map payload, got %T", msg.Payload)
-	}
-	if payload["success"] != false {
-		t.Errorf("expected success false, got %v", payload["success"])
-	}
-}
-
-// TestHandleChunkDecisionNoHandler verifies error when no handler is set.
-func TestHandleChunkDecisionNoHandler(t *testing.T) {
-	s, ts := newTestServer()
-	defer ts.Close()
-	defer s.Stop()
-
-	// Don't set a chunk decision handler
-
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
-	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-
-	// Read session.status
-	_ = readMessage(t, conn)
-
-	// Send chunk.decision
-	decision := map[string]interface{}{
-		"type": "chunk.decision",
-		"payload": map[string]interface{}{
-			"card_id":     "card-abc",
-			"chunk_index": 0,
-			"action":      "accept",
-		},
-	}
-	if err := conn.WriteJSON(decision); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-
-	// Read the error result
-	msg := readMessage(t, conn)
-	if msg.Type != MessageTypeChunkDecisionResult {
-		t.Fatalf("expected chunk.decision_result, got %s", msg.Type)
-	}
-
-	payload, ok := msg.Payload.(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected map payload, got %T", msg.Payload)
-	}
-	if payload["success"] != false {
-		t.Errorf("expected success false, got %v", payload["success"])
-	}
-	if payload["error_code"] != apperrors.CodeServerHandlerMissing {
-		t.Errorf("expected error_code %s, got %v", apperrors.CodeServerHandlerMissing, payload["error_code"])
 	}
 }
 
@@ -2553,6 +2270,54 @@ func (m *mockWriter) getWritten() []byte {
 	result := make([]byte, len(m.written))
 	copy(result, m.written)
 	return result
+}
+
+type blockingMockWriter struct {
+	mu      sync.Mutex
+	written []byte
+	started chan struct{}
+	release chan struct{}
+}
+
+func (m *blockingMockWriter) Write(p []byte) (n int, err error) {
+	select {
+	case <-m.started:
+	default:
+		close(m.started)
+	}
+	<-m.release
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.written = append(m.written, p...)
+	return len(p), nil
+}
+
+func (m *blockingMockWriter) getWritten() []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]byte, len(m.written))
+	copy(result, m.written)
+	return result
+}
+
+type failingMockWriter struct {
+	err error
+}
+
+func (m *failingMockWriter) Write(p []byte) (n int, err error) {
+	return 0, m.err
+}
+
+func configureStructuredPromptSession(t *testing.T, s *Server, sessionID string, metadata SessionInfo) *storage.SQLiteStore {
+	t.Helper()
+
+	store := newStructuredRuntimeSessionStoreForSession(t, sessionID, metadata)
+	s.SetSessionStore(store)
+	s.SetStructuredChatEnabled(true)
+	controller := NewStructuredChatController(store)
+	s.SetStructuredChatController(controller)
+	s.SetStructuredChatRuntime(NewStructuredChatRuntime(store, controller, s.Broadcast))
+	return store
 }
 
 // TestTerminalInputPayloadParsing tests TerminalInputPayload JSON serialization.
@@ -3242,6 +3007,534 @@ func TestEmptySessionList(t *testing.T) {
 
 	if payload.Sessions != nil {
 		t.Errorf("expected nil sessions for empty list, got %v", payload.Sessions)
+	}
+}
+
+func TestHandleChatPromptRequiresRequestID(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	_ = readMessage(t, conn)
+
+	if err := conn.WriteJSON(Message{
+		Type: MessageTypeChatPrompt,
+		Payload: ChatPromptPayload{
+			SessionID: s.SessionID(),
+			Text:      "summarize the patch",
+		},
+	}); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	msg := readMessage(t, conn)
+	if msg.Type != MessageTypeChatPromptResult {
+		t.Fatalf("msg.Type = %s, want chat.prompt_result", msg.Type)
+	}
+	payload := mustMarshalToMap(t, msg.Payload)
+	assertStringField(t, payload, "error_code", apperrors.CodeServerInvalidMessage)
+	assertStringField(t, payload, "error", "request_id is required")
+}
+
+func TestHandleChatPromptRejectsUnsupportedSession(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	mockPTY := &mockWriter{}
+	s.SetPTYWriter(mockPTY)
+	configureStructuredPromptSession(t, s, s.SessionID(), SessionInfo{
+		SessionKind:   SessionKindShell,
+		AgentProvider: AgentProviderUnknown,
+	})
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	_ = readMessage(t, conn)
+
+	if err := conn.WriteJSON(Message{
+		Type: MessageTypeChatPrompt,
+		Payload: ChatPromptPayload{
+			SessionID: s.SessionID(),
+			RequestID: "prompt-1",
+			Text:      "summarize the patch",
+		},
+	}); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	msg := readMessage(t, conn)
+	if msg.Type != MessageTypeChatPromptResult {
+		t.Fatalf("msg.Type = %s, want chat.prompt_result", msg.Type)
+	}
+	payload := mustMarshalToMap(t, msg.Payload)
+	assertStringField(t, payload, "error_code", "structured_chat.unavailable")
+	if got := string(mockPTY.getWritten()); got != "" {
+		t.Fatalf("PTY wrote %q, want empty", got)
+	}
+}
+
+func TestHandleChatPromptWritesToPTYAndBroadcastsCanonicalUserMessage(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	mockPTY := &mockWriter{}
+	s.SetPTYWriter(mockPTY)
+	store := configureStructuredPromptSession(t, s, s.SessionID(), ClassifySessionMetadata("codex", nil, ""))
+	defer store.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	_ = readMessage(t, conn)
+
+	if err := conn.WriteJSON(Message{
+		Type: MessageTypeChatPrompt,
+		Payload: ChatPromptPayload{
+			SessionID: s.SessionID(),
+			RequestID: "prompt-1",
+			Text:      "summarize the patch",
+		},
+	}); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	// Pipeline startup adds a chat.snapshot; read up to 3 messages and
+	// pick out the chat.upsert and chat.prompt_result, ignoring snapshots.
+	var upsertMsg, resultMsg Message
+	for i := 0; i < 3; i++ {
+		m := readMessage(t, conn)
+		switch m.Type {
+		case MessageTypeChatUpsert:
+			upsertMsg = m
+		case MessageTypeChatPromptResult:
+			resultMsg = m
+		case MessageTypeChatSnapshot:
+			// expected from ensurePipeline
+		default:
+			t.Fatalf("unexpected message type %s", m.Type)
+		}
+	}
+	if upsertMsg.Type != MessageTypeChatUpsert {
+		t.Fatal("expected chat.upsert among prompt response messages")
+	}
+	upsert := mustMarshalToMap(t, upsertMsg.Payload)
+	items, ok := upsert["items"].([]interface{})
+	if !ok || len(items) != 1 {
+		t.Fatalf("items = %#v, want one item", upsert["items"])
+	}
+	item, ok := items[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("item = %#v, want map", items[0])
+	}
+	assertStringField(t, item, "kind", string(ChatItemKindUserMessage))
+	assertStringField(t, item, "text", "summarize the patch")
+	assertStringField(t, item, "request_id", "prompt-1")
+
+	if resultMsg.Type != MessageTypeChatPromptResult {
+		t.Fatal("expected chat.prompt_result among prompt response messages")
+	}
+	result := mustMarshalToMap(t, resultMsg.Payload)
+	if accepted, ok := result["accepted"].(bool); !ok || !accepted {
+		t.Fatalf("accepted = %#v, want true", result["accepted"])
+	}
+	if got := string(mockPTY.getWritten()); got != "summarize the patch\r" {
+		t.Fatalf("PTY wrote %q, want summarize the patch\\r", got)
+	}
+	snapshot, err := store.LoadStructuredChatSnapshot(s.SessionID())
+	if err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+	}
+	if snapshot == nil || len(snapshot.Items) != 1 {
+		t.Fatalf("snapshot = %#v, want one item", snapshot)
+	}
+}
+
+func TestHandleChatPromptReplayDoesNotDoubleWritePTY(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	mockPTY := &mockWriter{}
+	s.SetPTYWriter(mockPTY)
+	store := configureStructuredPromptSession(t, s, s.SessionID(), ClassifySessionMetadata("codex", nil, ""))
+	defer store.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	_ = readMessage(t, conn)
+
+	msg := Message{
+		Type: MessageTypeChatPrompt,
+		Payload: ChatPromptPayload{
+			SessionID: s.SessionID(),
+			RequestID: "prompt-1",
+			Text:      "summarize the patch",
+		},
+	}
+	if err := conn.WriteJSON(msg); err != nil {
+		t.Fatalf("first write failed: %v", err)
+	}
+	// Pipeline startup adds a chat.snapshot; read 3 messages and verify
+	// we get a chat.upsert and chat.prompt_result (ignoring snapshot).
+	var sawUpsert, sawResult bool
+	for i := 0; i < 3; i++ {
+		m := readMessage(t, conn)
+		switch m.Type {
+		case MessageTypeChatUpsert:
+			sawUpsert = true
+		case MessageTypeChatPromptResult:
+			sawResult = true
+		case MessageTypeChatSnapshot:
+			// expected from ensurePipeline
+		}
+	}
+	if !sawUpsert {
+		t.Fatal("expected chat.upsert in first send")
+	}
+	if !sawResult {
+		t.Fatal("expected chat.prompt_result in first send")
+	}
+
+	if err := conn.WriteJSON(msg); err != nil {
+		t.Fatalf("second write failed: %v", err)
+	}
+	replayResult := readMessage(t, conn)
+	if replayResult.Type != MessageTypeChatPromptResult {
+		t.Fatalf("replay result type = %s, want chat.prompt_result", replayResult.Type)
+	}
+	if msg, ok := readOptionalServerMessage(conn, 150*time.Millisecond); ok {
+		t.Fatalf("unexpected follow-up message on replay: %s", msg.Type)
+	}
+	if got := string(mockPTY.getWritten()); got != "summarize the patch\r" {
+		t.Fatalf("PTY wrote %q, want one prompt write", got)
+	}
+}
+
+func TestHandleChatPromptWriteFailureRollsBackSeededUserMessage(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	s.SetPTYWriter(&failingMockWriter{err: io.ErrClosedPipe})
+	store := configureStructuredPromptSession(t, s, s.SessionID(), ClassifySessionMetadata("codex", nil, ""))
+	defer store.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	_ = readMessage(t, conn)
+
+	if err := conn.WriteJSON(Message{
+		Type: MessageTypeChatPrompt,
+		Payload: ChatPromptPayload{
+			SessionID: s.SessionID(),
+			RequestID: "prompt-1",
+			Text:      "summarize the patch",
+		},
+	}); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	// Pipeline startup adds a chat.snapshot; read 4 messages total.
+	var sawUpsert, sawRemove, sawResult bool
+	for i := 0; i < 4; i++ {
+		msg := readMessage(t, conn)
+		switch msg.Type {
+		case MessageTypeChatUpsert:
+			sawUpsert = true
+		case MessageTypeChatRemove:
+			sawRemove = true
+		case MessageTypeChatPromptResult:
+			sawResult = true
+			payload := mustMarshalToMap(t, msg.Payload)
+			if accepted, ok := payload["accepted"].(bool); !ok || accepted {
+				t.Fatalf("accepted = %#v, want false", payload["accepted"])
+			}
+			assertStringField(t, payload, "error_code", apperrors.CodeInputWriteFailed)
+		case MessageTypeChatSnapshot:
+			// expected from ensurePipeline
+		default:
+			t.Fatalf("unexpected message type %s", msg.Type)
+		}
+	}
+	if !sawUpsert || !sawRemove || !sawResult {
+		t.Fatalf("sawUpsert=%t sawRemove=%t sawResult=%t, want all true", sawUpsert, sawRemove, sawResult)
+	}
+
+	snapshot, err := store.LoadStructuredChatSnapshot(s.SessionID())
+	if err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+	}
+	if snapshot == nil {
+		t.Fatal("snapshot is nil")
+	}
+	if len(snapshot.Items) != 0 {
+		t.Fatalf("len(snapshot.Items) = %d, want 0", len(snapshot.Items))
+	}
+}
+
+func TestHandleChatPromptCrossClientInFlightRejected(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	mockPTY := &blockingMockWriter{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	s.SetPTYWriter(mockPTY)
+	store := configureStructuredPromptSession(t, s, s.SessionID(), ClassifySessionMetadata("codex", nil, ""))
+	defer store.Close()
+
+	connA, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial A failed: %v", err)
+	}
+	defer connA.Close()
+	connB, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial B failed: %v", err)
+	}
+	defer connB.Close()
+	_ = readMessage(t, connA)
+	_ = readMessage(t, connB)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- connA.WriteJSON(Message{
+			Type: MessageTypeChatPrompt,
+			Payload: ChatPromptPayload{
+				SessionID: s.SessionID(),
+				RequestID: "prompt-1",
+				Text:      "summarize the patch",
+			},
+		})
+	}()
+	select {
+	case <-mockPTY.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first prompt never reached PTY write")
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("write A failed: %v", err)
+	}
+
+	if err := connB.WriteJSON(Message{
+		Type: MessageTypeChatPrompt,
+		Payload: ChatPromptPayload{
+			SessionID: s.SessionID(),
+			RequestID: "prompt-2",
+			Text:      "different prompt",
+		},
+	}); err != nil {
+		t.Fatalf("write B failed: %v", err)
+	}
+
+	// ConnB may receive broadcast messages (chat.snapshot, chat.upsert) from
+	// connA's pipeline startup before its own prompt_result; skip past them.
+	resultB := readUntilMessageType(t, connB, MessageTypeChatPromptResult, 2*time.Second)
+	payloadB := mustMarshalToMap(t, resultB.Payload)
+	if accepted, ok := payloadB["accepted"].(bool); !ok || accepted {
+		t.Fatalf("B accepted = %#v, want false", payloadB["accepted"])
+	}
+	assertStringField(t, payloadB, "error_code", "chat.prompt_in_flight")
+
+	close(mockPTY.release)
+	// ConnA receives chat.snapshot + chat.upsert + chat.prompt_result (3 msgs).
+	var sawUpsertA, sawResultA bool
+	for i := 0; i < 3; i++ {
+		m := readMessage(t, connA)
+		switch m.Type {
+		case MessageTypeChatUpsert:
+			sawUpsertA = true
+		case MessageTypeChatPromptResult:
+			sawResultA = true
+		case MessageTypeChatSnapshot:
+			// expected from ensurePipeline
+		}
+	}
+	if !sawUpsertA {
+		t.Fatal("expected chat.upsert for connA")
+	}
+	if !sawResultA {
+		t.Fatal("expected chat.prompt_result for connA")
+	}
+	if got := string(mockPTY.getWritten()); got != "summarize the patch\r" {
+		t.Fatalf("PTY wrote %q, want only accepted prompt", got)
+	}
+}
+
+func TestHandleTerminalInputBlockedWhilePromptInFlight(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	mockPTY := &blockingMockWriter{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	s.SetPTYWriter(mockPTY)
+	store := configureStructuredPromptSession(t, s, s.SessionID(), ClassifySessionMetadata("codex", nil, ""))
+	defer store.Close()
+
+	connA, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial A failed: %v", err)
+	}
+	defer connA.Close()
+	connB, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial B failed: %v", err)
+	}
+	defer connB.Close()
+	_ = readMessage(t, connA)
+	_ = readMessage(t, connB)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- connA.WriteJSON(Message{
+			Type: MessageTypeChatPrompt,
+			Payload: ChatPromptPayload{
+				SessionID: s.SessionID(),
+				RequestID: "prompt-1",
+				Text:      "summarize the patch",
+			},
+		})
+	}()
+	select {
+	case <-mockPTY.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt never reached PTY write")
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("prompt write failed: %v", err)
+	}
+
+	if err := connB.WriteJSON(Message{
+		Type: MessageTypeTerminalInput,
+		Payload: TerminalInputPayload{
+			SessionID: s.SessionID(),
+			Data:      "ls\n",
+			Timestamp: time.Now().UnixMilli(),
+		},
+	}); err != nil {
+		t.Fatalf("terminal.input write failed: %v", err)
+	}
+
+	msg := readUntilMessageType(t, connB, MessageTypeError, 2*time.Second)
+	if msg.Type != MessageTypeError {
+		t.Fatalf("msg.Type = %s, want error", msg.Type)
+	}
+	payload := mustMarshalToMap(t, msg.Payload)
+	assertStringField(t, payload, "code", apperrors.CodeInputPromptPending)
+
+	close(mockPTY.release)
+	// ConnA receives chat.snapshot + chat.upsert + chat.prompt_result (3 msgs).
+	var sawUpsertA, sawResultA bool
+	for i := 0; i < 3; i++ {
+		m := readMessage(t, connA)
+		switch m.Type {
+		case MessageTypeChatUpsert:
+			sawUpsertA = true
+		case MessageTypeChatPromptResult:
+			sawResultA = true
+		case MessageTypeChatSnapshot:
+			// expected from ensurePipeline
+		}
+	}
+	if !sawUpsertA {
+		t.Fatal("expected chat.upsert for connA")
+	}
+	if !sawResultA {
+		t.Fatal("expected chat.prompt_result for connA")
+	}
+	if got := string(mockPTY.getWritten()); got != "summarize the patch\r" {
+		t.Fatalf("PTY wrote %q, want only prompt text", got)
+	}
+}
+
+func TestHandleTerminalInputBlockedWhilePromptInFlightLegacyEmptySessionID(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	mockPTY := &mockWriter{}
+	s.SetPTYWriter(mockPTY)
+	s.beginSessionPrompt(s.SessionID(), nil, "prompt-1")
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	_ = readMessage(t, conn)
+
+	if err := conn.WriteJSON(Message{
+		Type: MessageTypeTerminalInput,
+		Payload: TerminalInputPayload{
+			Data:      "ls\n",
+			Timestamp: time.Now().UnixMilli(),
+		},
+	}); err != nil {
+		t.Fatalf("terminal.input write failed: %v", err)
+	}
+
+	msg := readUntilMessageType(t, conn, MessageTypeError, 2*time.Second)
+	payload := mustMarshalToMap(t, msg.Payload)
+	assertStringField(t, payload, "code", apperrors.CodeInputPromptPending)
+	if got := string(mockPTY.getWritten()); got != "" {
+		t.Fatalf("PTY wrote %q, want empty", got)
+	}
+}
+
+func TestClearSessionPromptsForDeviceRemovesOwnedPrompts(t *testing.T) {
+	s := NewServer(":0")
+	clientA := &Client{deviceID: "device-a"}
+	clientB := &Client{deviceID: "device-b"}
+	s.beginSessionPrompt("session-a", clientA, "prompt-a")
+	s.beginSessionPrompt("session-b", clientB, "prompt-b")
+
+	s.clearSessionPromptsForDevice("device-a")
+
+	if s.hasSessionPrompt("session-a") {
+		t.Fatal("session-a prompt state still present")
+	}
+	if !s.hasSessionPrompt("session-b") {
+		t.Fatal("session-b prompt state missing")
+	}
+}
+
+func TestClearSessionPromptsForClientRemovesOwnedPromptsWithoutDeviceID(t *testing.T) {
+	s := NewServer(":0")
+	clientA := &Client{}
+	clientB := &Client{}
+	s.beginSessionPrompt("session-a", clientA, "prompt-a")
+	s.beginSessionPrompt("session-b", clientB, "prompt-b")
+
+	s.clearSessionPromptsForClient(clientA)
+
+	if s.hasSessionPrompt("session-a") {
+		t.Fatal("session-a prompt state still present")
+	}
+	if !s.hasSessionPrompt("session-b") {
+		t.Fatal("session-b prompt state missing")
 	}
 }
 
@@ -4568,6 +4861,578 @@ func TestNewSessionCreatedMessage(t *testing.T) {
 	if payload.CreatedAt != createdAt {
 		t.Errorf("expected CreatedAt %d, got %d", createdAt, payload.CreatedAt)
 	}
+	if payload.SessionKind != "" {
+		t.Errorf("expected empty SessionKind by default, got %q", payload.SessionKind)
+	}
+	if payload.AgentProvider != "" {
+		t.Errorf("expected empty AgentProvider by default, got %q", payload.AgentProvider)
+	}
+	if payload.ChatCapabilities != nil {
+		t.Errorf("expected nil ChatCapabilities by default, got %#v", payload.ChatCapabilities)
+	}
+
+	meta := SessionInfo{
+		SessionKind:   SessionKindAgent,
+		AgentProvider: AgentProviderCodex,
+		ChatCapabilities: &ChatCapabilities{
+			StructuredTimeline: true,
+			Markdown:           true,
+			ToolCards:          false,
+			ApprovalInline:     false,
+			TranscriptFallback: true,
+			DefaultView:        ChatDefaultViewChat,
+		},
+	}
+	msg = NewSessionCreatedMessage(
+		"session-123",
+		"Session 1",
+		"/bin/bash",
+		"running",
+		createdAt,
+		meta,
+	)
+	payload, ok = msg.Payload.(SessionCreatedPayload)
+	if !ok {
+		t.Fatalf("expected SessionCreatedPayload, got %T", msg.Payload)
+	}
+	if payload.SessionKind != SessionKindAgent {
+		t.Errorf("expected SessionKind %q, got %q", SessionKindAgent, payload.SessionKind)
+	}
+	if payload.AgentProvider != AgentProviderCodex {
+		t.Errorf("expected AgentProvider %q, got %q", AgentProviderCodex, payload.AgentProvider)
+	}
+	if payload.ChatCapabilities == nil || payload.ChatCapabilities.DefaultView != ChatDefaultViewChat {
+		t.Fatalf("expected ChatCapabilities with default_view chat, got %#v", payload.ChatCapabilities)
+	}
+}
+
+func TestChatMessageTypeValues(t *testing.T) {
+	tests := []struct {
+		got  MessageType
+		want string
+	}{
+		{MessageTypeChatSnapshot, "chat.snapshot"},
+		{MessageTypeChatUpsert, "chat.upsert"},
+		{MessageTypeChatRemove, "chat.remove"},
+		{MessageTypeChatReset, "chat.reset"},
+		{MessageTypeChatPrompt, "chat.prompt"},
+		{MessageTypeChatPromptResult, "chat.prompt_result"},
+	}
+
+	for _, tt := range tests {
+		if string(tt.got) != tt.want {
+			t.Errorf("message type = %q, want %q", tt.got, tt.want)
+		}
+	}
+}
+
+func TestChatPayloadSerialization(t *testing.T) {
+	item := sampleApprovalChatItem()
+
+	tests := []struct {
+		name    string
+		payload interface{}
+		check   func(t *testing.T, raw map[string]interface{})
+	}{
+		{
+			name: "snapshot",
+			payload: ChatSnapshotPayload{
+				SessionID:    "session-1",
+				ServerBootID: "boot-1",
+				Revision:     42,
+				Items:        []ChatItem{item},
+			},
+			check: func(t *testing.T, raw map[string]interface{}) {
+				t.Helper()
+				assertStringField(t, raw, "session_id", "session-1")
+				assertStringField(t, raw, "server_boot_id", "boot-1")
+				assertNumberField(t, raw, "revision", 42)
+				items, ok := raw["items"].([]interface{})
+				if !ok || len(items) != 1 {
+					t.Fatalf("expected one serialized item, got %#v", raw["items"])
+				}
+				itemMap, ok := items[0].(map[string]interface{})
+				if !ok {
+					t.Fatalf("expected item map, got %#v", items[0])
+				}
+				assertStringField(t, itemMap, "approval_request_id", "approval-1")
+				assertStringField(t, itemMap, "request_id", "req-1")
+				assertStringField(t, itemMap, "reason", "needs approval")
+			},
+		},
+		{
+			name: "upsert",
+			payload: ChatUpsertPayload{
+				SessionID:    "session-1",
+				ServerBootID: "boot-1",
+				Revision:     43,
+				Items:        []ChatItem{item},
+			},
+			check: func(t *testing.T, raw map[string]interface{}) {
+				t.Helper()
+				assertNumberField(t, raw, "revision", 43)
+			},
+		},
+		{
+			name: "remove",
+			payload: ChatRemovePayload{
+				SessionID:    "session-1",
+				ServerBootID: "boot-1",
+				Revision:     44,
+				ItemIDs:      []string{"item-1", "item-2"},
+			},
+			check: func(t *testing.T, raw map[string]interface{}) {
+				t.Helper()
+				ids, ok := raw["item_ids"].([]interface{})
+				if !ok || len(ids) != 2 {
+					t.Fatalf("expected item_ids array, got %#v", raw["item_ids"])
+				}
+			},
+		},
+		{
+			name: "reset",
+			payload: ChatResetPayload{
+				SessionID:    "session-1",
+				ServerBootID: "boot-1",
+				Revision:     45,
+				Reason:       ChatResetReasonHistoryCleared,
+			},
+			check: func(t *testing.T, raw map[string]interface{}) {
+				t.Helper()
+				assertStringField(t, raw, "reason", string(ChatResetReasonHistoryCleared))
+			},
+		},
+		{
+			name: "prompt",
+			payload: ChatPromptPayload{
+				SessionID: "session-1",
+				RequestID: "prompt-1",
+				Text:      "summarize this change",
+			},
+			check: func(t *testing.T, raw map[string]interface{}) {
+				t.Helper()
+				assertStringField(t, raw, "request_id", "prompt-1")
+				assertStringField(t, raw, "text", "summarize this change")
+			},
+		},
+		{
+			name: "prompt_result",
+			payload: ChatPromptResultPayload{
+				SessionID: "session-1",
+				RequestID: "prompt-1",
+				Accepted:  false,
+				ErrorCode: "chat.prompt_in_flight",
+				Error:     "another client already has a pending prompt",
+			},
+			check: func(t *testing.T, raw map[string]interface{}) {
+				t.Helper()
+				if accepted, ok := raw["accepted"].(bool); !ok || accepted {
+					t.Fatalf("expected accepted=false, got %#v", raw["accepted"])
+				}
+				assertStringField(t, raw, "error_code", "chat.prompt_in_flight")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := mustMarshalToMap(t, tt.payload)
+			tt.check(t, raw)
+		})
+	}
+}
+
+func TestChatPayloadTimestampEncoding(t *testing.T) {
+	item := sampleApprovalChatItem()
+	item.CreatedAt = 1700000000123
+	item.ExpiresAt = "2026-03-07T12:34:56Z"
+
+	toolCall := ChatItem{
+		ID:            "tool-1",
+		SessionID:     "session-1",
+		Kind:          ChatItemKindToolCall,
+		CreatedAt:     1700000000999,
+		Provider:      ChatItemProviderSystem,
+		Status:        ChatItemStatusCompleted,
+		ToolName:      "rg",
+		Summary:       "search repo",
+		InputExcerpt:  "rg TODO",
+		ResultExcerpt: "no matches",
+		IsError:       false,
+		StartedAt:     1700000001000,
+		CompletedAt:   1700000002000,
+	}
+
+	approvalMap := mustMarshalToMap(t, item)
+	assertNumberField(t, approvalMap, "created_at", 1700000000123)
+	assertStringField(t, approvalMap, "expires_at", "2026-03-07T12:34:56Z")
+
+	toolMap := mustMarshalToMap(t, toolCall)
+	assertNumberField(t, toolMap, "created_at", 1700000000999)
+	assertNumberField(t, toolMap, "started_at", 1700000001000)
+	assertNumberField(t, toolMap, "completed_at", 1700000002000)
+}
+
+func TestChatBatchPayloadShapes(t *testing.T) {
+	snapshot := mustMarshalToMap(t, ChatSnapshotPayload{
+		SessionID:    "session-1",
+		ServerBootID: "boot-1",
+		Revision:     1,
+		Items: []ChatItem{{
+			ID:        "item-1",
+			SessionID: "session-1",
+			Kind:      ChatItemKindUserMessage,
+			CreatedAt: 1,
+			Provider:  ChatItemProviderClaude,
+			Status:    ChatItemStatusCompleted,
+			Text:      "hello",
+		}},
+	})
+	if _, ok := snapshot["items"].([]interface{}); !ok {
+		t.Fatalf("expected items array, got %#v", snapshot["items"])
+	}
+	if _, exists := snapshot["item"]; exists {
+		t.Fatalf("expected no singular item field, got %#v", snapshot["item"])
+	}
+
+	remove := mustMarshalToMap(t, ChatRemovePayload{
+		SessionID:    "session-1",
+		ServerBootID: "boot-1",
+		Revision:     2,
+		ItemIDs:      []string{"item-1"},
+	})
+	if _, ok := remove["item_ids"].([]interface{}); !ok {
+		t.Fatalf("expected item_ids array, got %#v", remove["item_ids"])
+	}
+	if _, exists := remove["item_id"]; exists {
+		t.Fatalf("expected no singular item_id field, got %#v", remove["item_id"])
+	}
+}
+
+func TestChatCapabilitiesExplicitFalseSerialization(t *testing.T) {
+	raw := mustMarshalToMap(t, SessionInfo{
+		ID:            "session-1",
+		Repo:          "/repo",
+		Branch:        "main",
+		StartedAt:     1,
+		LastSeen:      2,
+		Status:        "running",
+		SessionKind:   SessionKindAgent,
+		AgentProvider: AgentProviderClaude,
+		ChatCapabilities: &ChatCapabilities{
+			StructuredTimeline: false,
+			Markdown:           false,
+			ToolCards:          false,
+			ApprovalInline:     false,
+			TranscriptFallback: false,
+			DefaultView:        ChatDefaultViewTerminal,
+		},
+	})
+
+	caps, ok := raw["chat_capabilities"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected chat_capabilities object, got %#v", raw["chat_capabilities"])
+	}
+	for _, key := range []string{
+		"structured_timeline",
+		"markdown",
+		"tool_cards",
+		"approval_inline",
+		"transcript_fallback",
+	} {
+		if value, exists := caps[key]; !exists || value != false {
+			t.Fatalf("expected %s=false to serialize explicitly, got %#v", key, value)
+		}
+	}
+	assertStringField(t, caps, "default_view", string(ChatDefaultViewTerminal))
+}
+
+func TestChatItemProviderValues(t *testing.T) {
+	providers := []ChatItemProvider{
+		ChatItemProviderClaude,
+		ChatItemProviderCodex,
+		ChatItemProviderGemini,
+		ChatItemProviderSystem,
+		ChatItemProviderUnknown,
+	}
+
+	for _, provider := range providers {
+		item := ChatItem{
+			ID:        "item-1",
+			SessionID: "session-1",
+			Kind:      ChatItemKindUserMessage,
+			CreatedAt: 1,
+			Provider:  provider,
+			Status:    ChatItemStatusCompleted,
+			Text:      "hello",
+		}
+		raw := mustMarshalToMap(t, item)
+		assertStringField(t, raw, "provider", string(provider))
+	}
+}
+
+func TestChatItemKindFieldOmission(t *testing.T) {
+	tests := []struct {
+		name        string
+		item        ChatItem
+		presentKeys []string
+		absentKeys  []string
+	}{
+		{
+			name: "user_message",
+			item: ChatItem{
+				ID:                "item-1",
+				SessionID:         "session-1",
+				Kind:              ChatItemKindUserMessage,
+				CreatedAt:         1,
+				Provider:          ChatItemProviderClaude,
+				Status:            ChatItemStatusCompleted,
+				Text:              "hello",
+				Markdown:          "ignore",
+				ToolName:          "ignored",
+				ApprovalRequestID: "ignored",
+				Code:              "ignored",
+			},
+			presentKeys: []string{"text"},
+			absentKeys:  []string{"markdown", "tool_name", "approval_request_id", "code"},
+		},
+		{
+			name: "assistant_message",
+			item: ChatItem{
+				ID:        "item-2",
+				SessionID: "session-1",
+				Kind:      ChatItemKindAssistant,
+				CreatedAt: 2,
+				Provider:  ChatItemProviderClaude,
+				Status:    ChatItemStatusCompleted,
+				Markdown:  "**answer**",
+				Text:      "ignored",
+			},
+			presentKeys: []string{"markdown"},
+			absentKeys:  []string{"text", "tool_name"},
+		},
+		{
+			name: "tool_call",
+			item: ChatItem{
+				ID:            "item-3",
+				SessionID:     "session-1",
+				Kind:          ChatItemKindToolCall,
+				CreatedAt:     3,
+				Provider:      ChatItemProviderSystem,
+				Status:        ChatItemStatusCompleted,
+				ToolName:      "rg",
+				Summary:       "search",
+				InputExcerpt:  "rg foo",
+				ResultExcerpt: "foo",
+				IsError:       false,
+				StartedAt:     4,
+				CompletedAt:   5,
+				Text:          "ignored",
+			},
+			presentKeys: []string{
+				"tool_name",
+				"summary",
+				"input_excerpt",
+				"result_excerpt",
+				"is_error",
+				"started_at",
+				"completed_at",
+			},
+			absentKeys: []string{"text", "approval_request_id", "code"},
+		},
+		{
+			name: "approval_request",
+			item: sampleApprovalChatItem(),
+			presentKeys: []string{
+				"approval_request_id",
+				"command",
+				"reason",
+				"expires_at",
+				"decision",
+			},
+			absentKeys: []string{"text", "markdown", "tool_name", "code"},
+		},
+		{
+			name: "system_event",
+			item: ChatItem{
+				ID:        "item-5",
+				SessionID: "session-1",
+				Kind:      ChatItemKindSystemEvent,
+				CreatedAt: 5,
+				Provider:  ChatItemProviderSystem,
+				Status:    ChatItemStatusCompleted,
+				Code:      "structured_chat.unavailable",
+				Message:   "fallback to terminal",
+				Text:      "ignored",
+			},
+			presentKeys: []string{"code", "message"},
+			absentKeys:  []string{"text", "tool_name", "approval_request_id"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := mustMarshalToMap(t, tt.item)
+			for _, key := range tt.presentKeys {
+				if _, exists := raw[key]; !exists {
+					t.Fatalf("expected key %s in %#v", key, raw)
+				}
+			}
+			for _, key := range tt.absentKeys {
+				if _, exists := raw[key]; exists {
+					t.Fatalf("expected key %s to be omitted in %#v", key, raw)
+				}
+			}
+		})
+	}
+}
+
+func TestSessionInfoStructuredChatMetadata(t *testing.T) {
+	raw := mustMarshalToMap(t, SessionInfo{
+		ID:            "session-1",
+		Repo:          "/repo",
+		Branch:        "main",
+		StartedAt:     1,
+		LastSeen:      2,
+		Status:        "running",
+		SessionKind:   SessionKindAgent,
+		AgentProvider: AgentProviderGemini,
+		ChatCapabilities: &ChatCapabilities{
+			StructuredTimeline: true,
+			Markdown:           true,
+			ToolCards:          true,
+			ApprovalInline:     false,
+			TranscriptFallback: true,
+			DefaultView:        ChatDefaultViewChat,
+		},
+	})
+
+	assertStringField(t, raw, "session_kind", string(SessionKindAgent))
+	assertStringField(t, raw, "agent_provider", string(AgentProviderGemini))
+	if _, ok := raw["chat_capabilities"].(map[string]interface{}); !ok {
+		t.Fatalf("expected chat_capabilities object, got %#v", raw["chat_capabilities"])
+	}
+
+	statusRaw := mustMarshalToMap(t, SessionStatusPayload{
+		SessionID:    "session-1",
+		Status:       "running",
+		LastActivity: 3,
+	})
+	if _, exists := statusRaw["chat_capabilities"]; exists {
+		t.Fatalf("session.status unexpectedly included chat_capabilities: %#v", statusRaw)
+	}
+	if _, exists := statusRaw["session_kind"]; exists {
+		t.Fatalf("session.status unexpectedly included session_kind: %#v", statusRaw)
+	}
+	if _, exists := statusRaw["agent_provider"]; exists {
+		t.Fatalf("session.status unexpectedly included agent_provider: %#v", statusRaw)
+	}
+}
+
+func TestSessionCreatedStructuredChatMetadata(t *testing.T) {
+	raw := mustMarshalToMap(t, SessionCreatedPayload{
+		SessionID:     "session-1",
+		Name:          "Agent",
+		Command:       "codex",
+		Status:        "running",
+		CreatedAt:     1,
+		SessionKind:   SessionKindAgent,
+		AgentProvider: AgentProviderCodex,
+		ChatCapabilities: &ChatCapabilities{
+			StructuredTimeline: true,
+			Markdown:           true,
+			ToolCards:          false,
+			ApprovalInline:     false,
+			TranscriptFallback: true,
+			DefaultView:        ChatDefaultViewChat,
+		},
+	})
+
+	assertStringField(t, raw, "session_kind", string(SessionKindAgent))
+	assertStringField(t, raw, "agent_provider", string(AgentProviderCodex))
+	if _, ok := raw["chat_capabilities"].(map[string]interface{}); !ok {
+		t.Fatalf("expected chat_capabilities object, got %#v", raw["chat_capabilities"])
+	}
+}
+
+func TestSessionsToInfoListStructuredChatMetadata(t *testing.T) {
+	infos := SessionsToInfoList([]*SessionData{{
+		ID:            "session-1",
+		Repo:          "/repo",
+		Branch:        "main",
+		StartedAt:     time.UnixMilli(10),
+		LastSeen:      time.UnixMilli(11),
+		Status:        "running",
+		SessionKind:   SessionKindAgent,
+		AgentProvider: AgentProviderClaude,
+		ChatCapabilities: &ChatCapabilities{
+			StructuredTimeline: true,
+			Markdown:           true,
+			ToolCards:          true,
+			ApprovalInline:     true,
+			TranscriptFallback: true,
+			DefaultView:        ChatDefaultViewChat,
+		},
+	}})
+
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 info, got %d", len(infos))
+	}
+	if infos[0].SessionKind != SessionKindAgent {
+		t.Fatalf("expected session kind agent, got %q", infos[0].SessionKind)
+	}
+	if infos[0].AgentProvider != AgentProviderClaude {
+		t.Fatalf("expected agent provider claude, got %q", infos[0].AgentProvider)
+	}
+	if infos[0].ChatCapabilities == nil || !infos[0].ChatCapabilities.StructuredTimeline {
+		t.Fatalf("expected structured chat metadata to pass through, got %#v", infos[0].ChatCapabilities)
+	}
+}
+
+func sampleApprovalChatItem() ChatItem {
+	return ChatItem{
+		ID:                "item-approval-1",
+		SessionID:         "session-1",
+		Kind:              ChatItemKindApprovalRequest,
+		CreatedAt:         1700000000000,
+		Provider:          ChatItemProviderSystem,
+		Status:            ChatItemStatusPending,
+		RequestID:         "req-1",
+		ApprovalRequestID: "approval-1",
+		Command:           "git push",
+		Reason:            "needs approval",
+		ExpiresAt:         "2026-03-07T12:34:56Z",
+		Decision:          "approved",
+	}
+}
+
+func mustMarshalToMap(t *testing.T, value interface{}) map[string]interface{} {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	return raw
+}
+
+func assertStringField(t *testing.T, raw map[string]interface{}, key, want string) {
+	t.Helper()
+	got, ok := raw[key].(string)
+	if !ok || got != want {
+		t.Fatalf("%s = %#v, want %q", key, raw[key], want)
+	}
+}
+
+func assertNumberField(t *testing.T, raw map[string]interface{}, key string, want int64) {
+	t.Helper()
+	got, ok := raw[key].(float64)
+	if !ok || int64(got) != want {
+		t.Fatalf("%s = %#v, want %d", key, raw[key], want)
+	}
 }
 
 // TestNewSessionClosedMessage verifies the session closed message constructor.
@@ -5186,7 +6051,7 @@ func TestServer_BroadcastAfterStop(t *testing.T) {
 	// This tests the s.stopped check in Broadcast()
 	s.Broadcast(NewHeartbeatMessage())
 	s.BroadcastTerminalOutput("test output")
-	s.BroadcastDiffCard("card-1", "file.go", "diff content", nil, nil, nil, false, false, nil, time.Now().Unix())
+	s.BroadcastDiffCard("card-1", "file.go", "diff content", nil, false, false, nil, time.Now().Unix())
 
 	// If we get here without panic, the test passes
 }
@@ -6158,6 +7023,345 @@ func TestHandleSessionCreateSuccess(t *testing.T) {
 	}
 }
 
+func TestHandleSessionCreateCodexPersistsMetadataAndActivatesStructuredRuntime(t *testing.T) {
+	s := NewServer(":0")
+	mgr := pty.NewSessionManager()
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	s.SetSessionManager(mgr)
+	s.SetSessionStore(store)
+	s.SetStructuredChatEnabled(true)
+	controller := NewStructuredChatController(store)
+	s.SetStructuredChatController(controller)
+	s.SetStructuredChatRuntime(NewStructuredChatRuntime(store, controller, s.Broadcast))
+
+	errCh := s.StartAsync()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer s.Stop()
+	defer mgr.CloseAll()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleWebSocket(w, r)
+	}))
+	defer ts.Close()
+
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	if err := os.Symlink("/bin/sh", codexPath); err != nil {
+		t.Fatalf("Symlink failed: %v", err)
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.ReadMessage()
+
+	msg := map[string]interface{}{
+		"type": "session.create",
+		"payload": map[string]interface{}{
+			"command": codexPath,
+			"args":    []string{"-c", "printf 'User: explain the bug\\n'; sleep 1"},
+			"name":    "Codex Session",
+		},
+	}
+	if err := conn.WriteJSON(msg); err != nil {
+		t.Fatalf("Failed to send message: %v", err)
+	}
+
+	created := readMessage(t, conn)
+	if created.Type != MessageTypeSessionCreated {
+		t.Fatalf("expected session.created, got %s", created.Type)
+	}
+	payload, ok := created.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", created.Payload)
+	}
+	sessionID, ok := payload["session_id"].(string)
+	if !ok || sessionID == "" {
+		t.Fatalf("expected non-empty session_id, got %#v", payload["session_id"])
+	}
+
+	stored, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("expected persisted session record")
+	}
+	info, err := SessionInfoFromStoredSession(stored)
+	if err != nil {
+		t.Fatalf("SessionInfoFromStoredSession failed: %v", err)
+	}
+	if info.AgentProvider != AgentProviderCodex {
+		t.Fatalf("AgentProvider = %q, want codex", info.AgentProvider)
+	}
+	if info.ChatCapabilities == nil || !info.ChatCapabilities.StructuredTimeline {
+		t.Fatalf("ChatCapabilities = %#v, want structured timeline", info.ChatCapabilities)
+	}
+
+	appendMsg := readMessage(t, conn)
+	structuredReceived := false
+	appendReceived := false
+	for i := 0; i < 4; i++ {
+		switch appendMsg.Type {
+		case MessageTypeTerminalAppend:
+			appendReceived = true
+		case MessageTypeChatUpsert, MessageTypeChatSnapshot:
+			structuredReceived = true
+		}
+		if appendReceived && structuredReceived {
+			break
+		}
+		appendMsg = readMessage(t, conn)
+	}
+	if !appendReceived {
+		t.Fatal("expected terminal.append during session.create structured runtime activation")
+	}
+	if !structuredReceived {
+		t.Fatal("expected chat.upsert or chat.snapshot during session.create structured runtime activation")
+	}
+}
+
+func TestHandleSessionCreateGeminiPersistsMetadataAndActivatesStructuredRuntime(t *testing.T) {
+	s := NewServer(":0")
+	mgr := pty.NewSessionManager()
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	s.SetSessionManager(mgr)
+	s.SetSessionStore(store)
+	s.SetStructuredChatEnabled(true)
+	controller := NewStructuredChatController(store)
+	s.SetStructuredChatController(controller)
+	s.SetStructuredChatRuntime(NewStructuredChatRuntime(store, controller, s.Broadcast))
+
+	errCh := s.StartAsync()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer s.Stop()
+	defer mgr.CloseAll()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleWebSocket(w, r)
+	}))
+	defer ts.Close()
+
+	geminiPath := filepath.Join(t.TempDir(), "gemini")
+	if err := os.Symlink("/bin/sh", geminiPath); err != nil {
+		t.Fatalf("Symlink failed: %v", err)
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.ReadMessage()
+
+	msg := map[string]interface{}{
+		"type": "session.create",
+		"payload": map[string]interface{}{
+			"command": geminiPath,
+			"args":    []string{"-c", "printf 'User: explain the bug\\n'; sleep 1"},
+			"name":    "Gemini Session",
+		},
+	}
+	if err := conn.WriteJSON(msg); err != nil {
+		t.Fatalf("Failed to send message: %v", err)
+	}
+
+	created := readMessage(t, conn)
+	if created.Type != MessageTypeSessionCreated {
+		t.Fatalf("expected session.created, got %s", created.Type)
+	}
+	payload, ok := created.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", created.Payload)
+	}
+	sessionID, ok := payload["session_id"].(string)
+	if !ok || sessionID == "" {
+		t.Fatalf("expected non-empty session_id, got %#v", payload["session_id"])
+	}
+
+	stored, err := store.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("expected persisted session record")
+	}
+	info, err := SessionInfoFromStoredSession(stored)
+	if err != nil {
+		t.Fatalf("SessionInfoFromStoredSession failed: %v", err)
+	}
+	if info.AgentProvider != AgentProviderGemini {
+		t.Fatalf("AgentProvider = %q, want gemini", info.AgentProvider)
+	}
+	if info.ChatCapabilities == nil || !info.ChatCapabilities.StructuredTimeline {
+		t.Fatalf("ChatCapabilities = %#v, want structured timeline", info.ChatCapabilities)
+	}
+
+	appendMsg := readMessage(t, conn)
+	structuredReceived := false
+	appendReceived := false
+	for i := 0; i < 4; i++ {
+		switch appendMsg.Type {
+		case MessageTypeTerminalAppend:
+			appendReceived = true
+		case MessageTypeChatUpsert, MessageTypeChatSnapshot:
+			structuredReceived = true
+		}
+		if appendReceived && structuredReceived {
+			break
+		}
+		appendMsg = readMessage(t, conn)
+	}
+	if !appendReceived {
+		t.Fatal("expected terminal.append during session.create structured runtime activation")
+	}
+	if !structuredReceived {
+		t.Fatal("expected chat.upsert or chat.snapshot during session.create structured runtime activation")
+	}
+}
+
+func TestHandleSessionCreatePersistenceFailureFailsClosed(t *testing.T) {
+	s := NewServer(":0")
+	mgr := pty.NewSessionManager()
+	s.SetSessionManager(mgr)
+	s.SetSessionStore(&failingSessionStore{saveErr: errors.New("disk full")})
+
+	errCh := s.StartAsync()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer s.Stop()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleWebSocket(w, r)
+	}))
+	defer ts.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.ReadMessage()
+
+	msg := map[string]interface{}{
+		"type": "session.create",
+		"payload": map[string]interface{}{
+			"command": "/bin/sh",
+			"args":    []string{"-c", "printf 'hello\\n'; sleep 1"},
+			"name":    "Broken Session",
+		},
+	}
+	if err := conn.WriteJSON(msg); err != nil {
+		t.Fatalf("Failed to send message: %v", err)
+	}
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeError {
+		t.Fatalf("expected error message, got %s", resp.Type)
+	}
+
+	payload, ok := resp.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map payload, got %T", resp.Payload)
+	}
+	if code, ok := payload["code"].(string); !ok || code != apperrors.CodeSessionCreateFailed {
+		t.Fatalf("expected code %q, got %#v", apperrors.CodeSessionCreateFailed, payload["code"])
+	}
+
+	if sessions := mgr.List(); len(sessions) != 0 {
+		t.Fatalf("expected failed session.create to clean up session manager, got %d sessions", len(sessions))
+	}
+
+	if msg, ok := readOptionalServerMessage(conn, 150*time.Millisecond); ok {
+		t.Fatalf("expected no follow-up broadcast after failed session.create, got %s", msg.Type)
+	}
+}
+
+func TestHandleSessionCreateFailedUnnamedCreateDoesNotConsumeSequence(t *testing.T) {
+	s := NewServer(":0")
+	mgr := pty.NewSessionManager()
+	s.SetSessionManager(mgr)
+
+	store := &failingSessionStore{saveErr: errors.New("disk full")}
+	s.SetSessionStore(store)
+
+	errCh := s.StartAsync()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer s.Stop()
+	defer mgr.CloseAll()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleWebSocket(w, r)
+	}))
+	defer ts.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.ReadMessage()
+
+	failedCreate := map[string]interface{}{
+		"type": "session.create",
+		"payload": map[string]interface{}{
+			"command": "/bin/sh",
+			"args":    []string{"-c", "printf 'hello\\n'; sleep 1"},
+		},
+	}
+	if err := conn.WriteJSON(failedCreate); err != nil {
+		t.Fatalf("Failed to send failing message: %v", err)
+	}
+
+	resp := readMessage(t, conn)
+	if resp.Type != MessageTypeError {
+		t.Fatalf("expected error message, got %s", resp.Type)
+	}
+
+	store.saveErr = nil
+
+	successfulCreate := map[string]interface{}{
+		"type": "session.create",
+		"payload": map[string]interface{}{
+			"command": "/bin/sh",
+			"args":    []string{"-c", "sleep 1"},
+		},
+	}
+	if err := conn.WriteJSON(successfulCreate); err != nil {
+		t.Fatalf("Failed to send successful message: %v", err)
+	}
+
+	if got := readSessionCreatedName(t, conn); got != "Session 1" {
+		t.Fatalf("first successful unnamed session after failed create = %q, want Session 1", got)
+	}
+}
+
 func TestHandleSessionCreateAutoNamesStartAtOneWithPreexistingSessions(t *testing.T) {
 	s := NewServer(":0")
 
@@ -6320,6 +7524,7 @@ func TestHandleSessionCloseSuccess(t *testing.T) {
 	if mgr.Get("session-to-close") == nil {
 		t.Fatal("Session should exist before close")
 	}
+	s.beginSessionPrompt("session-to-close", &Client{deviceID: "device-1"}, "prompt-1")
 
 	// Send session.close message
 	msg := map[string]interface{}{
@@ -6362,6 +7567,9 @@ func TestHandleSessionCloseSuccess(t *testing.T) {
 	// Verify session no longer exists in manager
 	if mgr.Get("session-to-close") != nil {
 		t.Error("Session should not exist in manager after close")
+	}
+	if s.hasSessionPrompt("session-to-close") {
+		t.Error("Prompt state should be cleared after session close")
 	}
 }
 
@@ -6885,7 +8093,7 @@ func TestNewDiffCardMessage_WithSemanticGroups(t *testing.T) {
 			RiskLevel:    "low",
 		},
 	}
-	msg := NewDiffCardMessage("card-1", "file.go", "+line", nil, nil, groups, false, false, nil, 1000)
+	msg := NewDiffCardMessage("card-1", "file.go", "+line", groups, false, false, nil, 1000)
 	payload, ok := msg.Payload.(DiffCardPayload)
 	if !ok {
 		t.Fatalf("expected DiffCardPayload, got %T", msg.Payload)
@@ -6926,7 +8134,7 @@ func TestNewDiffCardMessage_WithSemanticGroups(t *testing.T) {
 
 // TestNewDiffCardMessage_NilSemanticGroups verifies omitempty omits the key.
 func TestNewDiffCardMessage_NilSemanticGroups(t *testing.T) {
-	msg := NewDiffCardMessage("card-1", "file.go", "+line", nil, nil, nil, false, false, nil, 1000)
+	msg := NewDiffCardMessage("card-1", "file.go", "+line", nil, false, false, nil, 1000)
 	data, err := json.Marshal(msg)
 	if err != nil {
 		t.Fatalf("json marshal failed: %v", err)
@@ -6937,83 +8145,20 @@ func TestNewDiffCardMessage_NilSemanticGroups(t *testing.T) {
 	}
 }
 
-// TestChunkInfoSerialization_WithSemanticFields verifies chunk semantic fields in JSON.
-func TestChunkInfoSerialization_WithSemanticFields(t *testing.T) {
-	chunk := ChunkInfo{
-		Index:           0,
-		OldStart:        1,
-		OldCount:        3,
-		NewStart:        1,
-		NewCount:        4,
-		SemanticKind:    "import",
-		SemanticLabel:   "Import",
-		SemanticGroupID: "sg-abc123def456",
-	}
-	data, err := json.Marshal(chunk)
-	if err != nil {
-		t.Fatalf("json marshal failed: %v", err)
-	}
-	jsonStr := string(data)
-	if !strings.Contains(jsonStr, `"semantic_kind":"import"`) {
-		t.Errorf("JSON missing semantic_kind: %s", jsonStr)
-	}
-	if !strings.Contains(jsonStr, `"semantic_label":"Import"`) {
-		t.Errorf("JSON missing semantic_label: %s", jsonStr)
-	}
-	if !strings.Contains(jsonStr, `"semantic_group_id":"sg-abc123def456"`) {
-		t.Errorf("JSON missing semantic_group_id: %s", jsonStr)
-	}
-}
-
-// TestChunkInfoSerialization_OmitsEmptySemanticFields verifies omitempty behavior.
-func TestChunkInfoSerialization_OmitsEmptySemanticFields(t *testing.T) {
-	chunk := ChunkInfo{
-		Index:    0,
-		OldStart: 1,
-		OldCount: 3,
-		NewStart: 1,
-		NewCount: 4,
-	}
-	data, err := json.Marshal(chunk)
-	if err != nil {
-		t.Fatalf("json marshal failed: %v", err)
-	}
-	jsonStr := string(data)
-	if strings.Contains(jsonStr, `"semantic_kind"`) {
-		t.Errorf("JSON should omit empty semantic_kind: %s", jsonStr)
-	}
-	if strings.Contains(jsonStr, `"semantic_label"`) {
-		t.Errorf("JSON should omit empty semantic_label: %s", jsonStr)
-	}
-	if strings.Contains(jsonStr, `"semantic_group_id"`) {
-		t.Errorf("JSON should omit empty semantic_group_id: %s", jsonStr)
-	}
-}
-
+// TestSemanticPayloadCompatibilityMatrix verifies DiffCardPayload serialization
+// with semantic groups round-trips correctly.
 func TestSemanticPayloadCompatibilityMatrix(t *testing.T) {
 	type matrixCase struct {
 		name                 string
 		payload              DiffCardPayload
-		expectChunkSemantics bool
 		expectSemanticGroups bool
 		verifyRoundTrip      func(t *testing.T, got DiffCardPayload)
 	}
 
-	baseChunk := ChunkInfo{
-		Index:    0,
-		OldStart: 1,
-		OldCount: 2,
-		NewStart: 1,
-		NewCount: 3,
-		Offset:   0,
-		Length:   12,
-		Content:  "@@ -1,2 +1,3 @@\n+line",
-	}
 	basePayload := DiffCardPayload{
 		CardID:    "card-c4",
 		File:      "main.go",
 		Diff:      "@@ -1,2 +1,3 @@\n+line",
-		Chunks:    []ChunkInfo{baseChunk},
 		CreatedAt: 1703500000000,
 	}
 
@@ -7021,70 +8166,22 @@ func TestSemanticPayloadCompatibilityMatrix(t *testing.T) {
 		{
 			name:                 "legacy_no_semantic",
 			payload:              basePayload,
-			expectChunkSemantics: false,
 			expectSemanticGroups: false,
 			verifyRoundTrip: func(t *testing.T, got DiffCardPayload) {
-				if len(got.SemanticGroups) != 0 {
-					t.Fatalf("expected no semantic groups, got %d", len(got.SemanticGroups))
-				}
-				if got.Chunks[0].SemanticKind != "" || got.Chunks[0].SemanticLabel != "" || got.Chunks[0].SemanticGroupID != "" {
-					t.Fatalf("expected empty chunk semantic fields, got %+v", got.Chunks[0])
-				}
-			},
-		},
-		{
-			name: "partial_chunk_only",
-			payload: DiffCardPayload{
-				CardID: "card-c4-chunk-only",
-				File:   "main.go",
-				Diff:   "@@ -1,2 +1,3 @@\n+line",
-				Chunks: []ChunkInfo{
-					{
-						Index:           0,
-						OldStart:        1,
-						OldCount:        2,
-						NewStart:        1,
-						NewCount:        3,
-						Offset:          0,
-						Length:          12,
-						Content:         "@@ -1,2 +1,3 @@\n+line",
-						SemanticKind:    "function",
-						SemanticLabel:   "HandleRequest",
-						SemanticGroupID: "sg-c4chunkonly",
-					},
-				},
-				CreatedAt: 1703500000001,
-			},
-			expectChunkSemantics: true,
-			expectSemanticGroups: false,
-			verifyRoundTrip: func(t *testing.T, got DiffCardPayload) {
-				chunk := got.Chunks[0]
-				if chunk.SemanticKind != "function" {
-					t.Fatalf("expected chunk semantic_kind=function, got %q", chunk.SemanticKind)
-				}
-				if chunk.SemanticLabel != "HandleRequest" {
-					t.Fatalf("expected chunk semantic_label=HandleRequest, got %q", chunk.SemanticLabel)
-				}
-				if chunk.SemanticGroupID != "sg-c4chunkonly" {
-					t.Fatalf("expected chunk semantic_group_id=sg-c4chunkonly, got %q", chunk.SemanticGroupID)
-				}
 				if len(got.SemanticGroups) != 0 {
 					t.Fatalf("expected no semantic groups, got %d", len(got.SemanticGroups))
 				}
 			},
 		},
 		{
-			name: "partial_group_only",
+			name: "with_semantic_groups",
 			payload: DiffCardPayload{
-				CardID: "card-c4-group-only",
+				CardID: "card-c4-group",
 				File:   "main.go",
 				Diff:   "@@ -1,2 +1,3 @@\n+line",
-				Chunks: []ChunkInfo{
-					baseChunk,
-				},
 				SemanticGroups: []SemanticGroupInfo{
 					{
-						GroupID:      "sg-c4grouponly",
+						GroupID:      "sg-c4group",
 						Label:        "Imports",
 						Kind:         "import",
 						LineStart:    1,
@@ -7095,69 +8192,14 @@ func TestSemanticPayloadCompatibilityMatrix(t *testing.T) {
 				},
 				CreatedAt: 1703500000002,
 			},
-			expectChunkSemantics: false,
 			expectSemanticGroups: true,
 			verifyRoundTrip: func(t *testing.T, got DiffCardPayload) {
 				if len(got.SemanticGroups) != 1 {
 					t.Fatalf("expected 1 semantic group, got %d", len(got.SemanticGroups))
 				}
 				group := got.SemanticGroups[0]
-				if group.GroupID != "sg-c4grouponly" || group.Label != "Imports" || group.Kind != "import" {
+				if group.GroupID != "sg-c4group" || group.Label != "Imports" || group.Kind != "import" {
 					t.Fatalf("unexpected semantic group round-trip value: %+v", group)
-				}
-				chunk := got.Chunks[0]
-				if chunk.SemanticKind != "" || chunk.SemanticLabel != "" || chunk.SemanticGroupID != "" {
-					t.Fatalf("expected empty chunk semantic fields, got %+v", chunk)
-				}
-			},
-		},
-		{
-			name: "full_chunk_and_group",
-			payload: DiffCardPayload{
-				CardID: "card-c4-full",
-				File:   "main.go",
-				Diff:   "@@ -1,2 +1,3 @@\n+line",
-				Chunks: []ChunkInfo{
-					{
-						Index:           0,
-						OldStart:        1,
-						OldCount:        2,
-						NewStart:        1,
-						NewCount:        3,
-						Offset:          0,
-						Length:          12,
-						Content:         "@@ -1,2 +1,3 @@\n+line",
-						SemanticKind:    "import",
-						SemanticLabel:   "Import",
-						SemanticGroupID: "sg-c4full",
-					},
-				},
-				SemanticGroups: []SemanticGroupInfo{
-					{
-						GroupID:      "sg-c4full",
-						Label:        "Imports",
-						Kind:         "import",
-						LineStart:    1,
-						LineEnd:      3,
-						ChunkIndexes: []int{0},
-						RiskLevel:    "low",
-					},
-				},
-				CreatedAt: 1703500000003,
-			},
-			expectChunkSemantics: true,
-			expectSemanticGroups: true,
-			verifyRoundTrip: func(t *testing.T, got DiffCardPayload) {
-				if len(got.SemanticGroups) != 1 {
-					t.Fatalf("expected 1 semantic group, got %d", len(got.SemanticGroups))
-				}
-				chunk := got.Chunks[0]
-				if chunk.SemanticKind != "import" || chunk.SemanticLabel != "Import" || chunk.SemanticGroupID != "sg-c4full" {
-					t.Fatalf("unexpected chunk semantic round-trip values: %+v", chunk)
-				}
-				group := got.SemanticGroups[0]
-				if group.GroupID != "sg-c4full" || group.Label != "Imports" || group.Kind != "import" {
-					t.Fatalf("unexpected semantic group round-trip values: %+v", group)
 				}
 			},
 		},
@@ -7180,23 +8222,6 @@ func TestSemanticPayloadCompatibilityMatrix(t *testing.T) {
 				t.Fatalf("semantic_groups presence mismatch: got %v, want %v", hasSemanticGroups, tc.expectSemanticGroups)
 			}
 
-			chunksRaw, ok := payloadMap["chunks"].([]interface{})
-			if !ok || len(chunksRaw) != 1 {
-				t.Fatalf("expected exactly 1 serialized chunk, got %v", payloadMap["chunks"])
-			}
-			chunkMap, ok := chunksRaw[0].(map[string]interface{})
-			if !ok {
-				t.Fatalf("expected chunk object, got %T", chunksRaw[0])
-			}
-
-			chunkFields := []string{"semantic_kind", "semantic_label", "semantic_group_id"}
-			for _, field := range chunkFields {
-				_, hasField := chunkMap[field]
-				if tc.expectChunkSemantics != hasField {
-					t.Fatalf("%s presence mismatch: got %v, want %v", field, hasField, tc.expectChunkSemantics)
-				}
-			}
-
 			var roundTrip DiffCardPayload
 			if err := json.Unmarshal(data, &roundTrip); err != nil {
 				t.Fatalf("json unmarshal to DiffCardPayload failed: %v", err)
@@ -7208,9 +8233,6 @@ func TestSemanticPayloadCompatibilityMatrix(t *testing.T) {
 					roundTrip.CardID, roundTrip.File, roundTrip.CreatedAt,
 				)
 			}
-			if len(roundTrip.Chunks) != 1 {
-				t.Fatalf("expected 1 chunk after round-trip, got %d", len(roundTrip.Chunks))
-			}
 
 			tc.verifyRoundTrip(t, roundTrip)
 		})
@@ -7220,11 +8242,6 @@ func TestSemanticPayloadCompatibilityMatrix(t *testing.T) {
 // TestUndoResultMessage_WithSemanticMetadata verifies that undo re-emit with
 // semantic metadata doesn't break serialization.
 func TestUndoResultMessage_WithSemanticMetadata(t *testing.T) {
-	chunks := []ChunkInfo{
-		{Index: 0, OldStart: 1, OldCount: 3, NewStart: 1, NewCount: 5,
-			Content: "+import fmt", ContentHash: "abc123",
-			SemanticKind: "import", SemanticLabel: "Import", SemanticGroupID: "sg-test123456"},
-	}
 	groups := []SemanticGroupInfo{
 		{GroupID: "sg-test123456", Label: "Imports", Kind: "import",
 			LineStart: 1, LineEnd: 5, ChunkIndexes: []int{0}, RiskLevel: "low"},
@@ -7232,7 +8249,7 @@ func TestUndoResultMessage_WithSemanticMetadata(t *testing.T) {
 	stats := &DiffStats{ByteSize: 11, LineCount: 1, AddedLines: 1, DeletedLines: 0}
 
 	msg := NewDiffCardMessage("card-undo", "main.go", "+import fmt",
-		chunks, nil, groups, false, false, stats, 1703500000000)
+		groups, false, false, stats, 1703500000000)
 
 	// Serialize to JSON and back to verify no panic/corruption
 	data, err := json.Marshal(msg)
@@ -7272,8 +8289,6 @@ func TestReconnectReplayBinarySemanticGroups(t *testing.T) {
 
 	msg := NewDiffCardMessage("card-bin-reconnect", "image.png",
 		"(binary file - content not shown)",
-		nil,          // no chunks for binary
-		nil,          // no chunk groups
 		binaryGroups, // semantic groups must be present
 		true,         // isBinary
 		false,        // isDeleted
@@ -7317,8 +8332,8 @@ func TestReconnectReplayBinarySemanticGroups(t *testing.T) {
 func TestUndoReEmitBinarySemanticGroups(t *testing.T) {
 	// After the fix, binary undo re-emit calls EnrichChunksWithSemantics,
 	// which produces binary semantic groups via synthetic chunk.
-	_, semGroups := stream.EnrichChunksWithSemantics(
-		"card-bin-undo", "logo.png", nil, true, false,
+	semGroups := stream.EnrichFileWithSemantics(
+		"card-bin-undo", "logo.png", "", true, false,
 	)
 
 	if len(semGroups) == 0 {
@@ -7332,8 +8347,6 @@ func TestUndoReEmitBinarySemanticGroups(t *testing.T) {
 	serverGroups := mapSemanticGroupsToServer(semGroups)
 	msg := NewDiffCardMessage("card-bin-undo", "logo.png",
 		"(binary file - content not shown)",
-		nil,          // no chunks
-		nil,          // no chunk groups
 		serverGroups, // semantic groups from enrichment
 		true,         // isBinary
 		false,        // isDeleted
@@ -7382,7 +8395,7 @@ func TestSensitivePathParity_B1_C2(t *testing.T) {
 	for _, p := range paths {
 		t.Run(p.path, func(t *testing.T) {
 			// B1: computeDiffCardMeta detects sensitive path via risk reasons
-			_, _, reasons := computeDiffCardMeta(p.path, nil, false, false,
+			_, _, reasons := computeDiffCardMeta(p.path, false, false,
 				&DiffStats{ByteSize: 100, LineCount: 10, AddedLines: 5, DeletedLines: 3}, nil)
 
 			b1Sensitive := false
@@ -11418,5 +12431,108 @@ func TestHandleRepoPrCheckout_RequesterOnly(t *testing.T) {
 	_, _, err = conn2.ReadMessage()
 	if err == nil {
 		t.Error("client 2 should NOT receive repo.pr_checkout_result")
+	}
+}
+
+// TestStructuredChatAdditiveMessagesDoNotBreakLegacySessionFlow proves that a
+// legacy (non-structured) mobile client connected to a shell session is not
+// disrupted when the host broadcasts chat.upsert messages for a different
+// structured session. Terminal I/O must remain fully functional.
+func TestStructuredChatAdditiveMessagesDoNotBreakLegacySessionFlow(t *testing.T) {
+	s, ts := newTestServer()
+	defer ts.Close()
+	defer s.Stop()
+
+	// Set up mock PTY writer for terminal input verification.
+	mockPTY := &mockWriter{}
+	s.SetPTYWriter(mockPTY)
+
+	// Configure the server's own session as a plain shell (non-structured).
+	configureStructuredPromptSession(t, s, s.SessionID(), SessionInfo{
+		SessionKind:   SessionKindShell,
+		AgentProvider: AgentProviderUnknown,
+	})
+
+	// Connect a legacy WebSocket client.
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 1. Legacy client receives session.status on connect.
+	statusMsg := readMessage(t, conn)
+	if statusMsg.Type != MessageTypeSessionStatus {
+		t.Fatalf("expected session.status, got %s", statusMsg.Type)
+	}
+
+	// 2. Broadcast a chat.upsert for a *different* structured session.
+	structuredSessionID := "structured-other-session"
+	s.Broadcast(NewChatUpsertMessage(structuredSessionID, "boot-other", 1, []ChatItem{{
+		ID:        "item-1",
+		SessionID: structuredSessionID,
+		Kind:      ChatItemKindUserMessage,
+		CreatedAt: 1,
+		Provider:  ChatItemProviderCodex,
+		Status:    ChatItemStatusCompleted,
+		Text:      "hello from structured",
+	}}))
+
+	// 3. Broadcast terminal.append output for the default session.
+	s.BroadcastTerminalOutput("legacy output\n")
+
+	// 4. Read messages from the legacy client. We expect to receive both
+	//    the chat.upsert (which a legacy client ignores) and the
+	//    terminal.append in some order. Neither should cause an error.
+	var gotTerminalAppend bool
+	var gotChatUpsert bool
+	for i := 0; i < 2; i++ {
+		msg := readMessage(t, conn)
+		switch msg.Type {
+		case MessageTypeTerminalAppend:
+			gotTerminalAppend = true
+			payload, ok := msg.Payload.(map[string]interface{})
+			if !ok {
+				t.Fatalf("expected map payload for terminal.append, got %T", msg.Payload)
+			}
+			if payload["chunk"] != "legacy output\n" {
+				t.Fatalf("terminal.append chunk = %#v, want %q", payload["chunk"], "legacy output\n")
+			}
+		case MessageTypeChatUpsert:
+			gotChatUpsert = true
+		default:
+			t.Fatalf("unexpected message type %s", msg.Type)
+		}
+	}
+	if !gotTerminalAppend {
+		t.Fatal("legacy client did not receive terminal.append")
+	}
+	if !gotChatUpsert {
+		t.Fatal("legacy client did not receive chat.upsert broadcast")
+	}
+
+	// 5. Verify terminal input still works (legacy client can send input).
+	sessionPayload := statusMsg.Payload.(map[string]interface{})
+	sessionID := sessionPayload["session_id"].(string)
+	testData := "echo legacy\n"
+	inputMsg := Message{
+		Type: MessageTypeTerminalInput,
+		Payload: TerminalInputPayload{
+			SessionID: sessionID,
+			Data:      testData,
+			Timestamp: time.Now().UnixMilli(),
+		},
+	}
+	data, _ := json.Marshal(inputMsg)
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		t.Fatalf("write terminal.input failed: %v", err)
+	}
+
+	// Give the handler time to process.
+	time.Sleep(50 * time.Millisecond)
+
+	written := mockPTY.getWritten()
+	if string(written) != testData {
+		t.Fatalf("PTY wrote %q, want %q", written, testData)
 	}
 }

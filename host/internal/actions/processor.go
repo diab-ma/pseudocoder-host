@@ -20,10 +20,6 @@ type Processor struct {
 	// store is the card storage for looking up cards and recording decisions.
 	store storage.CardStore
 
-	// chunkStore is the optional chunk storage for per-chunk decisions.
-	// If nil, per-chunk decisions are not supported.
-	chunkStore storage.ChunkStore
-
 	// decidedStore is the optional storage for archiving decided cards.
 	// If nil, decided cards are not archived (undo not supported).
 	decidedStore storage.DecidedCardStore
@@ -44,12 +40,6 @@ func NewProcessor(store storage.CardStore, repoPath string) *Processor {
 		store:    store,
 		repoPath: repoPath,
 	}
-}
-
-// SetChunkStore sets the optional chunk store for per-chunk decisions.
-// If the store implements ChunkStore, this enables ProcessChunkDecision.
-func (p *Processor) SetChunkStore(hs storage.ChunkStore) {
-	p.chunkStore = hs
 }
 
 // SetDecidedStore sets the optional decided card store for undo support.

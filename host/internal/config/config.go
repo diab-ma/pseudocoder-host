@@ -106,16 +106,6 @@ type Config struct {
 	// Default: ~/.pseudocoder/pair.sock
 	PairSocket string `toml:"pair_socket"`
 
-	// ChunkGroupingEnabled enables proximity-based chunk grouping in diff cards.
-	// When true, chunks within ChunkGroupingProximity lines are grouped together.
-	// Default: true (but Go zero value is false; caller must apply defaults)
-	ChunkGroupingEnabled bool `toml:"chunk_grouping_enabled"`
-
-	// ChunkGroupingProximity is the maximum line distance for grouping chunks.
-	// Chunks within this many lines of each other are grouped together.
-	// Default: 20, must be >= 1 when set. Zero means "use default".
-	ChunkGroupingProximity int `toml:"chunk_grouping_proximity"`
-
 	// KeepAwakeRemoteEnabled enables remote keep-awake mutations from mobile.
 	// Default: false
 	KeepAwakeRemoteEnabled bool `toml:"keep_awake_remote_enabled"`
@@ -145,6 +135,9 @@ type Config struct {
 	// 0 means use default (1000). When set, must be 100-50000.
 	KeepAwakeAuditMaxRows int `toml:"keep_awake_audit_max_rows"`
 
+	// StructuredChatV1 enables host-side structured chat snapshot persistence/replay.
+	// Default: false
+	StructuredChatV1 bool `toml:"structured_chat_v1"`
 }
 
 // DefaultConfigPath returns the default config file location: ~/.pseudocoder/config.toml.
@@ -168,8 +161,9 @@ func DefaultPairSocketPath() (string, error) {
 }
 
 // WriteDefault creates a config file with mobile-ready defaults at the given path.
-// The config requires authentication and leaves the bind address unset so
-// CLI defaults can decide the runtime listen address.
+// The config requires authentication, enables structured chat for the default
+// mobile-first startup path, and leaves the bind address unset so CLI defaults
+// can decide the runtime listen address.
 //
 // Behavior:
 //   - If the file already exists, returns without error (does not overwrite).
@@ -194,6 +188,9 @@ func WriteDefault(path string, repo string) error {
 
 # Require authentication for security
 require_auth = true
+
+# Enable structured chat for fresh mobile-ready startup configs.
+structured_chat_v1 = true
 
 # Repository to supervise
 repo = %q
@@ -261,20 +258,10 @@ func (c *Config) EffectiveKeepAwakeAllowOnBattery() bool {
 // Validate checks config values for semantic correctness.
 // Returns an error if any value is invalid.
 //
-// Validation rules:
-//   - ChunkGroupingProximity must be >= 1 when set (non-zero).
-//     Zero indicates "use default" and is valid.
-//
 // This method does not apply defaults; the caller is responsible for that.
 // This separation allows Load() to be a pure parser and Validate() to be
 // a semantic checker, matching the existing pattern in this codebase.
 func (c *Config) Validate() error {
-	// ChunkGroupingProximity: 0 means "use default", any positive value is valid,
-	// but negative values are always invalid.
-	if c.ChunkGroupingProximity < 0 {
-		return fmt.Errorf("chunk_grouping_proximity must be >= 1, got %d", c.ChunkGroupingProximity)
-	}
-
 	// KeepAwakeAutoDisableBatteryPercent: 0 means disabled, 1-100 valid.
 	if c.KeepAwakeAutoDisableBatteryPercent != 0 &&
 		(c.KeepAwakeAutoDisableBatteryPercent < 1 || c.KeepAwakeAutoDisableBatteryPercent > 100) {

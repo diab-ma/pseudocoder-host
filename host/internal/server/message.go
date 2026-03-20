@@ -50,15 +50,6 @@ const (
 	// Payload: none (empty object)
 	MessageTypeHeartbeat MessageType = "heartbeat"
 
-	// MessageTypeChunkDecision is sent by clients to accept/reject a single chunk.
-	// This enables per-chunk decisions within a file card.
-	// Payload: ChunkDecisionPayload
-	MessageTypeChunkDecision MessageType = "chunk.decision"
-
-	// MessageTypeChunkDecisionResult is sent by the server to confirm a chunk decision.
-	// Payload: ChunkDecisionResultPayload
-	MessageTypeChunkDecisionResult MessageType = "chunk.decision_result"
-
 	// MessageTypeReviewDelete is sent by clients to delete an untracked file.
 	// This is used after the user confirms deletion of a new file that cannot
 	// be restored via git. Requires explicit confirmation flag.
@@ -93,6 +84,30 @@ const (
 	// This is sent on client connect after session.status to provide session history.
 	// Payload: SessionListPayload
 	MessageTypeSessionList MessageType = "session.list"
+
+	// MessageTypeChatSnapshot sends a structured chat snapshot to clients.
+	// Payload: ChatSnapshotPayload
+	MessageTypeChatSnapshot MessageType = "chat.snapshot"
+
+	// MessageTypeChatUpsert sends structured chat inserts or updates to clients.
+	// Payload: ChatUpsertPayload
+	MessageTypeChatUpsert MessageType = "chat.upsert"
+
+	// MessageTypeChatRemove sends structured chat removals to clients.
+	// Payload: ChatRemovePayload
+	MessageTypeChatRemove MessageType = "chat.remove"
+
+	// MessageTypeChatReset sends a structured chat reset event to clients.
+	// Payload: ChatResetPayload
+	MessageTypeChatReset MessageType = "chat.reset"
+
+	// MessageTypeChatPrompt is sent by clients to submit a structured prompt.
+	// Payload: ChatPromptPayload
+	MessageTypeChatPrompt MessageType = "chat.prompt"
+
+	// MessageTypeChatPromptResult returns the result of a structured prompt request.
+	// Payload: ChatPromptResultPayload
+	MessageTypeChatPromptResult MessageType = "chat.prompt_result"
 
 	// MessageTypeRepoStatus requests or sends git repository status.
 	// When received from client, triggers a status refresh.
@@ -204,6 +219,22 @@ const (
 	// Payload: SessionClearHistoryResultPayload
 	MessageTypeSessionClearHistoryResult MessageType = "session.clear_history_result"
 
+	// MessageTypeSessionDelete is sent by clients to delete a single archived session.
+	// Payload: SessionDeletePayload
+	MessageTypeSessionDelete MessageType = "session.delete"
+
+	// MessageTypeSessionDeleteResult is sent by the server with delete result.
+	// Payload: SessionDeleteResultPayload
+	MessageTypeSessionDeleteResult MessageType = "session.delete_result"
+
+	// MessageTypeSessionClearAll is sent by clients to clear all session history.
+	// Payload: SessionClearAllPayload
+	MessageTypeSessionClearAll MessageType = "session.clear_all"
+
+	// MessageTypeSessionClearAllResult is sent by the server with clear-all result.
+	// Payload: SessionClearAllResultPayload
+	MessageTypeSessionClearAllResult MessageType = "session.clear_all_result"
+
 	// tmux session integration messages (Phase 12)
 
 	// MessageTypeTmuxList is sent by clients to request available tmux sessions.
@@ -238,11 +269,6 @@ const (
 	// This reverses a previous accept or reject, restoring the card to pending.
 	// Payload: ReviewUndoPayload
 	MessageTypeReviewUndo MessageType = "review.undo"
-
-	// MessageTypeChunkUndo is sent by clients to undo a per-chunk decision.
-	// This reverses a previous chunk accept or reject.
-	// Payload: ChunkUndoPayload
-	MessageTypeChunkUndo MessageType = "chunk.undo"
 
 	// MessageTypeUndoResult is sent by the server to confirm an undo operation.
 	// Payload: UndoResultPayload
@@ -365,7 +391,6 @@ const (
 	// MessageTypeSessionKeepAwakeChanged broadcasts a keep-awake status update.
 	// Payload: KeepAwakeStatusPayload
 	MessageTypeSessionKeepAwakeChanged MessageType = "session.keep_awake_changed"
-
 )
 
 // Message is the envelope for all WebSocket messages.
@@ -410,6 +435,295 @@ type SessionStatusPayload struct {
 	LastActivity int64 `json:"last_activity"`
 }
 
+// SessionKind classifies the authoritative host session type for structured chat.
+type SessionKind string
+
+const (
+	// SessionKindShell is used for plain shell sessions.
+	SessionKindShell SessionKind = "shell"
+
+	// SessionKindAgent is used for supported agent sessions.
+	SessionKindAgent SessionKind = "agent"
+
+	// SessionKindTmux is used for tmux-backed sessions.
+	SessionKindTmux SessionKind = "tmux"
+
+	// SessionKindUnknown is used when the host cannot classify the session.
+	SessionKindUnknown SessionKind = "unknown"
+)
+
+// AgentProvider identifies the authoritative agent backing a session.
+type AgentProvider string
+
+const (
+	// AgentProviderClaude identifies Claude-backed sessions.
+	AgentProviderClaude AgentProvider = "claude"
+
+	// AgentProviderCodex identifies Codex-backed sessions.
+	AgentProviderCodex AgentProvider = "codex"
+
+	// AgentProviderGemini identifies Gemini-backed sessions.
+	AgentProviderGemini AgentProvider = "gemini"
+
+	// AgentProviderNone identifies explicitly non-agent sessions.
+	AgentProviderNone AgentProvider = "none"
+
+	// AgentProviderUnknown identifies sessions whose provider is unknown.
+	AgentProviderUnknown AgentProvider = "unknown"
+)
+
+// ChatDefaultView controls whether supported sessions default to chat or terminal.
+type ChatDefaultView string
+
+const (
+	// ChatDefaultViewChat opens supported sessions in chat mode first.
+	ChatDefaultViewChat ChatDefaultView = "chat"
+
+	// ChatDefaultViewTerminal opens sessions in terminal mode first.
+	ChatDefaultViewTerminal ChatDefaultView = "terminal"
+)
+
+// ChatItemKind identifies the semantic shape of a structured chat item.
+type ChatItemKind string
+
+const (
+	ChatItemKindUserMessage     ChatItemKind = "user_message"
+	ChatItemKindAssistant       ChatItemKind = "assistant_message"
+	ChatItemKindThinking        ChatItemKind = "thinking"
+	ChatItemKindToolCall        ChatItemKind = "tool_call"
+	ChatItemKindApprovalRequest ChatItemKind = "approval_request"
+	ChatItemKindSystemEvent     ChatItemKind = "system_event"
+	ChatItemKindTranscriptBlock ChatItemKind = "transcript_block"
+)
+
+// ChatItemStatus identifies the lifecycle state of a structured chat item.
+type ChatItemStatus string
+
+const (
+	ChatItemStatusInProgress ChatItemStatus = "in_progress"
+	ChatItemStatusCompleted  ChatItemStatus = "completed"
+	ChatItemStatusFailed     ChatItemStatus = "failed"
+	ChatItemStatusPending    ChatItemStatus = "pending"
+)
+
+// ChatItemProvider identifies who produced a structured chat item.
+type ChatItemProvider string
+
+const (
+	ChatItemProviderClaude  ChatItemProvider = "claude"
+	ChatItemProviderCodex   ChatItemProvider = "codex"
+	ChatItemProviderGemini  ChatItemProvider = "gemini"
+	ChatItemProviderSystem  ChatItemProvider = "system"
+	ChatItemProviderUnknown ChatItemProvider = "unknown"
+)
+
+// ChatResetReason identifies why the structured chat timeline was reset.
+type ChatResetReason string
+
+const (
+	ChatResetReasonDisconnect       ChatResetReason = "disconnect"
+	ChatResetReasonSessionSwitch    ChatResetReason = "session_switch"
+	ChatResetReasonTerminalClear    ChatResetReason = "terminal_clear"
+	ChatResetReasonProviderReset    ChatResetReason = "provider_reset"
+	ChatResetReasonHistoryCleared   ChatResetReason = "history_cleared"
+	ChatResetReasonAdapterDowngrade ChatResetReason = "adapter_downgrade"
+)
+
+// ChatCapabilities describes what structured-chat features the host authoritatively supports.
+type ChatCapabilities struct {
+	// StructuredTimeline indicates whether semantic timeline data is available.
+	StructuredTimeline bool `json:"structured_timeline"`
+
+	// Markdown indicates whether assistant markdown rendering is supported.
+	Markdown bool `json:"markdown"`
+
+	// ToolCards indicates whether tool activity cards are supported.
+	ToolCards bool `json:"tool_cards"`
+
+	// ApprovalInline indicates whether approvals can render inline in chat.
+	ApprovalInline bool `json:"approval_inline"`
+
+	// TranscriptFallback indicates whether transcript fallback remains available.
+	TranscriptFallback bool `json:"transcript_fallback"`
+
+	// DefaultView is the host-authoritative default surface for the session.
+	DefaultView ChatDefaultView `json:"default_view"`
+}
+
+// ChatItem is the canonical structured-chat timeline item schema.
+// Only the active kind's fields are serialized so the wire contract stays deterministic.
+type ChatItem struct {
+	// ID uniquely identifies the item.
+	ID string `json:"id"`
+
+	// SessionID identifies which session owns the item.
+	SessionID string `json:"session_id"`
+
+	// Kind selects the active kind-specific field set.
+	Kind ChatItemKind `json:"kind"`
+
+	// CreatedAt is when the item was created (Unix milliseconds).
+	CreatedAt int64 `json:"created_at"`
+
+	// Provider identifies who emitted the item.
+	Provider ChatItemProvider `json:"provider"`
+
+	// Status is the current item state.
+	Status ChatItemStatus `json:"status"`
+
+	// RequestID correlates request/result operations when present.
+	RequestID string `json:"request_id,omitempty"`
+
+	// ParentID links the item to a parent item when present.
+	ParentID string `json:"parent_id,omitempty"`
+
+	// Text is used by user_message, thinking, and transcript_block items.
+	Text string `json:"text,omitempty"`
+
+	// Markdown is used by assistant_message items.
+	Markdown string `json:"markdown,omitempty"`
+
+	// ToolName is used by tool_call items.
+	ToolName string `json:"tool_name,omitempty"`
+
+	// Summary is a short description of tool activity.
+	Summary string `json:"summary,omitempty"`
+
+	// InputExcerpt is the redacted tool input excerpt.
+	InputExcerpt string `json:"input_excerpt,omitempty"`
+
+	// ResultExcerpt is the redacted tool result excerpt.
+	ResultExcerpt string `json:"result_excerpt,omitempty"`
+
+	// IsError indicates whether a tool call failed.
+	IsError bool `json:"is_error,omitempty"`
+
+	// StartedAt is when the tool call started (Unix milliseconds).
+	StartedAt int64 `json:"started_at,omitempty"`
+
+	// CompletedAt is when the tool call completed (Unix milliseconds).
+	CompletedAt int64 `json:"completed_at,omitempty"`
+
+	// ApprovalRequestID links the item to an approval request.
+	ApprovalRequestID string `json:"approval_request_id,omitempty"`
+
+	// Command is the command requiring approval.
+	Command string `json:"command,omitempty"`
+
+	// Reason explains why approval is needed.
+	Reason string `json:"reason,omitempty"`
+
+	// ExpiresAt is when the approval expires (RFC3339).
+	ExpiresAt string `json:"expires_at,omitempty"`
+
+	// Decision is the approval decision when present.
+	Decision string `json:"decision,omitempty"`
+
+	// Code identifies a system event.
+	Code string `json:"code,omitempty"`
+
+	// Message describes a system event.
+	Message string `json:"message,omitempty"`
+}
+
+// MarshalJSON keeps ChatItem shape deterministic and omits fields from other kinds.
+func (i ChatItem) MarshalJSON() ([]byte, error) {
+	payload := map[string]interface{}{
+		"id":         i.ID,
+		"session_id": i.SessionID,
+		"kind":       i.Kind,
+		"created_at": i.CreatedAt,
+		"provider":   i.Provider,
+		"status":     i.Status,
+	}
+	if i.RequestID != "" {
+		payload["request_id"] = i.RequestID
+	}
+	if i.ParentID != "" {
+		payload["parent_id"] = i.ParentID
+	}
+
+	switch i.Kind {
+	case ChatItemKindUserMessage, ChatItemKindThinking, ChatItemKindTranscriptBlock:
+		payload["text"] = i.Text
+	case ChatItemKindAssistant:
+		payload["markdown"] = i.Markdown
+	case ChatItemKindToolCall:
+		payload["tool_name"] = i.ToolName
+		payload["summary"] = i.Summary
+		payload["input_excerpt"] = i.InputExcerpt
+		payload["result_excerpt"] = i.ResultExcerpt
+		payload["is_error"] = i.IsError
+		if i.StartedAt != 0 {
+			payload["started_at"] = i.StartedAt
+		}
+		if i.CompletedAt != 0 {
+			payload["completed_at"] = i.CompletedAt
+		}
+	case ChatItemKindApprovalRequest:
+		payload["approval_request_id"] = i.ApprovalRequestID
+		payload["command"] = i.Command
+		payload["reason"] = i.Reason
+		payload["expires_at"] = i.ExpiresAt
+		if i.Decision != "" {
+			payload["decision"] = i.Decision
+		}
+	case ChatItemKindSystemEvent:
+		payload["code"] = i.Code
+		payload["message"] = i.Message
+	}
+
+	return json.Marshal(payload)
+}
+
+// ChatSnapshotPayload carries the full structured chat timeline for a session.
+type ChatSnapshotPayload struct {
+	SessionID    string     `json:"session_id"`
+	ServerBootID string     `json:"server_boot_id"`
+	Revision     int64      `json:"revision"`
+	Items        []ChatItem `json:"items"`
+}
+
+// ChatUpsertPayload carries inserted or updated structured chat items.
+type ChatUpsertPayload struct {
+	SessionID    string     `json:"session_id"`
+	ServerBootID string     `json:"server_boot_id"`
+	Revision     int64      `json:"revision"`
+	Items        []ChatItem `json:"items"`
+}
+
+// ChatRemovePayload carries structured chat item removals.
+type ChatRemovePayload struct {
+	SessionID    string   `json:"session_id"`
+	ServerBootID string   `json:"server_boot_id"`
+	Revision     int64    `json:"revision"`
+	ItemIDs      []string `json:"item_ids"`
+}
+
+// ChatResetPayload carries a structured chat reset event.
+type ChatResetPayload struct {
+	SessionID    string          `json:"session_id"`
+	ServerBootID string          `json:"server_boot_id"`
+	Revision     int64           `json:"revision"`
+	Reason       ChatResetReason `json:"reason"`
+}
+
+// ChatPromptPayload carries a client-originated structured prompt request.
+type ChatPromptPayload struct {
+	SessionID string `json:"session_id"`
+	RequestID string `json:"request_id"`
+	Text      string `json:"text"`
+}
+
+// ChatPromptResultPayload carries the requester-scoped result of a structured prompt.
+type ChatPromptResultPayload struct {
+	SessionID string `json:"session_id"`
+	RequestID string `json:"request_id"`
+	Accepted  bool   `json:"accepted"`
+	ErrorCode string `json:"error_code,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
 // ErrorPayload carries error information to the client.
 type ErrorPayload struct {
 	// Code is a stable error code for programmatic handling.
@@ -417,61 +731,6 @@ type ErrorPayload struct {
 
 	// Message is a human-readable error description.
 	Message string `json:"message"`
-}
-
-// ChunkInfo describes the boundaries of a single chunk within a diff.
-// This allows clients to extract and display individual chunks,
-// and to send per-chunk decisions using the chunk index.
-type ChunkInfo struct {
-	// Index is the zero-based position of this chunk within the card's diff.
-	Index int `json:"index"`
-
-	// OldStart is the starting line number in the original file.
-	OldStart int `json:"old_start"`
-
-	// OldCount is the number of lines from the original file.
-	OldCount int `json:"old_count"`
-
-	// NewStart is the starting line number in the new file.
-	NewStart int `json:"new_start"`
-
-	// NewCount is the number of lines in the new file.
-	NewCount int `json:"new_count"`
-
-	// Offset is the byte offset where this chunk starts in the Diff string.
-	// Use Diff[Offset:Offset+Length] to extract the chunk content.
-	// Deprecated: Use Content field directly to avoid UTF-8/UTF-16 encoding issues.
-	Offset int `json:"offset"`
-
-	// Length is the byte length of this chunk's content in the Diff string.
-	// Deprecated: Use Content field directly to avoid UTF-8/UTF-16 encoding issues.
-	Length int `json:"length"`
-
-	// Content is the raw chunk content (including @@ header).
-	// Sent directly to avoid UTF-8/UTF-16 encoding issues with offset extraction.
-	Content string `json:"content,omitempty"`
-
-	// ContentHash is the SHA256 hash of the chunk content (first 16 hex chars / 8 bytes).
-	// Used to detect stale decisions: client sends this back in chunk.decision,
-	// server validates it matches current content before applying.
-	ContentHash string `json:"content_hash,omitempty"`
-
-	// GroupIndex is the group number for proximity grouping (0-based).
-	// Chunks within configurable proximity (default 20 lines) share the same group.
-	// Always included; clients check chunk_groups at card level to determine if grouping is active.
-	GroupIndex int `json:"group_index"`
-
-	// SemanticKind is the semantic classification of this chunk (e.g., "import", "function").
-	// Empty/omitted when semantic analysis has not been performed.
-	SemanticKind string `json:"semantic_kind,omitempty"`
-
-	// SemanticLabel is the display label for this chunk (e.g., "Import", "Function").
-	// Empty/omitted when semantic analysis has not been performed.
-	SemanticLabel string `json:"semantic_label,omitempty"`
-
-	// SemanticGroupID links this chunk to a SemanticGroupInfo entry.
-	// Empty/omitted when semantic analysis has not been performed.
-	SemanticGroupID string `json:"semantic_group_id,omitempty"`
 }
 
 // DiffStats provides size metrics for a diff to help mobile clients
@@ -503,9 +762,9 @@ var riskOrder = map[string]int{
 // The summary, riskLevel, and riskReasons are deterministic given the inputs.
 // When semanticGroups are present, the summary is derived from the primary
 // semantic group using deterministic selection criteria.
-func computeDiffCardMeta(file string, chunks []ChunkInfo, isBinary, isDeleted bool, stats *DiffStats, semanticGroups []SemanticGroupInfo) (summary, riskLevel string, riskReasons []string) {
+func computeDiffCardMeta(file string, isBinary, isDeleted bool, stats *DiffStats, semanticGroups []SemanticGroupInfo) (summary, riskLevel string, riskReasons []string) {
 	// --- summary ---
-	summary = computeSummary(chunks, isBinary, isDeleted, stats, semanticGroups)
+	summary = computeSummary(isBinary, isDeleted, stats, semanticGroups)
 
 	// --- risk reason detection ---
 	isSensitive := semantic.IsSensitivePath(file)
@@ -555,9 +814,7 @@ func computeDiffCardMeta(file string, chunks []ChunkInfo, isBinary, isDeleted bo
 // computeSummary returns the summary string for a diff card.
 // When semantic groups are present, the summary is always derived from the
 // primary semantic group, including binary/deleted cards.
-func computeSummary(chunks []ChunkInfo, isBinary, isDeleted bool, stats *DiffStats, semanticGroups []SemanticGroupInfo) string {
-	chunkCount := len(chunks)
-
+func computeSummary(isBinary, isDeleted bool, stats *DiffStats, semanticGroups []SemanticGroupInfo) string {
 	// If semantic groups exist, derive summary from primary group.
 	if len(semanticGroups) > 0 {
 		primary := selectPrimaryGroup(semanticGroups)
@@ -565,12 +822,11 @@ func computeSummary(chunks []ChunkInfo, isBinary, isDeleted bool, stats *DiffSta
 		if groupLabel == "" {
 			groupLabel = semantic.GroupLabel(semantic.NormalizeKind(primary.Kind), "")
 		}
-		groupChunkCount := len(primary.ChunkIndexes)
 		if stats != nil {
-			return fmt.Sprintf("%s: %d chunk(s), +%d / -%d",
-				groupLabel, groupChunkCount, stats.AddedLines, stats.DeletedLines)
+			return fmt.Sprintf("%s: +%d / -%d",
+				groupLabel, stats.AddedLines, stats.DeletedLines)
 		}
-		return fmt.Sprintf("%s: %d chunk(s)", groupLabel, groupChunkCount)
+		return groupLabel
 	}
 
 	// Binary and deleted keep fixed legacy summaries when semantic groups
@@ -582,10 +838,8 @@ func computeSummary(chunks []ChunkInfo, isBinary, isDeleted bool, stats *DiffSta
 		return "File deleted"
 	}
 
-	// B1 fallback: no semantic groups.
+	// Fallback: no semantic groups.
 	switch {
-	case stats != nil && chunkCount > 0:
-		return fmt.Sprintf("%d chunks, +%d / -%d", chunkCount, stats.AddedLines, stats.DeletedLines)
 	case stats != nil:
 		return fmt.Sprintf("+%d / -%d", stats.AddedLines, stats.DeletedLines)
 	default:
@@ -626,23 +880,6 @@ func comparePrimary(a, b SemanticGroupInfo) bool {
 	return a.GroupID < b.GroupID
 }
 
-// ChunkGroupInfo provides metadata about a group of proximity-related chunks.
-// Groups collect chunks within a configurable number of lines (default 20),
-// allowing mobile clients to display and act on related chunks together.
-type ChunkGroupInfo struct {
-	// GroupIndex is the 0-based position of this group within the card.
-	GroupIndex int `json:"group_index"`
-
-	// LineStart is the starting line number of the group (minimum of member chunks).
-	LineStart int `json:"line_start"`
-
-	// LineEnd is the ending line number of the group (maximum of member chunks).
-	LineEnd int `json:"line_end"`
-
-	// ChunkCount is the number of chunks in this group.
-	ChunkCount int `json:"chunk_count"`
-}
-
 // SemanticGroupInfo provides metadata about a semantically related group of chunks.
 // Semantic groups are determined by code analysis rather than line proximity.
 type SemanticGroupInfo struct {
@@ -670,7 +907,6 @@ type SemanticGroupInfo struct {
 
 // DiffCardPayload carries a review card for file changes.
 // This is sent when new changes are detected in the repository.
-// A card may contain multiple chunks; use the Chunks field to access them.
 type DiffCardPayload struct {
 	// CardID is the unique identifier for this review card.
 	CardID string `json:"card_id"`
@@ -678,33 +914,21 @@ type DiffCardPayload struct {
 	// File is the path to the file that was changed.
 	File string `json:"file"`
 
-	// Diff is the raw diff content (all chunks concatenated).
+	// Diff is the raw diff content for the file.
 	Diff string `json:"diff"`
 
-	// Chunks describes the boundaries of each chunk within the Diff.
-	// Clients can use this to display and act on individual chunks.
-	// May be nil for backward compatibility with older hosts.
-	Chunks []ChunkInfo `json:"chunks,omitempty"`
-
-	// ChunkGroups provides metadata about proximity-based chunk groups.
-	// When present, chunks are grouped by line proximity (configurable, default 20 lines).
-	// Each chunk's GroupIndex references an entry in this array.
-	// Missing or empty means grouping is disabled; render chunks as flat list.
-	ChunkGroups []ChunkGroupInfo `json:"chunk_groups,omitempty"`
-
-	// SemanticGroups provides metadata about semantically related chunk groups.
-	// When present, chunks are grouped by code analysis (e.g., imports, functions).
-	// Each chunk's SemanticGroupID references a GroupID in this array.
+	// SemanticGroups provides metadata about semantically related groups.
+	// When present, groups are determined by code analysis (e.g., imports, functions).
 	// Missing or empty means semantic analysis has not been performed.
 	SemanticGroups []SemanticGroupInfo `json:"semantic_groups,omitempty"`
 
 	// IsBinary indicates the file is a binary file.
-	// Binary files cannot use per-chunk actions - only file-level accept/reject.
+	// Binary files use file-level accept/reject only.
 	// The Diff field may be empty or contain a placeholder for binary files.
 	IsBinary bool `json:"is_binary,omitempty"`
 
 	// IsDeleted indicates this is a file deletion.
-	// File deletions should use file-level actions - per-chunk doesn't apply.
+	// File deletions should use file-level actions.
 	IsDeleted bool `json:"is_deleted,omitempty"`
 
 	// Stats provides size metrics for large diff warnings.
@@ -760,51 +984,6 @@ type DecisionResultPayload struct {
 	// ErrorCode is a stable error code if Success is false.
 	// Clients can use this for programmatic error handling.
 	// Format: {domain}.{error} (e.g., "storage.not_found", "action.git_failed")
-	ErrorCode string `json:"error_code,omitempty"`
-
-	// Error contains a human-readable error message if Success is false.
-	Error string `json:"error,omitempty"`
-}
-
-// ChunkDecisionPayload carries a user's accept/reject decision for a single chunk.
-// This enables per-chunk decisions within a file card, allowing granular control
-// over which changes to stage or restore.
-type ChunkDecisionPayload struct {
-	// CardID is the unique identifier of the parent file card.
-	CardID string `json:"card_id"`
-
-	// ChunkIndex is the zero-based index of the chunk within the card.
-	// This corresponds to the Index field in ChunkInfo from the diff.card.
-	ChunkIndex int `json:"chunk_index"`
-
-	// Action is either "accept" or "reject".
-	Action string `json:"action"`
-
-	// Comment is an optional explanation for the decision.
-	Comment string `json:"comment,omitempty"`
-
-	// ContentHash is the hash of the chunk content when the user viewed it.
-	// Server validates this matches current content to prevent stale decisions.
-	// If empty, validation is skipped (backward compatibility during transition).
-	ContentHash string `json:"content_hash,omitempty"`
-}
-
-// ChunkDecisionResultPayload carries the result of processing a chunk decision.
-// This is sent back to the client to confirm the action was applied.
-type ChunkDecisionResultPayload struct {
-	// CardID is the unique identifier of the parent file card.
-	CardID string `json:"card_id"`
-
-	// ChunkIndex is the zero-based index of the decided chunk.
-	ChunkIndex int `json:"chunk_index"`
-
-	// Action is the action that was taken ("accept" or "reject").
-	Action string `json:"action"`
-
-	// Success indicates whether the action was applied successfully.
-	Success bool `json:"success"`
-
-	// ErrorCode is a stable error code if Success is false.
 	ErrorCode string `json:"error_code,omitempty"`
 
 	// Error contains a human-readable error message if Success is false.
@@ -948,6 +1127,15 @@ type SessionInfo struct {
 	// IsSystem marks host-managed internal sessions that should be hidden from
 	// user-facing session history surfaces.
 	IsSystem bool `json:"is_system,omitempty"`
+
+	// SessionKind is the authoritative host classification for the session.
+	SessionKind SessionKind `json:"session_kind,omitempty"`
+
+	// AgentProvider is the authoritative provider for supported agent sessions.
+	AgentProvider AgentProvider `json:"agent_provider,omitempty"`
+
+	// ChatCapabilities describes structured-chat support for the session.
+	ChatCapabilities *ChatCapabilities `json:"chat_capabilities,omitempty"`
 }
 
 // RepoStatusPayload carries git repository status information.
@@ -1444,6 +1632,21 @@ type SessionCreatedPayload struct {
 
 	// CreatedAt is when the session was created (Unix milliseconds).
 	CreatedAt int64 `json:"created_at"`
+
+	// Repo is the repository path on the host (e.g., "/Users/name/project").
+	Repo string `json:"repo,omitempty"`
+
+	// Branch is the git branch name (e.g., "main", "feature/xyz").
+	Branch string `json:"branch,omitempty"`
+
+	// SessionKind is the authoritative host classification for the session.
+	SessionKind SessionKind `json:"session_kind,omitempty"`
+
+	// AgentProvider is the authoritative provider for supported agent sessions.
+	AgentProvider AgentProvider `json:"agent_provider,omitempty"`
+
+	// ChatCapabilities describes structured-chat support for the session.
+	ChatCapabilities *ChatCapabilities `json:"chat_capabilities,omitempty"`
 }
 
 // SessionClosePayload carries a request to close a PTY session.
@@ -1519,6 +1722,57 @@ type SessionClearHistoryResultPayload struct {
 	Error string `json:"error,omitempty"`
 }
 
+// SessionDeletePayload carries a request to delete a single archived session.
+type SessionDeletePayload struct {
+	// RequestID is the client-generated correlation ID for this operation.
+	RequestID string `json:"request_id"`
+
+	// SessionID identifies the session to delete.
+	SessionID string `json:"session_id"`
+}
+
+// SessionDeleteResultPayload carries the result of a session delete operation.
+type SessionDeleteResultPayload struct {
+	// RequestID echoes the request correlation ID.
+	RequestID string `json:"request_id"`
+
+	// Success indicates whether the session was deleted.
+	Success bool `json:"success"`
+
+	// SessionID echoes which session was deleted on success.
+	SessionID string `json:"session_id,omitempty"`
+
+	// ErrorCode is a stable machine-readable error code on failure.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error is a human-readable error message on failure.
+	Error string `json:"error,omitempty"`
+}
+
+// SessionClearAllPayload carries a request to clear all session history.
+type SessionClearAllPayload struct {
+	// RequestID is the client-generated correlation ID for this operation.
+	RequestID string `json:"request_id"`
+}
+
+// SessionClearAllResultPayload carries the result of a clear-all operation.
+type SessionClearAllResultPayload struct {
+	// RequestID echoes the request correlation ID.
+	RequestID string `json:"request_id"`
+
+	// Success indicates whether sessions were cleared.
+	Success bool `json:"success"`
+
+	// ClearedCount is the number of sessions deleted on success.
+	ClearedCount int `json:"cleared_count,omitempty"`
+
+	// ErrorCode is a stable machine-readable error code on failure.
+	ErrorCode string `json:"error_code,omitempty"`
+
+	// Error is a human-readable error message on failure.
+	Error string `json:"error,omitempty"`
+}
+
 // NewTerminalAppendMessage creates a message for terminal output.
 // This is a convenience function to ensure consistent message creation.
 func NewTerminalAppendMessage(sessionID, chunk string) Message {
@@ -1544,6 +1798,72 @@ func NewSessionStatusMessage(sessionID, status string) Message {
 	}
 }
 
+// NewChatSnapshotMessage creates a structured chat snapshot message.
+func NewChatSnapshotMessage(sessionID, serverBootID string, revision int64, items []ChatItem) Message {
+	return Message{
+		Type: MessageTypeChatSnapshot,
+		Payload: ChatSnapshotPayload{
+			SessionID:    sessionID,
+			ServerBootID: serverBootID,
+			Revision:     revision,
+			Items:        items,
+		},
+	}
+}
+
+// NewChatUpsertMessage creates a structured chat upsert message.
+func NewChatUpsertMessage(sessionID, serverBootID string, revision int64, items []ChatItem) Message {
+	return Message{
+		Type: MessageTypeChatUpsert,
+		Payload: ChatUpsertPayload{
+			SessionID:    sessionID,
+			ServerBootID: serverBootID,
+			Revision:     revision,
+			Items:        items,
+		},
+	}
+}
+
+// NewChatRemoveMessage creates a structured chat removal message.
+func NewChatRemoveMessage(sessionID, serverBootID string, revision int64, itemIDs []string) Message {
+	return Message{
+		Type: MessageTypeChatRemove,
+		Payload: ChatRemovePayload{
+			SessionID:    sessionID,
+			ServerBootID: serverBootID,
+			Revision:     revision,
+			ItemIDs:      itemIDs,
+		},
+	}
+}
+
+// NewChatResetMessage creates a structured chat reset message.
+func NewChatResetMessage(sessionID, serverBootID string, revision int64, reason ChatResetReason) Message {
+	return Message{
+		Type: MessageTypeChatReset,
+		Payload: ChatResetPayload{
+			SessionID:    sessionID,
+			ServerBootID: serverBootID,
+			Revision:     revision,
+			Reason:       reason,
+		},
+	}
+}
+
+// NewChatPromptResultMessage creates a requester-scoped structured prompt result.
+func NewChatPromptResultMessage(sessionID, requestID string, accepted bool, errCode, errMsg string) Message {
+	return Message{
+		Type: MessageTypeChatPromptResult,
+		Payload: ChatPromptResultPayload{
+			SessionID: sessionID,
+			RequestID: requestID,
+			Accepted:  accepted,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
 // NewErrorMessage creates an error message to send to clients.
 func NewErrorMessage(code, message string) Message {
 	return Message{
@@ -1564,20 +1884,16 @@ func NewHeartbeatMessage() Message {
 }
 
 // NewDiffCardMessage creates a message for a review card.
-// The chunks parameter is optional; pass nil for backward compatibility.
-// The chunkGroups parameter provides proximity grouping metadata (nil when disabled).
 // The semanticGroups parameter provides semantic grouping metadata (nil when disabled).
 // The isBinary, isDeleted, and stats parameters are optional for backward compatibility.
-func NewDiffCardMessage(cardID, file, diff string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, semanticGroups []SemanticGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) Message {
-	summary, riskLevel, riskReasons := computeDiffCardMeta(file, chunks, isBinary, isDeleted, stats, semanticGroups)
+func NewDiffCardMessage(cardID, file, diff string, semanticGroups []SemanticGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64) Message {
+	summary, riskLevel, riskReasons := computeDiffCardMeta(file, isBinary, isDeleted, stats, semanticGroups)
 	return Message{
 		Type: MessageTypeDiffCard,
 		Payload: DiffCardPayload{
 			CardID:         cardID,
 			File:           file,
 			Diff:           diff,
-			Chunks:         chunks,
-			ChunkGroups:    chunkGroups,
 			SemanticGroups: semanticGroups,
 			IsBinary:       isBinary,
 			IsDeleted:      isDeleted,
@@ -1613,23 +1929,6 @@ func NewDecisionResultMessage(cardID, action string, success bool, errCode, errM
 			Success:   success,
 			ErrorCode: errCode,
 			Error:     errMsg,
-		},
-	}
-}
-
-// NewChunkDecisionResultMessage creates a message confirming a per-chunk decision.
-// This is sent back to the client after processing a chunk.decision message.
-// Use errCode and errMsg for failure cases; both should be empty for success.
-func NewChunkDecisionResultMessage(cardID string, chunkIndex int, action string, success bool, errCode, errMsg string) Message {
-	return Message{
-		Type: MessageTypeChunkDecisionResult,
-		Payload: ChunkDecisionResultPayload{
-			CardID:     cardID,
-			ChunkIndex: chunkIndex,
-			Action:     action,
-			Success:    success,
-			ErrorCode:  errCode,
-			Error:      errMsg,
 		},
 	}
 }
@@ -1684,31 +1983,41 @@ func NewSessionListMessage(sessions []SessionInfo) Message {
 func SessionsToInfoList(sessions []*SessionData) []SessionInfo {
 	infos := make([]SessionInfo, len(sessions))
 	for i, s := range sessions {
-		infos[i] = SessionInfo{
-			ID:         s.ID,
-			Repo:       s.Repo,
-			Branch:     s.Branch,
-			StartedAt:  s.StartedAt.UnixMilli(),
-			LastSeen:   s.LastSeen.UnixMilli(),
-			LastCommit: s.LastCommit,
-			Status:     s.Status,
-			IsSystem:   s.IsSystem,
-		}
+		infos[i] = sessionInfoFromData(s)
 	}
 	return infos
+}
+
+func sessionInfoFromData(s *SessionData) SessionInfo {
+	return SessionInfo{
+		ID:               s.ID,
+		Repo:             s.Repo,
+		Branch:           s.Branch,
+		StartedAt:        s.StartedAt.UnixMilli(),
+		LastSeen:         s.LastSeen.UnixMilli(),
+		LastCommit:       s.LastCommit,
+		Status:           s.Status,
+		IsSystem:         s.IsSystem,
+		SessionKind:      s.SessionKind,
+		AgentProvider:    s.AgentProvider,
+		ChatCapabilities: s.ChatCapabilities,
+	}
 }
 
 // SessionData represents session data for conversion to SessionInfo.
 // This interface avoids importing the storage package to prevent import cycles.
 type SessionData struct {
-	ID         string
-	Repo       string
-	Branch     string
-	StartedAt  time.Time
-	LastSeen   time.Time
-	LastCommit string
-	Status     string
-	IsSystem   bool
+	ID               string
+	Repo             string
+	Branch           string
+	StartedAt        time.Time
+	LastSeen         time.Time
+	LastCommit       string
+	Status           string
+	IsSystem         bool
+	SessionKind      SessionKind
+	AgentProvider    AgentProvider
+	ChatCapabilities *ChatCapabilities
 }
 
 // NewRepoStatusMessage creates a message with current repository status.
@@ -1799,15 +2108,24 @@ func NewKeepAwakeChangedMessage(payload KeepAwakeStatusPayload) Message {
 
 // NewSessionCreatedMessage creates a message confirming session creation.
 // This is sent to clients in response to a session.create request.
-func NewSessionCreatedMessage(sessionID, name, command, status string, createdAt int64) Message {
+func NewSessionCreatedMessage(sessionID, name, command, status string, createdAt int64, metadata ...SessionInfo) Message {
+	var sessionInfo SessionInfo
+	if len(metadata) > 0 {
+		sessionInfo = metadata[0]
+	}
 	return Message{
 		Type: MessageTypeSessionCreated,
 		Payload: SessionCreatedPayload{
-			SessionID: sessionID,
-			Name:      name,
-			Command:   command,
-			Status:    status,
-			CreatedAt: createdAt,
+			SessionID:        sessionID,
+			Name:             name,
+			Command:          command,
+			Status:           status,
+			CreatedAt:        createdAt,
+			Repo:             sessionInfo.Repo,
+			Branch:           sessionInfo.Branch,
+			SessionKind:      sessionInfo.SessionKind,
+			AgentProvider:    sessionInfo.AgentProvider,
+			ChatCapabilities: sessionInfo.ChatCapabilities,
 		},
 	}
 }
@@ -1848,6 +2166,44 @@ func NewSessionClearHistoryResultMessage(
 	return Message{
 		Type: MessageTypeSessionClearHistoryResult,
 		Payload: SessionClearHistoryResultPayload{
+			RequestID:    requestID,
+			Success:      success,
+			ClearedCount: clearedCount,
+			ErrorCode:    errCode,
+			Error:        errMsg,
+		},
+	}
+}
+
+// NewSessionDeleteResultMessage creates a session delete result message.
+func NewSessionDeleteResultMessage(
+	requestID string,
+	success bool,
+	sessionID string,
+	errCode, errMsg string,
+) Message {
+	return Message{
+		Type: MessageTypeSessionDeleteResult,
+		Payload: SessionDeleteResultPayload{
+			RequestID: requestID,
+			Success:   success,
+			SessionID: sessionID,
+			ErrorCode: errCode,
+			Error:     errMsg,
+		},
+	}
+}
+
+// NewSessionClearAllResultMessage creates a session clear-all result message.
+func NewSessionClearAllResultMessage(
+	requestID string,
+	success bool,
+	clearedCount int,
+	errCode, errMsg string,
+) Message {
+	return Message{
+		Type: MessageTypeSessionClearAllResult,
+		Payload: SessionClearAllResultPayload{
 			RequestID:    requestID,
 			Success:      success,
 			ClearedCount: clearedCount,
@@ -1998,27 +2354,6 @@ type ReviewUndoPayload struct {
 
 	// Confirmed indicates explicit user confirmation for committed card undo.
 	// Required when undoing cards that have been committed (requires git operations).
-	Confirmed bool `json:"confirmed,omitempty"`
-}
-
-// ChunkUndoPayload carries a request to undo a per-chunk decision.
-// This reverses a previous chunk accept or reject action.
-type ChunkUndoPayload struct {
-	// CardID is the unique identifier of the parent file card.
-	CardID string `json:"card_id"`
-
-	// ChunkIndex is the zero-based index of the chunk to undo.
-	// Note: When ContentHash is provided, it takes precedence for stable identity
-	// since chunk indices can shift after staging.
-	ChunkIndex int `json:"chunk_index"`
-
-	// ContentHash is the stable identifier for this chunk's content.
-	// When provided, the host prefers lookup by hash over chunk_index.
-	// This prevents undo failures when indices shift after staging.
-	ContentHash string `json:"content_hash,omitempty"`
-
-	// Confirmed indicates explicit user confirmation for committed chunk undo.
-	// Required when undoing chunks that have been committed.
 	Confirmed bool `json:"confirmed,omitempty"`
 }
 
@@ -2778,4 +3113,3 @@ func NewRepoBranchSwitchResultMessage(requestID string, success bool, name strin
 		},
 	}
 }
-

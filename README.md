@@ -1,197 +1,128 @@
 <p align="center">
-  <img src="assets/github-banner.svg" alt="pseudocoder" width="600">
+  <img src="assets/github-banner.svg" alt="pseudocoder" width="700">
 </p>
 
 <p align="center">
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-MIT-yellow.svg" alt="MIT License">
   </a>
+  <a href="https://apps.apple.com/us/app/pseudocoder/id6757658447">
+    <img src="https://img.shields.io/badge/App_Store-available-blue.svg" alt="App Store">
+  </a>
+  <a href="https://discord.gg/e7TaHYTxBC">
+    <img src="https://img.shields.io/badge/Discord-join-5865F2.svg" alt="Discord">
+  </a>
 </p>
 
-supervise terminal coding sessions from your phone. watch terminal output, review code changes, and accept or reject diffs anytime, anywhere.
+run your dev workflow from your phone. chat with AI coding agents, review diffs, approve commands, manage git, edit files — no cloud, no account.
 
-> **WARNING:**
-> 
-> THIS APP GRANTS FULL TERMINAL ACCESS TO PAIRED DEVICES. COMMANDS RUN WITH YOUR USER PRIVILEGES. **ONLY USE OVER TAILSCALE OR A TRUSTED LOCAL NETWORK. NEVER EXPOSE TO THE PUBLIC INTERNET.**
+> **WARNING:** paired devices have full terminal access with your user privileges. **only use over Tailscale or a trusted local network. never expose to the public internet.**
 
-## Prerequisites
-
-- [Tailscale](https://tailscale.com/download) installed and running on phone and host machine
-- iphone with iOS 15+
-
-## Installation
-
-### macOS
+## Install
 
 ```bash
-# install Tailscale
-brew install tailscale && brew services start tailscale
-
-# connect to Tailscale network
-sudo tailscale up
-
-# install pseudocoder
+# macOS
 brew tap diab-ma/pseudocoder-host https://github.com/diab-ma/pseudocoder-host
 brew install pseudocoder
-```
 
-### Linux
-
-```bash
-# install Tailscale
-curl -fsSL https://tailscale.com/install.sh | sh
-
-# connect to Tailscale network
-sudo tailscale up
-
-# install pseudocoder
+# linux / WSL
 curl -sSL https://raw.githubusercontent.com/diab-ma/pseudocoder-host/main/install.sh | bash
 ```
 
-### Windows (WSL2)
-
-run inside WSL:
-
-```bash
-# install Tailscale
-curl -fsSL https://tailscale.com/install.sh | sh
-
-# start Tailscale daemon
-sudo tailscaled &
-
-# connect to Tailscale network
-sudo tailscale up
-
-# install pseudocoder
-curl -sSL https://raw.githubusercontent.com/diab-ma/pseudocoder-host/main/install.sh | bash
-```
-
-also install Tailscale on your phone and sign in with the same account.
-
----
+get the mobile app from the [App Store](https://apps.apple.com/us/app/pseudocoder/id6757658447).
 
 ## Quick Start
 
-1. get the mobile app (check your email for TestFlight invite)
-2. note your Tailscale IP: `tailscale ip -4` (starts with `100.`)
-3. start the host:
-   ```bash
-   cd /path/to/your/project    # navigate to your project
-   pseudocoder start --pair --qr  # start host and show pairing QR
-   ```
-4. scan the QR code from the app and tap **Trust**
+```bash
+cd /path/to/your/project
+pseudocoder start --pair --qr
+```
+
+scan the QR code from the app. that's it.
+
+both devices need to be on the same network — [Tailscale](https://tailscale.com/download) (recommended) or local WiFi.
 
 ---
 
-## Usage
+## What You Can Do
 
-<h3 align="center">Sessions</h3>
+<h3 align="center">Structured Chat</h3>
 
-create multiple terminal sessions, easily switch via the session pill, and attach to an existing tmux session to continue right where you left off.
-
-<p align="center">
-  <img src="assets/screenshot-new-session.png" alt="New Session" width="300">
-</p>
-
-<h3 align="center">Terminal</h3>
-
-real-time terminal output streaming. send terminal commands, monitor CLI tools as they work, and accept changes from wherever you are.
+chat view for AI coding agent sessions. see the agent's thinking, tool calls, and code edits in a structured timeline. approve or deny commands inline. switch to raw terminal any time.
 
 <p align="center">
-  <img src="assets/screenshot-terminal.png" alt="Terminal" width="300">
+  <img src="assets/screenshot-terminal.png" alt="Structured Chat" width="300">
 </p>
 
-<h3 align="center">Review Cards</h3>
+<h3 align="center">Diff Review</h3>
 
-commit panel in review tab allows a frictionless way to enter message, commit, and push. track all your accepted/rejected changes and easily undo. nearby chunks are grouped by proximity so related changes stay together.
+AI-generated code changes arrive as diff cards sorted by risk. accept, reject, or undo at file or chunk level.
 
 - **Accept** stages changes (`git add`)
 - **Reject** restores original (`git restore`)
-- **Undo** reverts decision (`git restore --staged` or `git checkout`)
-- **Commit** creates a commit (`git commit`)
-- **Push** pushes to remote (`git push`)
+- **Undo** reverses either decision
 
 <p align="center">
-  <img src="assets/screenshot-review.png" alt="Review and Commit" width="300">
+  <img src="assets/screenshot-review.png" alt="Review Cards" width="300">
 </p>
-
-<h3 align="center">File Browser</h3>
-
-browse, read, write, create, and delete files in the supervised repository from mobile. write operations use version-conflict detection to prevent overwriting concurrent changes. external file changes are detected automatically via polling.
 
 <h3 align="center">Git</h3>
 
-paginated commit history, branch list with create and switch (blocks switching with a dirty tree), fetch, pull (fast-forward-only), and commit/push with request-scoped correlation. all git operations are scoped to the supervised repository.
+four tabs: **commit** (stage, message, push), **branch** (create, switch, delete), **PR** (list, create, checkout via `gh`), **sync** (fetch, pull, push).
+
+<h3 align="center">File Editor</h3>
+
+browse, read, edit, and delete files in the repo from your phone. conflict detection prevents overwrites.
 
 <h3 align="center">Keep-Awake</h3>
 
-prevent host machine from sleeping during active sessions. the host runs an authoritative state machine with multi-client lease arbitration and battery policy enforcement (macOS). enable via CLI or startup flag:
+prevents your mac from sleeping during active sessions. battery-aware — auto-disables below a configurable threshold.
 
 ```bash
-pseudocoder keep-awake enable-remote    # enable remote keep-awake policy
-pseudocoder keep-awake disable-remote   # disable remote keep-awake policy
-pseudocoder keep-awake status           # show current policy status
-pseudocoder start --enable-remote-keep-awake  # enable at startup
-```
-
----
-
-## Diagnostics
-
-run `pseudocoder doctor` to diagnose onboarding readiness and connectivity issues. checks TLS certificates, network reachability, pairing IPC socket, and host readiness. use `--json` for machine-readable output.
-
-```bash
-pseudocoder doctor          # interactive preflight checks
-pseudocoder doctor --json   # JSON output for scripting
+pseudocoder keep-awake enable-remote     # allow mobile to keep host awake
+pseudocoder keep-awake status            # check current state
 ```
 
 ---
 
 ## Security
 
-use Tailscale or trusted LAN only. we recommend never exposing to public internet.
-all connections use TLS 1.2+. paired devices have full terminal access. only pair devices you control.
-pairing codes are generated locally (IPC/loopback) to avoid exposing them on the network.
-file operations are scoped to the supervised repository directory.
-keep-awake policy mutations are restricted to loopback-only API with Bearer-token auth.
+all connections use TLS. paired devices have full terminal access — only pair devices you control.
 
-manage devices:
 ```bash
 pseudocoder devices list          # view paired devices
 pseudocoder devices revoke <id>   # remove access
 ```
 
+pairing codes are 6-digit, single-use, and expire after 2 minutes.
+
 ---
 
 ## Configuration
 
-`pseudocoder start` creates `~/.pseudocoder/config.toml` if missing. optional settings:
+`pseudocoder start` creates `~/.pseudocoder/config.toml` with sensible defaults. key options:
 
-- `pair_socket`: local IPC socket used by `pseudocoder pair` (default: `~/.pseudocoder/pair.sock`)
-- `chunk_grouping_enabled`: group nearby diff hunks into a single review card section
-- `chunk_grouping_proximity`: max line distance for grouping (default: `20` when enabled)
-- `keep_awake_remote_enabled`: allow mobile devices to activate keep-awake (default: `false`)
-- `keep_awake_allow_on_battery`: permit keep-awake when on battery power (default: `true`)
-- `keep_awake_auto_disable_battery_percent`: battery % threshold to auto-disable (0 = disabled)
-- `keep_awake_audit_max_rows`: max durable audit log rows retained (default: `1000`)
+| setting | default | description |
+|---------|---------|-------------|
+| `keep_awake_remote_enabled` | `false` | allow mobile to prevent host sleep |
+| `chunk_grouping_enabled` | `true` | group related diff hunks together |
+| `chunk_grouping_proximity` | `20` | max line distance for grouping |
+| `history_lines` | `5000` | terminal scrollback buffer |
 
 ---
 
 ## Troubleshooting
 
+run `pseudocoder doctor` first — it checks host health, TLS certs, and network reachability.
+
 | problem | solution |
 |---------|----------|
-| connection refused | use Tailscale IP (`100.x.x.x`), check `tailscale status` |
-| certificate errors | tap **Trust** on first connection, or re-pair |
-| pairing code expired | run `pseudocoder pair --qr` (codes last 5 min) |
-| `pseudocoder pair` fails | ensure the host is running and `~/.pseudocoder/pair.sock` is accessible |
+| can't connect | check both devices are on the same network. run `pseudocoder doctor` |
+| pairing code expired | codes last 2 min. run `pseudocoder pair --qr` |
 | QR won't scan | enter manually: host IP, port `7070`, 6-digit code |
-| keep-awake not activating | check `pseudocoder keep-awake status`, ensure `keep_awake_remote_enabled = true` in config |
-| file write conflict | another process modified the file; re-read and retry the write |
-| branch switch blocked | commit or stash uncommitted changes before switching branches |
-| pull rejected | non-fast-forward; fetch and merge or rebase locally |
-| general connectivity issues | run `pseudocoder doctor` for guided diagnostics |
+| certificate errors | re-pair, or tap **Trust** on first connection |
 | macOS Gatekeeper | `xattr -d com.apple.quarantine /usr/local/bin/pseudocoder` |
+| keep-awake not working | ensure `keep_awake_remote_enabled = true` in config |
 
 ---
 
@@ -199,31 +130,25 @@ pseudocoder devices revoke <id>   # remove access
 
 | command | description |
 |---------|-------------|
-| `pseudocoder start --pair --qr` | start host with mobile-ready defaults + pairing QR |
-| `pseudocoder host start` | start host daemon with advanced options |
-| `pseudocoder host status` | show host daemon status |
+| `pseudocoder start --pair --qr` | start host + show pairing QR |
 | `pseudocoder pair --qr` | generate new pairing code |
-| `pseudocoder doctor` | diagnose onboarding readiness and connectivity |
-| `pseudocoder doctor --json` | diagnostics with JSON output |
-| `pseudocoder session list` | list active sessions |
-| `pseudocoder session new --name <name>` | create a new session |
-| `pseudocoder session kill <id>` | kill a session |
-| `pseudocoder session rename <id> <name>` | rename a session |
-| `pseudocoder session list-tmux` | list available tmux sessions |
-| `pseudocoder session attach-tmux <name>` | attach to a tmux session |
-| `pseudocoder session detach <id>` | detach from a tmux session |
+| `pseudocoder doctor` | diagnose connectivity issues |
+| `pseudocoder host start` | start as background daemon |
+| `pseudocoder host status` | show host status |
 | `pseudocoder devices list` | list paired devices |
 | `pseudocoder devices revoke <id>` | revoke device access |
-| `pseudocoder keep-awake enable-remote` | enable remote keep-awake policy |
-| `pseudocoder keep-awake disable-remote` | disable remote keep-awake policy |
-| `pseudocoder keep-awake status` | show keep-awake policy status |
-| `pseudocoder start --enable-remote-keep-awake` | start with keep-awake enabled |
+| `pseudocoder session list` | list active sessions |
+| `pseudocoder session attach-tmux <name>` | attach to a tmux session |
+| `pseudocoder keep-awake enable-remote` | allow mobile keep-awake |
+| `pseudocoder keep-awake disable-remote` | disable mobile keep-awake |
 | `pseudocoder --version` | show version |
 
 ---
 
 ## Links
 
+- [website](https://pseudocoder.xyz)
+- [discord](https://discord.gg/e7TaHYTxBC)
 - [contributing](CONTRIBUTING.md)
 - [privacy policy](PRIVACY.md)
 - [changelog](CHANGELOG.md)

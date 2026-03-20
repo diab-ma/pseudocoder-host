@@ -100,69 +100,6 @@ type CardStore interface {
 	Close() error
 }
 
-// ChunkStatus tracks the decision status of an individual chunk within a file card.
-// This enables per-chunk accept/reject decisions while the parent card tracks
-// overall file status.
-type ChunkStatus struct {
-	// CardID is the ID of the parent file card.
-	CardID string `json:"card_id"`
-
-	// ChunkIndex is the zero-based position of this chunk within the card's diff.
-	ChunkIndex int `json:"chunk_index"`
-
-	// Content is the raw chunk content including the @@ header.
-	// This is needed to construct the patch for git apply.
-	Content string `json:"content"`
-
-	// Status is the current state (pending, accepted, rejected).
-	Status CardStatus `json:"status"`
-
-	// DecidedAt is when the decision was made (nil if pending).
-	DecidedAt *time.Time `json:"decided_at,omitempty"`
-}
-
-// ChunkDecision represents a user's action on a single chunk.
-type ChunkDecision struct {
-	// CardID is the ID of the parent file card.
-	CardID string `json:"card_id"`
-
-	// ChunkIndex is the zero-based position of this chunk.
-	ChunkIndex int `json:"chunk_index"`
-
-	// Status is whether the chunk was accepted or rejected.
-	Status CardStatus `json:"status"`
-
-	// Timestamp is when the decision was made.
-	Timestamp time.Time `json:"timestamp"`
-}
-
-// ChunkStore defines the interface for persisting per-chunk decisions.
-// This extends CardStore for granular chunk-level control.
-type ChunkStore interface {
-	// SaveChunks persists all chunks for a card.
-	// Replaces any existing chunks for that card.
-	SaveChunks(cardID string, chunks []*ChunkStatus) error
-
-	// GetChunks retrieves all chunks for a card.
-	// Returns empty slice if no chunks exist.
-	GetChunks(cardID string) ([]*ChunkStatus, error)
-
-	// GetChunk retrieves a specific chunk by card ID and index.
-	// Returns nil, nil if the chunk does not exist.
-	GetChunk(cardID string, chunkIndex int) (*ChunkStatus, error)
-
-	// RecordChunkDecision updates a chunk's status.
-	// Returns ErrCardNotFound if the chunk does not exist.
-	// Returns ErrAlreadyDecided if the chunk is not pending.
-	RecordChunkDecision(decision *ChunkDecision) error
-
-	// DeleteChunks removes all chunks for a card.
-	DeleteChunks(cardID string) error
-
-	// CountPendingChunks returns the number of pending chunks for a card.
-	CountPendingChunks(cardID string) (int, error)
-}
-
 // -----------------------------------------------------------------------------
 // Decided Card Storage (Undo Support)
 // -----------------------------------------------------------------------------
@@ -204,38 +141,6 @@ type DecidedCard struct {
 	OriginalDiff string `json:"original_diff"`
 }
 
-// DecidedChunk represents an archived chunk after a per-chunk decision.
-// Similar to DecidedCard but for individual chunks within a file.
-type DecidedChunk struct {
-	// CardID is the ID of the parent file card.
-	CardID string `json:"card_id"`
-
-	// ChunkIndex is the zero-based position of this chunk.
-	// Note: This index may change when the diff is refreshed after staging.
-	// Use ContentHash for stable identity when available.
-	ChunkIndex int `json:"chunk_index"`
-
-	// ContentHash is the stable identifier for this chunk's content.
-	// SHA256 hash (first 16 hex chars) of the chunk diff content.
-	// Used as stable identity since chunk_index can shift after staging.
-	ContentHash string `json:"content_hash,omitempty"`
-
-	// Patch is the git patch for this chunk at decision time.
-	Patch string `json:"patch"`
-
-	// Status is the current state (accepted, rejected, or committed).
-	Status CardStatus `json:"status"`
-
-	// DecidedAt is when the decision was made.
-	DecidedAt time.Time `json:"decided_at"`
-
-	// CommitHash is the git commit hash if this chunk was committed.
-	CommitHash string `json:"commit_hash,omitempty"`
-
-	// CommittedAt is when the chunk was committed (nil if not committed).
-	CommittedAt *time.Time `json:"committed_at,omitempty"`
-}
-
 // DecidedCardStore defines the interface for archiving decided cards.
 // This enables undo functionality by preserving decision history and patches.
 // Implementations must be safe for concurrent access.
@@ -253,7 +158,7 @@ type DecidedCardStore interface {
 	ListDecidedByStatus(status CardStatus) ([]*DecidedCard, error)
 
 	// ListAllDecidedCards returns all decided cards regardless of status.
-	// This is used for commit association to find all cards with accepted chunks.
+	// This is used for commit association to find all accepted cards.
 	// Results are ordered by decided_at (newest first).
 	ListAllDecidedCards() ([]*DecidedCard, error)
 
@@ -269,46 +174,6 @@ type DecidedCardStore interface {
 	// DeleteDecidedCard removes an archived card.
 	// This is called after a successful undo operation.
 	DeleteDecidedCard(id string) error
-
-	// SaveDecidedChunk archives a chunk after a per-chunk decision.
-	SaveDecidedChunk(chunk *DecidedChunk) error
-
-	// GetDecidedChunk retrieves an archived chunk by card ID and index.
-	// Returns nil, nil if the chunk does not exist.
-	GetDecidedChunk(cardID string, chunkIndex int) (*DecidedChunk, error)
-
-	// GetDecidedChunkByHash retrieves an archived chunk by card ID and content hash.
-	// Returns nil, nil if the chunk does not exist.
-	// Preferred over GetDecidedChunk when content_hash is available for stable identity.
-	GetDecidedChunkByHash(cardID string, contentHash string) (*DecidedChunk, error)
-
-	// GetLegacyDecidedChunk retrieves a legacy archived chunk by card ID and index.
-	// Only returns chunks with NULL content_hash (saved before content_hash migration).
-	// Used for safe fallback when hash lookup fails - avoids matching newer chunks.
-	GetLegacyDecidedChunk(cardID string, chunkIndex int) (*DecidedChunk, error)
-
-	// GetDecidedChunks retrieves all archived chunks for a card.
-	// Results are ordered by chunk_index.
-	GetDecidedChunks(cardID string) ([]*DecidedChunk, error)
-
-	// MarkChunksCommitted updates accepted chunks to committed status.
-	MarkChunksCommitted(cardID string, chunkIndexes []int, commitHash string) error
-
-	// DeleteDecidedChunk removes a single archived chunk.
-	// This is used when undoing a single chunk decision.
-	DeleteDecidedChunk(cardID string, chunkIndex int) error
-
-	// DeleteDecidedChunkByHash removes a single archived chunk by content hash.
-	// Preferred over DeleteDecidedChunk when content_hash is available.
-	DeleteDecidedChunkByHash(cardID string, contentHash string) error
-
-	// DeleteLegacyDecidedChunk removes a single archived chunk by index, only if
-	// it has no content_hash (NULL). This prevents accidentally deleting newer rows
-	// when schema v8 allows multiple rows per (card_id, chunk_index) with different hashes.
-	DeleteLegacyDecidedChunk(cardID string, chunkIndex int) error
-
-	// DeleteDecidedChunks removes all archived chunks for a card.
-	DeleteDecidedChunks(cardID string) error
 }
 
 // -----------------------------------------------------------------------------
@@ -357,6 +222,18 @@ type Session struct {
 	// IsSystem marks host-managed internal sessions that should be hidden from
 	// user-facing session lists in mobile UI.
 	IsSystem bool `json:"is_system,omitempty"`
+
+	// SessionKind stores the canonical lowercase session classification string.
+	// Empty means legacy rows that predate structured-chat metadata.
+	SessionKind string `json:"session_kind,omitempty"`
+
+	// AgentProvider stores the canonical lowercase provider string.
+	// Empty means no persisted provider metadata is available.
+	AgentProvider string `json:"agent_provider,omitempty"`
+
+	// ChatCapabilitiesJSON stores the canonical capabilities JSON object.
+	// Empty means the session has no persisted structured-chat capabilities.
+	ChatCapabilitiesJSON string `json:"chat_capabilities_json,omitempty"`
 }
 
 // SessionStore defines the interface for persisting session history.
@@ -385,4 +262,53 @@ type SessionStore interface {
 	// Archived means status is "complete" or "error".
 	// Returns the number of deleted rows.
 	ClearArchivedSessions() (int, error)
+
+	// DeleteSession deletes a single session by ID, including associated
+	// structured chat data. Returns an error if the session does not exist.
+	DeleteSession(id string) error
+
+	// ClearAllSessions deletes all non-system sessions from storage,
+	// regardless of status. Returns the number of deleted rows.
+	ClearAllSessions() (int, error)
+}
+
+// StructuredChatStoredItem is one persisted structured-chat item payload.
+// PayloadJSON stores the canonical wire JSON so replay stays stable across restarts.
+type StructuredChatStoredItem struct {
+	// ItemID is the canonical chat item id.
+	ItemID string `json:"item_id"`
+
+	// Position preserves authoritative snapshot ordering.
+	Position int `json:"position"`
+
+	// PayloadJSON is the serialized canonical ChatItem payload.
+	PayloadJSON string `json:"payload_json"`
+
+	// CreatedAt mirrors the item's created_at for deterministic ordering checks.
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// StructuredChatSnapshot is the durable snapshot state for one session.
+type StructuredChatSnapshot struct {
+	// SessionID identifies which session owns the snapshot.
+	SessionID string `json:"session_id"`
+
+	// Revision is the persisted monotonic revision for this session.
+	Revision int64 `json:"revision"`
+
+	// UpdatedAt is when the snapshot was last replaced.
+	UpdatedAt time.Time `json:"updated_at"`
+
+	// Items is the ordered retained snapshot window.
+	Items []StructuredChatStoredItem `json:"items"`
+}
+
+// StructuredChatStore defines persistence for host-authored structured chat snapshots.
+type StructuredChatStore interface {
+	// LoadStructuredChatSnapshot returns the stored snapshot for one session.
+	// Returns nil, nil when no snapshot exists.
+	LoadStructuredChatSnapshot(sessionID string) (*StructuredChatSnapshot, error)
+
+	// ReplaceStructuredChatSnapshot atomically replaces the stored snapshot for one session.
+	ReplaceStructuredChatSnapshot(snapshot *StructuredChatSnapshot) error
 }

@@ -1,0 +1,49 @@
+{
+  "fixture_name": "chunk_fragmentation",
+  "session_id": "session-codex-1",
+  "steps": [
+    {
+      "label": "fragmented user prompt",
+      "chunk_observed_at": 1000,
+      "chunks": ["Us", "er: fragmented input\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "codex-user:turn-1",
+          "session_id": "session-codex-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "codex",
+          "status": "completed",
+          "text": "fragmented input"
+        }
+      ]
+    },
+    {
+      "label": "fragmented assistant response",
+      "chunk_observed_at": 2000,
+      "chunks": ["Assist", "ant: fragmented reply\n", "\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "codex-user:turn-1",
+          "session_id": "session-codex-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "codex",
+          "status": "completed",
+          "text": "fragmented input"
+        },
+        {
+          "id": "codex-assistant:turn-1",
+          "session_id": "session-codex-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "codex",
+          "status": "completed",
+          "markdown": "fragmented reply"
+        }
+      ]
+    }
+  ]
+}

@@ -308,6 +308,7 @@ func TestErrorCodes(t *testing.T) {
 		CodeKeepAwakeAcquireFailed,
 		CodeKeepAwakeConflict,
 		CodeKeepAwakeExpired,
+		CodeKeepAwakeUnavailable,
 		CodeUnknown,
 		CodeInternal,
 	}
@@ -340,6 +341,7 @@ func TestKeepAwakeNextActions(t *testing.T) {
 		CodeKeepAwakeAcquireFailed,
 		CodeKeepAwakeConflict,
 		CodeKeepAwakeExpired,
+		CodeKeepAwakeUnavailable,
 	}
 
 	for _, code := range codes {

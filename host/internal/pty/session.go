@@ -153,12 +153,26 @@ func (s *Session) Start(command string, args ...string) error {
 	// It doesn't actually start the command yet.
 	s.cmd = exec.Command(command, args...)
 
-	// pty.Start() does three things:
+	// Set terminal-related environment variables so the child process
+	// knows it's running inside a 256-color capable terminal with
+	// true-color support. Without these, TUI programs may fall back
+	// to basic monochrome output.
+	s.cmd.Env = append(os.Environ(),
+		"TERM=xterm-256color",
+		"COLORTERM=truecolor",
+	)
+
+	// pty.StartWithSize() does four things:
 	// 1. Creates a new PTY (master + slave pair)
-	// 2. Attaches the command's stdin/stdout/stderr to the slave
-	// 3. Starts the command
+	// 2. Sets the initial terminal size on the slave
+	// 3. Attaches the command's stdin/stdout/stderr to the slave
+	// 4. Starts the command
 	// It returns the master side (ptmx) which we use to read/write.
-	ptmx, err := pty.Start(s.cmd)
+	// We set a sensible default size (80x24) so that programs querying
+	// their terminal dimensions at startup get a valid answer instead
+	// of 0x0 (which can cause layout glitches in TUI apps).
+	defaultSize := &pty.Winsize{Cols: 80, Rows: 24}
+	ptmx, err := pty.StartWithSize(s.cmd, defaultSize)
 	if err != nil {
 		// %w wraps the original error so callers can unwrap it later
 		return fmt.Errorf("failed to start PTY: %w", err)

@@ -32,8 +32,7 @@ log_file = "/var/log/pseudocoder.log"
 pair = true
 qr = true
 pair_socket = "/tmp/pseudocoder-pair.sock"
-chunk_grouping_enabled = true
-chunk_grouping_proximity = 25
+structured_chat_v1 = true
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
@@ -108,12 +107,8 @@ chunk_grouping_proximity = 25
 	if cfg.PairSocket != "/tmp/pseudocoder-pair.sock" {
 		t.Errorf("PairSocket = %q, want %q", cfg.PairSocket, "/tmp/pseudocoder-pair.sock")
 	}
-	// Unit 2.1: Chunk grouping fields
-	if !cfg.ChunkGroupingEnabled {
-		t.Error("ChunkGroupingEnabled = false, want true")
-	}
-	if cfg.ChunkGroupingProximity != 25 {
-		t.Errorf("ChunkGroupingProximity = %d, want 25", cfg.ChunkGroupingProximity)
+	if !cfg.StructuredChatV1 {
+		t.Error("StructuredChatV1 = false, want true")
 	}
 }
 
@@ -178,12 +173,41 @@ history_lines = 3000
 	if cfg.PairSocket != "" {
 		t.Errorf("PairSocket = %q, want empty", cfg.PairSocket)
 	}
-	// Unit 2.1: Chunk grouping fields should default to zero values
-	if cfg.ChunkGroupingEnabled {
-		t.Error("ChunkGroupingEnabled = true, want false (zero value)")
+	if cfg.StructuredChatV1 {
+		t.Error("StructuredChatV1 = true, want false")
 	}
-	if cfg.ChunkGroupingProximity != 0 {
-		t.Errorf("ChunkGroupingProximity = %d, want 0 (zero value)", cfg.ChunkGroupingProximity)
+}
+
+func TestLoadStructuredChatV1Flag(t *testing.T) {
+	content := `structured_chat_v1 = true`
+	tmpFile := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if !cfg.StructuredChatV1 {
+		t.Fatal("StructuredChatV1 = false, want true")
+	}
+}
+
+func TestStructuredChatV1DefaultFalse(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(tmpFile, []byte("addr = \"127.0.0.1:7070\"\n"), 0600); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.StructuredChatV1 {
+		t.Fatal("StructuredChatV1 = true, want false")
 	}
 }
 
@@ -329,6 +353,9 @@ func TestWriteDefault_CreatesFile(t *testing.T) {
 	if !cfg.RequireAuth {
 		t.Error("RequireAuth = false, want true")
 	}
+	if !cfg.StructuredChatV1 {
+		t.Error("StructuredChatV1 = false, want true")
+	}
 	if cfg.Repo != "/path/to/repo" {
 		t.Errorf("Repo = %q, want %q", cfg.Repo, "/path/to/repo")
 	}
@@ -343,6 +370,7 @@ func TestWriteDefault_NoOverwrite(t *testing.T) {
 	// Create an existing config with different values
 	existingContent := `addr = "127.0.0.1:9999"
 require_auth = false
+structured_chat_v1 = false
 repo = "/existing/repo"
 `
 	if err := os.WriteFile(configPath, []byte(existingContent), 0600); err != nil {
@@ -366,6 +394,9 @@ repo = "/existing/repo"
 	}
 	if cfg.RequireAuth {
 		t.Error("RequireAuth = true, want false (original should be preserved)")
+	}
+	if cfg.StructuredChatV1 {
+		t.Error("StructuredChatV1 = true, want false (original should be preserved)")
 	}
 	if cfg.Repo != "/existing/repo" {
 		t.Errorf("Repo = %q, want %q (original should be preserved)", cfg.Repo, "/existing/repo")
@@ -424,91 +455,6 @@ func TestWriteDefault_RepoWithSpecialChars(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Phase 2 Unit 2.1: Chunk Grouping Config Fields
-// =============================================================================
-
-// TestLoad_ChunkGroupingFields verifies that chunk grouping config fields
-// are parsed correctly from TOML.
-func TestLoad_ChunkGroupingFields(t *testing.T) {
-	content := `
-chunk_grouping_enabled = true
-chunk_grouping_proximity = 30
-`
-	tmpFile := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
-		t.Fatalf("Failed to write temp config: %v", err)
-	}
-
-	cfg, err := Load(tmpFile)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-
-	if !cfg.ChunkGroupingEnabled {
-		t.Error("ChunkGroupingEnabled = false, want true")
-	}
-	if cfg.ChunkGroupingProximity != 30 {
-		t.Errorf("ChunkGroupingProximity = %d, want 30", cfg.ChunkGroupingProximity)
-	}
-}
-
-// TestLoad_ChunkGroupingEnabled_False verifies that explicit false value parses.
-func TestLoad_ChunkGroupingEnabled_False(t *testing.T) {
-	content := `
-chunk_grouping_enabled = false
-chunk_grouping_proximity = 20
-`
-	tmpFile := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
-		t.Fatalf("Failed to write temp config: %v", err)
-	}
-
-	cfg, err := Load(tmpFile)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-
-	if cfg.ChunkGroupingEnabled {
-		t.Error("ChunkGroupingEnabled = true, want false")
-	}
-	if cfg.ChunkGroupingProximity != 20 {
-		t.Errorf("ChunkGroupingProximity = %d, want 20", cfg.ChunkGroupingProximity)
-	}
-}
-
-// TestValidate_ChunkGroupingProximity uses table-driven tests to verify
-// proximity validation for boundary and adversarial cases.
-func TestValidate_ChunkGroupingProximity(t *testing.T) {
-	tests := []struct {
-		name      string
-		proximity int
-		wantErr   bool
-	}{
-		// Valid cases
-		{"valid_default", 20, false},
-		{"valid_boundary", 1, false},
-		{"valid_large", 1000, false},
-		{"valid_zero_means_unset", 0, false}, // 0 means "use default"
-
-		// Adversarial cases (from PLANS.md)
-		{"invalid_negative", -1, true},
-		{"invalid_negative_large", -100, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{
-				ChunkGroupingProximity: tt.proximity,
-			}
-			err := cfg.Validate()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Validate() error = %v, wantErr = %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
 // TestValidate_Valid_EmptyConfig verifies that an empty config passes validation.
 // Zero values indicate "use default" and are valid.
 func TestValidate_Valid_EmptyConfig(t *testing.T) {
@@ -517,41 +463,6 @@ func TestValidate_Valid_EmptyConfig(t *testing.T) {
 	if err != nil {
 		t.Errorf("Validate() error = %v, want nil for empty config", err)
 	}
-}
-
-// TestValidate_ErrorMessage verifies that validation errors include helpful details.
-func TestValidate_ErrorMessage(t *testing.T) {
-	cfg := &Config{
-		ChunkGroupingProximity: -5,
-	}
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("Validate() expected error, got nil")
-	}
-
-	// Error should mention the field name and the invalid value
-	errMsg := err.Error()
-	if !contains(errMsg, "chunk_grouping_proximity") {
-		t.Errorf("Error message should mention field name, got: %s", errMsg)
-	}
-	if !contains(errMsg, "-5") {
-		t.Errorf("Error message should mention invalid value, got: %s", errMsg)
-	}
-}
-
-// contains is a helper to check if a string contains a substring.
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
-		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
-}
-
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // =============================================================================
@@ -929,5 +840,3 @@ keep_awake_allow_on_battery = false
 		t.Error("expected true after second persist")
 	}
 }
-
-

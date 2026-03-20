@@ -488,7 +488,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
-			ErrorCode: apperrors.CodeKeepAwakeConflict,
+			ErrorCode: apperrors.CodeKeepAwakeUnavailable,
 			Error:     "Authentication system unavailable",
 		})
 		return

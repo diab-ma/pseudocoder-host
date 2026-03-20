@@ -10,7 +10,7 @@ import (
 
 // currentSchemaVersion is the current database schema version.
 // Increment this when making schema changes and add migration logic.
-const currentSchemaVersion = 10
+const currentSchemaVersion = 12
 
 // initSchema creates the required tables if they don't exist.
 // Uses IF NOT EXISTS to make the operation idempotent.
@@ -96,12 +96,151 @@ func (s *SQLiteStore) initSchema() error {
 		}
 	}
 
+	if version < 11 {
+		if err := s.migrateToV11(); err != nil {
+			return fmt.Errorf("migrate to v11: %w", err)
+		}
+	}
+
+	if version < 12 {
+		if err := s.migrateToV12(); err != nil {
+			return fmt.Errorf("migrate to v12: %w", err)
+		}
+	}
+
 	// Safety net: ensure per-chunk storage table exists even if prior migrations
 	// were marked applied (e.g., older DBs with missing tables).
 	if err := s.ensureChunksTable(); err != nil {
 		return fmt.Errorf("ensure card_chunks table: %w", err)
 	}
+	if err := s.ensureStructuredChatTables(); err != nil {
+		return fmt.Errorf("ensure structured chat tables: %w", err)
+	}
+	if err := s.ensureSessionStructuredChatColumns(); err != nil {
+		return fmt.Errorf("ensure session structured chat columns: %w", err)
+	}
 
+	return nil
+}
+
+func (s *SQLiteStore) migrateToV11() error {
+	log.Printf("storage: applying migration to schema version 11")
+
+	if err := s.ensureStructuredChatTables(); err != nil {
+		return err
+	}
+
+	_, err := s.db.Exec(
+		"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+		11,
+		time.Now().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+
+	return nil
+}
+
+func (s *SQLiteStore) ensureStructuredChatTables() error {
+	const structuredChatTables = `
+		CREATE TABLE IF NOT EXISTS structured_chat_sessions (
+			session_id TEXT PRIMARY KEY,
+			revision INTEGER NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS structured_chat_items (
+			session_id TEXT NOT NULL,
+			item_id TEXT NOT NULL,
+			position INTEGER NOT NULL,
+			payload_json TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (session_id, item_id),
+			FOREIGN KEY (session_id) REFERENCES structured_chat_sessions(session_id) ON DELETE CASCADE
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_structured_chat_items_session_position
+			ON structured_chat_items(session_id, position);
+	`
+
+	if _, err := s.db.Exec(structuredChatTables); err != nil {
+		return fmt.Errorf("create structured chat tables: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) migrateToV12() error {
+	log.Printf("storage: applying migration to schema version 12")
+
+	if err := s.ensureSessionStructuredChatColumns(); err != nil {
+		return err
+	}
+
+	_, err := s.db.Exec(
+		"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+		12,
+		time.Now().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+
+	return nil
+}
+
+func (s *SQLiteStore) ensureSessionStructuredChatColumns() error {
+	type sessionColumn struct {
+		name       string
+		definition string
+	}
+
+	columns := []sessionColumn{
+		{name: "session_kind", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "agent_provider", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "chat_capabilities_json", definition: "TEXT NOT NULL DEFAULT ''"},
+	}
+
+	for _, column := range columns {
+		if err := s.ensureSessionsColumn(column.name, column.definition); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *SQLiteStore) ensureSessionsColumn(name, definition string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(sessions)`)
+	if err != nil {
+		return fmt.Errorf("inspect sessions table info: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid      int
+			column   string
+			dataType string
+			notNull  int
+			defaultV sql.NullString
+			primaryK int
+		)
+		if err := rows.Scan(&cid, &column, &dataType, &notNull, &defaultV, &primaryK); err != nil {
+			return fmt.Errorf("scan sessions table info: %w", err)
+		}
+		if column == name {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate sessions table info: %w", err)
+	}
+
+	query := fmt.Sprintf("ALTER TABLE sessions ADD COLUMN %s %s", name, definition)
+	if _, err := s.db.Exec(query); err != nil {
+		return fmt.Errorf("add sessions.%s column: %w", name, err)
+	}
 	return nil
 }
 

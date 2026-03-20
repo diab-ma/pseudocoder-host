@@ -8,50 +8,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/pseudocoder/host/internal/diff"
 	"github.com/pseudocoder/host/internal/storage"
 )
-
-// ChunkInfo mirrors server.ChunkInfo for the streaming layer.
-// This avoids an import cycle between stream and server packages.
-type ChunkInfo struct {
-	Index       int
-	OldStart    int
-	OldCount    int
-	NewStart    int
-	NewCount    int
-	Offset      int    // Deprecated: use Content directly
-	Length      int    // Deprecated: use Content directly
-	Content     string // Raw chunk content (including @@ header)
-	ContentHash     string // SHA256 hash prefix for stale detection
-	GroupIndex      int    // Group number for proximity grouping (0-based)
-	SemanticKind    string // Semantic classification (e.g., "import", "function")
-	SemanticLabel   string // Display label for the chunk
-	SemanticGroupID string // Deterministic group identifier
-}
-
-// ChunkGroupInfo describes a group of related chunks for proximity grouping.
-// Groups are formed by collecting chunks within a configurable number of lines
-// of each other. This allows mobile clients to display and act on related
-// chunks together.
-type ChunkGroupInfo struct {
-	// GroupIndex is the 0-based position of this group.
-	GroupIndex int
-
-	// LineStart is the starting line number of the group (minimum of member chunks).
-	LineStart int
-
-	// LineEnd is the ending line number of the group (maximum of member chunks).
-	LineEnd int
-
-	// ChunkCount is the number of chunks in this group.
-	ChunkCount int
-}
 
 // SemanticGroupInfo describes a semantic group of related chunks.
 // Semantic groups are determined by code analysis (C2) rather than
@@ -92,13 +54,11 @@ type DiffStats struct {
 // This abstraction allows testing without a real WebSocket server.
 type CardBroadcaster interface {
 	// BroadcastDiffCard sends a card to all connected clients.
-	// The chunks parameter provides per-chunk metadata for granular decisions.
-	// The chunkGroups parameter provides proximity grouping metadata (nil when disabled).
 	// The semanticGroups parameter provides semantic grouping metadata (nil when disabled).
-	// The isBinary flag indicates per-chunk actions should be disabled.
+	// The isBinary flag indicates this is a binary file (file-level actions only).
 	// The isDeleted flag indicates this is a file deletion (use file-level actions).
 	// The stats parameter provides size metrics for large diff warnings.
-	BroadcastDiffCard(cardID, file, diffContent string, chunks []ChunkInfo, chunkGroups []ChunkGroupInfo, semanticGroups []SemanticGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64)
+	BroadcastDiffCard(cardID, file, diffContent string, semanticGroups []SemanticGroupInfo, isBinary, isDeleted bool, stats *DiffStats, createdAt int64)
 
 	// BroadcastCardRemoved notifies clients that a card was removed.
 	// This is called when changes are staged/reverted externally.
@@ -113,10 +73,6 @@ type CardStreamerConfig struct {
 	// Store persists cards to SQLite for restart safety.
 	Store storage.CardStore
 
-	// ChunkStore persists individual chunk records for per-chunk decisions.
-	// If nil, per-chunk decisions will fail with storage.not_found errors.
-	ChunkStore storage.ChunkStore
-
 	// Broadcaster sends cards to connected WebSocket clients.
 	Broadcaster CardBroadcaster
 
@@ -126,15 +82,6 @@ type CardStreamerConfig struct {
 	// OnError is called when an error occurs during streaming.
 	// If nil, errors are logged but not propagated.
 	OnError func(err error)
-
-	// ChunkGroupingEnabled enables proximity-based chunk grouping.
-	// When true, chunks within ChunkGroupingProximity lines are grouped together.
-	ChunkGroupingEnabled bool
-
-	// ChunkGroupingProximity is the maximum line distance for grouping chunks.
-	// Chunks within this many lines of each other are placed in the same group.
-	// Default is 20 lines if not specified.
-	ChunkGroupingProximity int
 }
 
 // CardStreamer coordinates diff polling, storage, and streaming.
@@ -298,8 +245,6 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 		cardID := diff.FileCardID(file)
 
 		var diffContent string
-		var chunkInfoList []ChunkInfo
-		var chunkGroups []ChunkGroupInfo
 		var stats *DiffStats
 
 		// For hashing, we need content that changes when the file changes.
@@ -308,7 +253,7 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 		var hashSource string
 
 		if isBinary {
-			// Binary file - no chunks, use placeholder content for display
+			// Binary file - use placeholder content for display
 			diffContent = diff.BinaryDiffPlaceholder
 			// But hash the raw diff section (includes index line with blob hashes)
 			hashSource = diff.ExtractFileDiffSection(rawDiff, file)
@@ -318,16 +263,6 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 		} else {
 			diffContent = diff.ConcatChunkContent(fileChunkList)
 			hashSource = diffContent
-			chunkInfoList = buildChunkInfo(fileChunkList, diffContent)
-
-			// Apply proximity-based grouping if enabled
-			if cs.config.ChunkGroupingEnabled && len(chunkInfoList) > 0 {
-				proximity := cs.config.ChunkGroupingProximity
-				if proximity <= 0 {
-					proximity = 20 // Default proximity
-				}
-				chunkGroups, chunkInfoList = GroupChunksByProximity(chunkInfoList, proximity)
-			}
 
 			// Calculate diff stats for large file warnings
 			diffStats := diff.CalculateDiffStats(diffContent)
@@ -372,36 +307,13 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 			}
 		}
 
-		// Save individual chunks to ChunkStore for per-chunk decision support.
-		// This allows ProcessChunkDecision to look up chunk content by index.
-		// Skip for binary files as they have no chunks.
-		if cs.config.ChunkStore != nil && !isBinary && len(chunkInfoList) > 0 {
-			chunkStatuses := make([]*storage.ChunkStatus, len(chunkInfoList))
-			for i, h := range chunkInfoList {
-				chunkStatuses[i] = &storage.ChunkStatus{
-					CardID:     cardID,
-					ChunkIndex: i,
-					Content:    h.Content,
-					Status:     storage.CardPending,
-				}
-			}
-			if err := cs.config.ChunkStore.SaveChunks(cardID, chunkStatuses); err != nil {
-				log.Printf("Failed to save chunks for card %s: %v", cardID, err)
-				if cs.config.OnError != nil {
-					cs.config.OnError(err)
-				}
-				// Don't continue - card is saved, chunks just won't be available for per-chunk decisions
-			}
-		}
-
 		// Update seen hash only after successful save
 		cs.mu.Lock()
 		cs.seenFileHashes[file] = contentHash
 		cs.mu.Unlock()
 
 		// Semantic enrichment (non-blocking).
-		var semanticGroups []SemanticGroupInfo
-		chunkInfoList, semanticGroups = EnrichChunksWithSemantics(cardID, file, chunkInfoList, isBinary, isDeleted)
+		semanticGroups := EnrichFileWithSemantics(cardID, file, diffContent, isBinary, isDeleted)
 
 		// Broadcast to clients (same message for new and updated cards)
 		if cs.config.Broadcaster != nil {
@@ -409,8 +321,6 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 				card.ID,
 				card.File,
 				card.Diff,
-				chunkInfoList,
-				chunkGroups,
 				semanticGroups,
 				isBinary,
 				isDeleted,
@@ -419,40 +329,6 @@ func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 			)
 		}
 	}
-}
-
-// buildChunkInfo creates ChunkInfo slice from parsed chunks and concatenated diff.
-// It calculates byte offsets for each chunk within the diff string and includes
-// the raw content and content hash for each chunk.
-// Note: ConcatChunkContent joins chunks with "\n" separators, so offsets must
-// account for these separators between chunks.
-func buildChunkInfo(chunks []*diff.Chunk, diffContent string) []ChunkInfo {
-	result := make([]ChunkInfo, len(chunks))
-	offset := 0
-
-	for i, h := range chunks {
-		length := len(h.Content)
-
-		result[i] = ChunkInfo{
-			Index:       i,
-			OldStart:    h.OldStart,
-			OldCount:    h.OldCount,
-			NewStart:    h.NewStart,
-			NewCount:    h.NewCount,
-			Offset:      offset,
-			Length:      length,
-			Content:     h.Content,
-			ContentHash: hashContent(h.Content),
-		}
-
-		offset += length
-		// Account for the "\n" separator between chunks (added by ConcatChunkContent)
-		if i < len(chunks)-1 {
-			offset += 1
-		}
-	}
-
-	return result
 }
 
 // removeStaleFileCards checks pending cards against current files and removes
@@ -476,14 +352,6 @@ func (cs *CardStreamer) removeStaleFileCards(currentFiles map[string]bool) {
 			if err := cs.config.Store.DeleteCard(card.ID); err != nil {
 				log.Printf("Failed to delete stale card %s: %v", card.ID, err)
 				continue
-			}
-
-			// Delete associated chunks to avoid orphaned rows
-			if cs.config.ChunkStore != nil {
-				if err := cs.config.ChunkStore.DeleteChunks(card.ID); err != nil {
-					log.Printf("Failed to delete chunks for stale card %s: %v", card.ID, err)
-					// Continue anyway - card is already deleted
-				}
 			}
 
 			// Remove from seen hashes so it can be re-added if changes reappear
@@ -534,11 +402,6 @@ func (cs *CardStreamer) ValidateAndCleanStaleCards() error {
 // StreamPendingCards sends all pending cards to clients.
 // This is useful for newly connected clients who need to catch up
 // on existing cards. Call this when a new client connects.
-//
-// This method also reconciles missing chunk rows: if a pending card has
-// no chunks in the ChunkStore (e.g., due to database corruption or migration),
-// it parses the diff content and recreates the chunk rows. This ensures
-// per-chunk decisions work correctly after reconnect.
 func (cs *CardStreamer) StreamPendingCards() error {
 	if cs.config.Store == nil || cs.config.Broadcaster == nil {
 		return nil
@@ -553,27 +416,9 @@ func (cs *CardStreamer) StreamPendingCards() error {
 		// Detect if card is for a binary file based on stored placeholder content
 		isBinary := card.Diff == diff.BinaryDiffPlaceholder
 
-		var chunkInfoList []ChunkInfo
-		var chunkGroups []ChunkGroupInfo
 		var stats *DiffStats
 
 		if !isBinary {
-			// Parse chunk boundaries from stored diff content
-			chunkInfoList = ParseChunkInfoFromDiff(card.Diff)
-
-			// Apply proximity-based grouping if enabled
-			if cs.config.ChunkGroupingEnabled && len(chunkInfoList) > 0 {
-				proximity := cs.config.ChunkGroupingProximity
-				if proximity <= 0 {
-					proximity = 20 // Default proximity
-				}
-				chunkGroups, chunkInfoList = GroupChunksByProximity(chunkInfoList, proximity)
-			}
-
-			// Reconcile: if ChunkStore is configured but has no chunks for this card,
-			// save the parsed chunks to enable per-chunk decisions.
-			cs.reconcileChunks(card.ID, chunkInfoList)
-
 			// Calculate diff stats for large file warnings
 			diffStats := diff.CalculateDiffStats(card.Diff)
 			stats = &DiffStats{
@@ -589,15 +434,12 @@ func (cs *CardStreamer) StreamPendingCards() error {
 		isDeleted := stats != nil && stats.AddedLines == 0 && stats.DeletedLines > 0
 
 		// Semantic enrichment (non-blocking).
-		var semanticGroups []SemanticGroupInfo
-		chunkInfoList, semanticGroups = EnrichChunksWithSemantics(card.ID, card.File, chunkInfoList, isBinary, isDeleted)
+		semanticGroups := EnrichFileWithSemantics(card.ID, card.File, card.Diff, isBinary, isDeleted)
 
 		cs.config.Broadcaster.BroadcastDiffCard(
 			card.ID,
 			card.File,
 			card.Diff,
-			chunkInfoList,
-			chunkGroups,
 			semanticGroups,
 			isBinary,
 			isDeleted,
@@ -610,209 +452,6 @@ func (cs *CardStreamer) StreamPendingCards() error {
 	return nil
 }
 
-// ReconcileChunksForCard checks if chunks exist and are in sync for a card,
-// rebuilding them if necessary. This is exported for use by the reconnect
-// handler in host/cmd/host.go which needs to reconcile chunks before sending
-// cards to reconnecting clients.
-func (cs *CardStreamer) ReconcileChunksForCard(cardID string, chunkInfoList []ChunkInfo) {
-	cs.reconcileChunks(cardID, chunkInfoList)
-}
-
-// reconcileChunks checks if chunks exist and are in sync for a card.
-// It creates missing chunks or rebuilds stale chunks when:
-// - No chunks exist (missing)
-// - Chunk count doesn't match (stale)
-// - Any chunk's content hash doesn't match (stale)
-//
-// This handles cases where a pending card exists in storage but its chunk rows
-// were never created, are outdated, or were corrupted.
-// Without correct chunk rows, per-chunk decisions fail with "chunk not found"
-// or "chunk stale" errors.
-func (cs *CardStreamer) reconcileChunks(cardID string, chunkInfoList []ChunkInfo) {
-	if cs.config.ChunkStore == nil || len(chunkInfoList) == 0 {
-		return
-	}
-
-	// Check if chunks already exist
-	existingChunks, err := cs.config.ChunkStore.GetChunks(cardID)
-	if err != nil {
-		log.Printf("Warning: failed to get chunks for reconciliation (card %s): %v", cardID, err)
-		return
-	}
-
-	// Determine if we need to rebuild chunks
-	needsRebuild := false
-	reason := ""
-
-	if len(existingChunks) == 0 {
-		// No chunks exist - need to create them
-		needsRebuild = true
-		reason = "missing"
-	} else if len(existingChunks) != len(chunkInfoList) {
-		// Chunk count mismatch - stale data
-		needsRebuild = true
-		reason = fmt.Sprintf("count mismatch (stored=%d, expected=%d)", len(existingChunks), len(chunkInfoList))
-	} else {
-		// Compare all chunks' content hashes to detect stale content
-		for i := range existingChunks {
-			storedHash := hashContent(existingChunks[i].Content)
-			expectedHash := chunkInfoList[i].ContentHash
-			if storedHash != expectedHash {
-				needsRebuild = true
-				reason = fmt.Sprintf("hash mismatch at chunk %d (stored=%s, expected=%s)", i, storedHash[:8], expectedHash[:8])
-				break
-			}
-		}
-	}
-
-	if !needsRebuild {
-		return
-	}
-
-	// Delete existing stale chunks before recreating
-	if len(existingChunks) > 0 {
-		if err := cs.config.ChunkStore.DeleteChunks(cardID); err != nil {
-			log.Printf("Warning: failed to delete stale chunks for card %s: %v", cardID, err)
-			return
-		}
-	}
-
-	// Create chunk rows from parsed info
-	log.Printf("Reconciling %d chunks for card %s (%s)", len(chunkInfoList), cardID, reason)
-
-	chunkStatuses := make([]*storage.ChunkStatus, len(chunkInfoList))
-	for i, h := range chunkInfoList {
-		chunkStatuses[i] = &storage.ChunkStatus{
-			CardID:     cardID,
-			ChunkIndex: i,
-			Content:    h.Content,
-			Status:     storage.CardPending,
-		}
-	}
-
-	if err := cs.config.ChunkStore.SaveChunks(cardID, chunkStatuses); err != nil {
-		log.Printf("Warning: failed to reconcile chunks for card %s: %v", cardID, err)
-		// Don't fail - card will still be streamed, just without per-chunk support
-	}
-}
-
-// ParseChunkInfoFromDiff extracts chunk boundaries from a diff string.
-// It parses @@ -old,count +new,count @@ headers to build ChunkInfo.
-// This is exported for use in reconnect scenarios where chunk metadata
-// must be reconstructed from stored diff content.
-//
-// IMPORTANT: This function must produce identical Content/ContentHash values
-// to buildChunkInfo for the same diff content. ConcatChunkContent joins chunks
-// with "\n" separators, so when we finalize a non-last chunk (upon seeing the
-// next @@ header), we must exclude that trailing separator newline.
-func ParseChunkInfoFromDiff(diffContent string) []ChunkInfo {
-	var result []ChunkInfo
-	lines := strings.Split(diffContent, "\n")
-	offset := 0
-	index := 0
-
-	var currentChunk *ChunkInfo
-
-	for i, line := range lines {
-		lineLen := len(line)
-		if i < len(lines)-1 {
-			lineLen++ // Account for newline
-		}
-
-		if strings.HasPrefix(line, "@@") {
-			// If we had a previous chunk, finalize its length and content.
-			// Exclude the trailing separator newline - ConcatChunkContent adds
-			// "\n" between chunks, but that separator is not part of the chunk content.
-			if currentChunk != nil {
-				currentChunk.Length = offset - currentChunk.Offset
-				// Trim trailing separator newline (the "\n" between chunks)
-				if currentChunk.Length > 0 && diffContent[currentChunk.Offset+currentChunk.Length-1] == '\n' {
-					currentChunk.Length--
-				}
-				currentChunk.Content = diffContent[currentChunk.Offset : currentChunk.Offset+currentChunk.Length]
-				currentChunk.ContentHash = hashContent(currentChunk.Content)
-				result = append(result, *currentChunk)
-			}
-
-			// Parse the @@ header: @@ -old,count +new,count @@
-			oldStart, oldCount, newStart, newCount := parseChunkHeader(line)
-
-			currentChunk = &ChunkInfo{
-				Index:    index,
-				OldStart: oldStart,
-				OldCount: oldCount,
-				NewStart: newStart,
-				NewCount: newCount,
-				Offset:   offset,
-			}
-			index++
-		}
-
-		offset += lineLen
-	}
-
-	// Finalize the last chunk - no trailing separator to trim here
-	if currentChunk != nil {
-		currentChunk.Length = offset - currentChunk.Offset
-		currentChunk.Content = diffContent[currentChunk.Offset : currentChunk.Offset+currentChunk.Length]
-		currentChunk.ContentHash = hashContent(currentChunk.Content)
-		result = append(result, *currentChunk)
-	}
-
-	// Handle edge case: empty result means single chunk from offset 0
-	if len(result) == 0 && len(diffContent) > 0 {
-		result = append(result, ChunkInfo{
-			Index:       0,
-			Offset:      0,
-			Length:      len(diffContent),
-			Content:     diffContent,
-			ContentHash: hashContent(diffContent),
-		})
-	}
-
-	return result
-}
-
-// parseChunkHeader extracts line numbers from @@ -old,count +new,count @@ header.
-func parseChunkHeader(line string) (oldStart, oldCount, newStart, newCount int) {
-	// Default counts to 1 if not specified
-	oldCount = 1
-	newCount = 1
-
-	// Find the parts between @@ markers
-	parts := strings.Split(line, "@@")
-	if len(parts) < 2 {
-		return
-	}
-
-	header := strings.TrimSpace(parts[1])
-	// header is like "-1,3 +1,4" or "-1 +1"
-
-	fields := strings.Fields(header)
-	for _, f := range fields {
-		if strings.HasPrefix(f, "-") {
-			// Parse -old,count
-			nums := strings.Split(strings.TrimPrefix(f, "-"), ",")
-			if len(nums) >= 1 {
-				fmt.Sscanf(nums[0], "%d", &oldStart)
-			}
-			if len(nums) >= 2 {
-				fmt.Sscanf(nums[1], "%d", &oldCount)
-			}
-		} else if strings.HasPrefix(f, "+") {
-			// Parse +new,count
-			nums := strings.Split(strings.TrimPrefix(f, "+"), ",")
-			if len(nums) >= 1 {
-				fmt.Sscanf(nums[0], "%d", &newStart)
-			}
-			if len(nums) >= 2 {
-				fmt.Sscanf(nums[1], "%d", &newCount)
-			}
-		}
-	}
-
-	return
-}
 
 // ClearSeen resets the seen file hashes tracking.
 // This is useful for testing or when you want to re-process all chunks.
@@ -829,140 +468,3 @@ func hashContent(content string) string {
 	return hex.EncodeToString(hash[:8])
 }
 
-// =============================================================================
-// Phase 2.2: Chunk Grouping by Proximity
-// =============================================================================
-
-// lineRef returns the reference line number for a chunk, used for grouping.
-// Uses new-file line numbers for edits/additions, old-file for deletion-only chunks.
-//
-// Implements the PLANS.md pseudocode:
-//
-//	line_ref(chunk) = chunk.new_start if chunk.new_count > 0 else chunk.old_start
-func lineRef(chunk ChunkInfo) int {
-	if chunk.NewCount > 0 {
-		return chunk.NewStart
-	}
-	return chunk.OldStart
-}
-
-// lineSpan returns the number of lines a chunk spans, used for calculating group end.
-// Uses new-file line count for edits/additions, old-file for deletion-only chunks.
-//
-// Implements the PLANS.md pseudocode:
-//
-//	line_span(chunk) = chunk.new_count if chunk.new_count > 0 else chunk.old_count
-func lineSpan(chunk ChunkInfo) int {
-	if chunk.NewCount > 0 {
-		return chunk.NewCount
-	}
-	return chunk.OldCount
-}
-
-// GroupChunksByProximity groups chunks that are within proximity lines of each other.
-// It returns the list of groups and a copy of the input chunks with GroupIndex set.
-//
-// The algorithm sorts chunks by line reference (new-file line for edits, old-file
-// for deletions), then iterates through them. If a chunk starts within proximity
-// lines of the previous group's end, it joins that group; otherwise it starts a
-// new group.
-//
-// Implements the PLANS.md pseudocode:
-//
-//	groups = []
-//	for chunk in chunks_sorted:
-//	  if groups empty: start new group
-//	  else if line_ref(chunk) <= groups.last.line_end + proximity: add to group
-//	  else start new group
-//	  groups.last.line_end = max(groups.last.line_end, line_ref(chunk) + line_span(chunk) - 1)
-//
-// Parameters:
-//   - chunks: the ChunkInfo slice to group (not modified)
-//   - proximity: maximum line distance to group chunks (typically 20)
-//
-// Returns:
-//   - groups: slice of ChunkGroupInfo describing each group
-//   - indexed: copy of chunks with GroupIndex field set
-func GroupChunksByProximity(chunks []ChunkInfo, proximity int) ([]ChunkGroupInfo, []ChunkInfo) {
-	if len(chunks) == 0 {
-		return nil, nil
-	}
-
-	// Create a copy of chunks with indices for sorting
-	type indexedChunk struct {
-		originalIndex int
-		chunk         ChunkInfo
-		lineRef       int
-	}
-	sortable := make([]indexedChunk, len(chunks))
-	for i, c := range chunks {
-		sortable[i] = indexedChunk{
-			originalIndex: i,
-			chunk:         c,
-			lineRef:       lineRef(c),
-		}
-	}
-
-	// Sort by line reference (stable sort preserves original order for equal keys)
-	sort.SliceStable(sortable, func(i, j int) bool {
-		return sortable[i].lineRef < sortable[j].lineRef
-	})
-
-	// Build groups using the PLANS.md algorithm
-	var groups []ChunkGroupInfo
-	chunkToGroup := make([]int, len(chunks)) // maps original index -> group index
-
-	for _, ic := range sortable {
-		chunkRef := ic.lineRef
-		span := lineSpan(ic.chunk)
-
-		// Calculate this chunk's end line
-		// Handle edge case: if span is 0, treat as 1 line minimum to avoid line_end < line_start
-		if span < 1 {
-			span = 1
-		}
-		chunkEnd := chunkRef + span - 1
-
-		if len(groups) == 0 {
-			// Start first group
-			groups = append(groups, ChunkGroupInfo{
-				GroupIndex: 0,
-				LineStart:  chunkRef,
-				LineEnd:    chunkEnd,
-				ChunkCount: 1,
-			})
-			chunkToGroup[ic.originalIndex] = 0
-		} else {
-			lastGroup := &groups[len(groups)-1]
-			// Check if this chunk is within proximity of the last group's end
-			if chunkRef <= lastGroup.LineEnd+proximity {
-				// Add to existing group
-				lastGroup.ChunkCount++
-				// Extend group's line range if needed
-				if chunkEnd > lastGroup.LineEnd {
-					lastGroup.LineEnd = chunkEnd
-				}
-				chunkToGroup[ic.originalIndex] = lastGroup.GroupIndex
-			} else {
-				// Start new group
-				newGroupIndex := len(groups)
-				groups = append(groups, ChunkGroupInfo{
-					GroupIndex: newGroupIndex,
-					LineStart:  chunkRef,
-					LineEnd:    chunkEnd,
-					ChunkCount: 1,
-				})
-				chunkToGroup[ic.originalIndex] = newGroupIndex
-			}
-		}
-	}
-
-	// Build the indexed output - copy chunks with GroupIndex set
-	indexed := make([]ChunkInfo, len(chunks))
-	for i, c := range chunks {
-		indexed[i] = c
-		indexed[i].GroupIndex = chunkToGroup[i]
-	}
-
-	return groups, indexed
-}

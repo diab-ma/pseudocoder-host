@@ -80,6 +80,8 @@ func (c *Client) readPump() {
 		c.server.mu.Lock()
 		delete(c.server.clients, c)
 		c.server.mu.Unlock()
+		c.server.clearSessionPromptsForClient(c)
+		c.server.clearSessionPromptsForDevice(deviceID)
 		c.server.onKeepAwakeClientDisconnected(deviceID)
 
 		// Use closeSend() to safely close the channel.
@@ -138,21 +140,19 @@ func (c *Client) readPump() {
 		switch msg.Type {
 		case MessageTypeReviewDecision:
 			c.handleReviewDecision(data)
-		case MessageTypeChunkDecision:
-			c.handleChunkDecision(data)
 		case MessageTypeReviewDelete:
 			c.handleReviewDelete(data)
 		// Phase 20.2: Undo messages for review card state reversal
 		case MessageTypeReviewUndo:
 			c.handleReviewUndo(data)
-		case MessageTypeChunkUndo:
-			c.handleChunkUndo(data)
 		case MessageTypeTerminalInput:
 			c.handleTerminalInput(data)
 		case MessageTypeTerminalResize:
 			c.handleTerminalResize(data)
 		case MessageTypeApprovalDecision:
 			c.handleApprovalDecision(data)
+		case MessageTypeChatPrompt:
+			c.handleChatPrompt(data)
 		case MessageTypeRepoStatus:
 			c.handleRepoStatus(data)
 		case MessageTypeRepoCommit:
@@ -174,6 +174,10 @@ func (c *Client) readPump() {
 			c.handleSessionRename(data)
 		case MessageTypeSessionClearHistory:
 			c.handleSessionClearHistory(data)
+		case MessageTypeSessionDelete:
+			c.handleSessionDelete(data)
+		case MessageTypeSessionClearAll:
+			c.handleSessionClearAll(data)
 		// Phase 12: tmux session integration messages
 		case MessageTypeTmuxList:
 			c.handleTmuxList(data)

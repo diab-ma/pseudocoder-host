@@ -6,8 +6,7 @@
 //   - actions.go: Package entry point (this file)
 //   - processor.go: Processor struct, constructor, and setters
 //   - decision_file.go: File-level accept/reject (ProcessDecision)
-//   - decision_chunk.go: Chunk-level accept/reject (ProcessChunkDecision)
 //   - delete.go: Untracked file deletion (DeleteUntrackedFile)
 //   - patch.go: Patch building and application (BuildPatch, applyPatch)
-//   - undo.go: Undo operations (ProcessUndo, ProcessChunkUndo)
+//   - undo.go: Undo operations (ProcessUndo)
 package actions

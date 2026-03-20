@@ -175,6 +175,7 @@ func (s *Server) Stop() error {
 
 	// Clear the clients map
 	s.clients = make(map[*Client]bool)
+	s.sessionPromptState = make(map[string]sessionPromptState)
 
 	// Close the broadcast channel to allow runBroadcaster to exit.
 	// This must happen after setting stopped=true to prevent panics

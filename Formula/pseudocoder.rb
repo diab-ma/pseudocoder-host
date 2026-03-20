@@ -1,24 +1,24 @@
 class Pseudocoder < Formula
   desc "Supervise AI coding sessions from your phone"
   homepage "https://github.com/diab-ma/pseudocoder-host"
-  version "0.2.0-beta"
+  version "2.2.0"
   license "MIT"
 
   on_macos do
     on_arm do
       url "https://github.com/diab-ma/pseudocoder-host/releases/download/v#{version}/pseudocoder-darwin-arm64"
-      sha256 "e40ac2714c33cae492831e1d436b52de9791ae4327b5960bd8f01993561624af"
+      sha256 "c2224752b16f97e0c7f131ff2926b8acd3d6bb1715b5fbfcba5cce2ad6ddf63e"
     end
     on_intel do
       url "https://github.com/diab-ma/pseudocoder-host/releases/download/v#{version}/pseudocoder-darwin-amd64"
-      sha256 "0305c5bc26d1082b97a790487375710aaf3ce33d118fdc57fe21f2fc670ee256"
+      sha256 "f37423b07314a736c562e18d1fc22d7232e1b1cbbd4b2606d24e18279e792e29"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/diab-ma/pseudocoder-host/releases/download/v#{version}/pseudocoder-linux-amd64"
-      sha256 "3323c962d198688ae32067d0c01e743d8a45eab3aa91c6574b16220179a112b1"
+      sha256 "7f47f86fdc8c99649ebf45bab1884cb6e3b3c9b73dba4d07fa2b7300ac347db0"
     end
   end
 

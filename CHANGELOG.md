@@ -4,6 +4,25 @@ All notable changes to pseudocoder will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-03-20
+
+### Features
+
+- **Structured chat**: real-time chat pipelines for Claude, Codex, and Gemini agents — agent thinking, tool calls, and responses streamed as structured timeline items
+- **Inline approvals**: command approval requests projected into the structured chat timeline
+- **Session output gating**: output buffered until client is ready, preventing dropped messages on connect
+
+### Improvements
+
+- **File-level diffs**: review cards now operate at file level (replaces chunk-level decisions)
+- **README rewrite**: new ASCII banner, App Store and Discord badges, concise documentation
+- **CI**: govulncheck non-blocking for Go stdlib vulnerabilities pending Go 1.25+
+
+### Removed
+
+- Chunk-level decision system (replaced by file-level diffs)
+- Stale chunk decision integration tests
+
 ## [0.2.0-beta] - 2026-03-01
 
 ### Features

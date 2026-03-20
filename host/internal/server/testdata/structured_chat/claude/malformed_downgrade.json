@@ -1,0 +1,61 @@
+{
+  "fixture_name": "malformed_downgrade",
+  "session_id": "session-claude-1",
+  "steps": [
+    {
+      "label": "user prompt observed",
+      "chunk_observed_at": 1000,
+      "chunks": ["Human: explain the bug\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "explain the bug"
+        }
+      ]
+    },
+    {
+      "label": "assistant response observed",
+      "chunk_observed_at": 2000,
+      "chunks": ["Assistant: reply\n", "\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "explain the bug"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "reply"
+        }
+      ]
+    },
+    {
+      "label": "thinking after assistant is malformed",
+      "chunk_observed_at": 3000,
+      "chunks": ["Thinking: malformed after assistant\n"],
+      "expect_status": "fatal_downgrade"
+    },
+    {
+      "label": "later chunks stay downgraded",
+      "chunk_observed_at": 4000,
+      "chunks": ["Assistant: ignored after downgrade\n"],
+      "expect_status": "fatal_downgrade"
+    }
+  ]
+}

@@ -56,14 +56,6 @@ func (p *Processor) DeleteUntrackedFile(cardID string) error {
 		}
 	}
 
-	// Delete associated chunks from storage (if chunk store configured)
-	if p.chunkStore != nil {
-		if err := p.chunkStore.DeleteChunks(cardID); err != nil {
-			// Log but don't fail - the file was already deleted
-			log.Printf("actions: failed to delete chunks for card %s: %v", cardID, err)
-		}
-	}
-
 	// Delete the card from storage
 	if err := p.store.DeleteCard(cardID); err != nil {
 		// Log but don't fail - the file was already deleted
