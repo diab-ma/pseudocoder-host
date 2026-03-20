@@ -7,9 +7,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/pseudocoder/host/internal/pty"
+	"github.com/pseudocoder/host/internal/storage"
 )
 
 // TestSessionAPIHandler_New tests the POST /api/session/new endpoint.
@@ -85,6 +90,245 @@ func TestSessionAPIHandler_New_DefaultCommand(t *testing.T) {
 
 	if resp.Command != "/bin/sh" {
 		t.Errorf("expected default command '/bin/sh', got %q", resp.Command)
+	}
+
+	mgr.CloseAll()
+}
+
+func TestSessionAPIHandler_New_PersistsStructuredMetadata(t *testing.T) {
+	mgr := pty.NewSessionManager()
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	if err := os.Symlink("/bin/echo", codexPath); err != nil {
+		t.Fatalf("Symlink failed: %v", err)
+	}
+
+	handler := NewSessionAPIHandler(mgr, SessionAPIConfig{
+		HistoryLines: 100,
+		SessionStore: store,
+	})
+
+	reqBody := `{"name":"codex-session","command":"` + codexPath + `","args":["hello"]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/session/new", bytes.NewBufferString(reqBody))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp SessionNewResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	stored, err := store.GetSession(resp.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("expected persisted session record")
+	}
+	info, err := SessionInfoFromStoredSession(stored)
+	if err != nil {
+		t.Fatalf("SessionInfoFromStoredSession failed: %v", err)
+	}
+	if info.SessionKind != SessionKindAgent {
+		t.Fatalf("SessionKind = %q, want agent", info.SessionKind)
+	}
+	if info.AgentProvider != AgentProviderCodex {
+		t.Fatalf("AgentProvider = %q, want codex", info.AgentProvider)
+	}
+	if info.ChatCapabilities == nil || !info.ChatCapabilities.StructuredTimeline {
+		t.Fatalf("ChatCapabilities = %#v, want structured timeline", info.ChatCapabilities)
+	}
+
+	mgr.CloseAll()
+}
+
+func TestSessionAPIHandler_New_ImmediateCodexOutputActivatesStructuredRuntime(t *testing.T) {
+	mgr := pty.NewSessionManager()
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	controller := NewStructuredChatController(store)
+	var (
+		mu        sync.Mutex
+		rawOutput []string
+		broadcast []Message
+	)
+	runtime := NewStructuredChatRuntime(store, controller, func(msg Message) {
+		mu.Lock()
+		defer mu.Unlock()
+		broadcast = append(broadcast, msg)
+	})
+
+	codexPath := filepath.Join(t.TempDir(), "codex")
+	if err := os.Symlink("/bin/sh", codexPath); err != nil {
+		t.Fatalf("Symlink failed: %v", err)
+	}
+
+	handler := NewSessionAPIHandler(mgr, SessionAPIConfig{
+		HistoryLines: 100,
+		SessionStore: store,
+		OnSessionOutput: func(sessionID, line string) {
+			mu.Lock()
+			rawOutput = append(rawOutput, line)
+			mu.Unlock()
+			runtime.ObservePTYOutput(sessionID, line, time.Now().UnixMilli())
+		},
+	})
+
+	reqBody := `{"name":"codex-session","command":"` + codexPath + `","args":["-c","printf 'User: explain the bug\\n'; sleep 1"]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/session/new", bytes.NewBufferString(reqBody))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		gotOutput := len(rawOutput)
+		mu.Unlock()
+		if gotOutput > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	gotOutput := len(rawOutput)
+	mu.Unlock()
+	if gotOutput == 0 {
+		t.Fatal("expected immediate terminal output to be forwarded after activation")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		gotBroadcast := len(broadcast)
+		mu.Unlock()
+		if gotBroadcast > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	gotBroadcast := append([]Message(nil), broadcast...)
+	mu.Unlock()
+	if len(gotBroadcast) == 0 {
+		t.Fatal("expected structured runtime to receive immediate Codex output")
+	}
+	// All providers now use file-based pipelines, so the first broadcast
+	// from ensurePipeline is a chat.snapshot (empty initial snapshot).
+	if gotBroadcast[0].Type != MessageTypeChatSnapshot && gotBroadcast[0].Type != MessageTypeChatUpsert {
+		t.Fatalf("first structured message = %s, want chat.snapshot or chat.upsert", gotBroadcast[0].Type)
+	}
+
+	mgr.CloseAll()
+}
+
+func TestSessionAPIHandler_New_ImmediateGeminiOutputActivatesStructuredRuntime(t *testing.T) {
+	mgr := pty.NewSessionManager()
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	controller := NewStructuredChatController(store)
+	var (
+		mu        sync.Mutex
+		rawOutput []string
+		broadcast []Message
+	)
+	runtime := NewStructuredChatRuntime(store, controller, func(msg Message) {
+		mu.Lock()
+		defer mu.Unlock()
+		broadcast = append(broadcast, msg)
+	})
+
+	geminiPath := filepath.Join(t.TempDir(), "gemini")
+	if err := os.Symlink("/bin/sh", geminiPath); err != nil {
+		t.Fatalf("Symlink failed: %v", err)
+	}
+
+	handler := NewSessionAPIHandler(mgr, SessionAPIConfig{
+		HistoryLines: 100,
+		SessionStore: store,
+		OnSessionOutput: func(sessionID, line string) {
+			mu.Lock()
+			rawOutput = append(rawOutput, line)
+			mu.Unlock()
+			runtime.ObservePTYOutput(sessionID, line, time.Now().UnixMilli())
+		},
+	})
+
+	reqBody := `{"name":"gemini-session","command":"` + geminiPath + `","args":["-c","printf 'User: explain the bug\\n'; sleep 1"]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/session/new", bytes.NewBufferString(reqBody))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		gotOutput := len(rawOutput)
+		mu.Unlock()
+		if gotOutput > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	gotOutput := len(rawOutput)
+	mu.Unlock()
+	if gotOutput == 0 {
+		t.Fatal("expected immediate terminal output to be forwarded after activation")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		gotBroadcast := len(broadcast)
+		mu.Unlock()
+		if gotBroadcast > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	gotBroadcast := append([]Message(nil), broadcast...)
+	mu.Unlock()
+	if len(gotBroadcast) == 0 {
+		t.Fatal("expected structured runtime to receive immediate Gemini output")
+	}
+	// All providers now use file-based pipelines, so the first broadcast
+	// from ensurePipeline is a chat.snapshot (empty initial snapshot).
+	if gotBroadcast[0].Type != MessageTypeChatSnapshot && gotBroadcast[0].Type != MessageTypeChatUpsert {
+		t.Fatalf("first structured message = %s, want chat.snapshot or chat.upsert", gotBroadcast[0].Type)
 	}
 
 	mgr.CloseAll()
@@ -306,9 +550,9 @@ func TestSessionAPIHandler_MethodNotAllowed(t *testing.T) {
 		method string
 		path   string
 	}{
-		{http.MethodGet, "/api/session/new"},      // Should be POST
-		{http.MethodPost, "/api/session/list"},    // Should be GET
-		{http.MethodGet, "/api/session/id/kill"},  // Should be POST
+		{http.MethodGet, "/api/session/new"},       // Should be POST
+		{http.MethodPost, "/api/session/list"},     // Should be GET
+		{http.MethodGet, "/api/session/id/kill"},   // Should be POST
 		{http.MethodGet, "/api/session/id/rename"}, // Should be POST
 	}
 

@@ -40,13 +40,6 @@ const channelBufferSize = 256
 // repository and storage, returning any error that occurred.
 type DecisionHandler func(cardID, action, comment string) error
 
-// ChunkDecisionHandler processes per-chunk decisions from clients.
-// It is called when a client sends a chunk.decision message.
-// The handler should apply the decision to the specific chunk within the card.
-// The contentHash parameter is the hash of the chunk content when the user viewed it.
-// If non-empty, the handler should validate it matches current content before applying.
-type ChunkDecisionHandler func(cardID string, chunkIndex int, action string, contentHash string) error
-
 // DeleteHandler processes file deletion requests from clients.
 // It is called when a client sends a review.delete message for an untracked file.
 // The handler should delete the file from the filesystem and remove the card from storage.
@@ -56,6 +49,33 @@ type DeleteHandler func(cardID string) error
 // It should send terminal history and pending cards to the client.
 // The handler receives a function to send messages directly to the client.
 type ReconnectHandler func(sendToClient func(msg Message))
+
+// StructuredChatController owns persisted structured-chat replay state.
+// It is intentionally narrow so session handlers do not depend on storage details.
+type StructuredChatController interface {
+	LoadSnapshotMessage(sessionID string) (*Message, error)
+	BuildSessionSwitchReset(sessionID string) Message
+	ApplyAuthoritativeTimeline(sessionID string, items []ChatItem) ([]Message, error)
+	MergeProviderTimeline(sessionID string, providerItems []ChatItem) ([]Message, error)
+	NextRevision(sessionID string) (int64, error)
+	ServerBootID() string
+}
+
+// StructuredChatRuntime observes PTY output and emits structured-chat updates.
+type StructuredChatRuntime interface {
+	ObservePTYOutput(sessionID, chunk string, observedAt int64)
+	SeedPrompt(sessionID, text, requestID string, observedAt int64) error
+	RollbackPrompt(sessionID, requestID string) error
+	// StopSession cleans up any JSONL pipeline resources for a closed session.
+	// Called from handleSessionClose to prevent goroutine/file-handle leaks.
+	StopSession(sessionID string)
+}
+
+type sessionPromptState struct {
+	Owner     *Client
+	DeviceID  string
+	RequestID string
+}
 
 // TokenValidator validates authentication tokens for WebSocket connections.
 // Returns the device ID if the token is valid, or an error if not.
@@ -70,13 +90,6 @@ type DeviceActivityTracker func(deviceID string)
 // Returns the restored card for re-emission to clients.
 // Phase 20.2: Enables undo flow from mobile.
 type UndoHandler func(cardID string, confirmed bool) (*UndoResult, error)
-
-// ChunkUndoHandler processes undo requests for chunk-level decisions.
-// It reverses a previous chunk accept/reject decision.
-// Returns the restored chunk info for re-emission to clients.
-// Phase 20.2: Enables per-chunk undo flow from mobile.
-// contentHash is preferred over chunkIndex for stable identity (indices can shift after staging).
-type ChunkUndoHandler func(cardID string, chunkIndex int, contentHash string, confirmed bool) (*UndoResult, error)
 
 // FileReadData holds the metadata returned by a file read operation.
 type FileReadData struct {
@@ -96,12 +109,10 @@ type FileOperations interface {
 	Delete(path string, confirmed bool) (canonPath string, err error)
 }
 
-// UndoResult carries the restored card/chunk information after a successful undo.
+// UndoResult carries the restored card information after a successful undo.
 // This is used to re-emit the card to connected clients.
 type UndoResult struct {
 	CardID       string
-	ChunkIndex   int    // -1 for file-level undo
-	ContentHash  string // Stable chunk identifier (returned for client to clear pending state)
 	File         string
 	Diff         string
 	OriginalDiff string // Full diff for card re-emission
@@ -145,10 +156,6 @@ type Server struct {
 	// If nil, decisions are logged but not processed.
 	decisionHandler DecisionHandler
 
-	// chunkDecisionHandler is called when a client sends a chunk.decision message.
-	// If nil, chunk decisions are logged but not processed.
-	chunkDecisionHandler ChunkDecisionHandler
-
 	// deleteHandler is called when a client sends a review.delete message.
 	// If nil, delete requests are logged but not processed.
 	deleteHandler DeleteHandler
@@ -157,11 +164,6 @@ type Server struct {
 	// If nil, undo requests are logged but not processed.
 	// Phase 20.2: Enables undo flow from mobile.
 	undoHandler UndoHandler
-
-	// chunkUndoHandler is called when a client sends a chunk.undo message.
-	// If nil, chunk undo requests are logged but not processed.
-	// Phase 20.2: Enables per-chunk undo flow from mobile.
-	chunkUndoHandler ChunkUndoHandler
 
 	// reconnectHandler is called when a new client connects to replay history.
 	// If nil, no history is replayed on connect.
@@ -201,6 +203,10 @@ type Server struct {
 	// Phase 6: Enables CLI command approval through mobile app.
 	approvalQueue *ApprovalQueue
 
+	// sessionPromptState tracks the single in-flight structured prompt per session.
+	// It is host-authoritative across all connected clients.
+	sessionPromptState map[string]sessionPromptState
+
 	// approveHandler handles the /approve endpoint for CLI approval requests.
 	// Set via SetApproveHandler.
 	// Phase 6.1b: HTTP endpoint for CLI command approval.
@@ -229,6 +235,21 @@ type Server struct {
 	// sessionStore persists session history for session.list and clear-history operations.
 	// Set via SetSessionStore. If nil, history mutation handlers are rejected.
 	sessionStore storage.SessionStore
+
+	// repoPath is the repository directory path, included in session.created messages.
+	repoPath string
+
+	// structuredChatEnabled gates host-authored structured replay behavior.
+	// When false, reconnect/session-switch replay stays on terminal-only paths.
+	structuredChatEnabled bool
+
+	// structuredChatController owns persisted structured snapshot replay state.
+	// Set via SetStructuredChatController when the rollout gate is enabled.
+	structuredChatController StructuredChatController
+
+	// structuredChatRuntime projects live PTY output into structured chat updates.
+	// Set via SetStructuredChatRuntime when an adapter runtime is available.
+	structuredChatRuntime StructuredChatRuntime
 
 	// metricsStore records rollout metrics (crashes, latency, pairing).
 	// Set via SetMetricsStore. If nil, metrics recording is silently skipped.
@@ -272,7 +293,6 @@ type Server struct {
 	// keepAwakePolicyHandler handles the /api/keep-awake/policy endpoint.
 	// Set via SetKeepAwakePolicyHandler. Phase 18: CLI-driven policy mutation.
 	keepAwakePolicyHandler http.Handler
-
 }
 
 // maxIdempotencyEntries is the maximum number of cached mutation results per client.
@@ -393,6 +413,11 @@ func commitFingerprint(message string, noVerify, noGpgSign, overrideWarnings boo
 func pushFingerprint(remote, branch string, forceWithLease bool) string {
 	return computeFingerprint("push", remote, branch,
 		fmt.Sprintf("%t", forceWithLease))
+}
+
+// chatPromptFingerprint creates a fingerprint for a structured prompt mutation.
+func chatPromptFingerprint(sessionID, text string) string {
+	return computeFingerprint("chat_prompt", sessionID, text)
 }
 
 // fetchFingerprint creates a fingerprint for a fetch operation.
@@ -580,11 +605,10 @@ type Client struct {
 	// Phase 9.3: Multi-session PTY support.
 	//
 	// Threading model:
-	// - Written only by the client's own readPump goroutine (in handleSessionSwitch)
-	// - Read by handleSessionClose when resetting clients viewing a closed session
-	//   (protected by server.mu during iteration over clients map)
-	// - This is safe because writes happen in a single goroutine and reads are
-	//   protected by server.mu when accessing from other goroutines.
+	// - Written by handleSessionSwitch (own readPump) under server.mu
+	// - Read/written by handleSessionClose (other client's readPump) under server.mu
+	//   when resetting clients viewing a closed session
+	// - All accesses protected by server.mu.
 	activeSessionID string
 
 	// mutationCache stores recent file mutation results for idempotent replay.
@@ -608,6 +632,7 @@ func NewServer(addr string) *Server {
 		broadcast:              make(chan Message, channelBufferSize),
 		sessionID:              "session-" + formatTimestamp(time.Now()),
 		createdSessionSequence: 0,
+		sessionPromptState:     make(map[string]sessionPromptState),
 		upgrader: websocket.Upgrader{
 			// Allow connections from any origin during development.
 			// In production with TLS and auth, this is less critical.

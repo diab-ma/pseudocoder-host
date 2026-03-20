@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	// SQLite driver - imported for side effects (registers the driver).
@@ -20,9 +21,6 @@ var ErrCardNotFound = errors.New("card not found")
 // ErrAlreadyDecided is returned when trying to decide a card that is not pending.
 // This ensures atomic decision processing - only one concurrent request can succeed.
 var ErrAlreadyDecided = errors.New("card already has a decision")
-
-// ErrChunkNotFound is returned when a chunk lookup fails.
-var ErrChunkNotFound = errors.New("chunk not found")
 
 // ErrDeviceNotFound is returned when a device lookup fails.
 var ErrDeviceNotFound = errors.New("device not found")
@@ -42,9 +40,6 @@ type SQLiteStore struct {
 type Transaction interface {
 	RecordDecision(decision *Decision) error
 	DeleteCard(id string) error
-	RecordChunkDecision(decision *ChunkDecision) error
-	DeleteChunks(cardID string) error
-	CountPendingChunks(cardID string) (int, error)
 }
 
 // TxStore exposes transaction-scoped storage helpers.
@@ -64,21 +59,6 @@ func (t *TxStore) DeleteCard(id string) error {
 	return t.store.deleteCardTx(t.tx, id)
 }
 
-// RecordChunkDecision updates a chunk's status inside the transaction.
-func (t *TxStore) RecordChunkDecision(decision *ChunkDecision) error {
-	return t.store.recordChunkDecisionTx(t.tx, decision)
-}
-
-// DeleteChunks removes all chunks for a card inside the transaction.
-func (t *TxStore) DeleteChunks(cardID string) error {
-	return t.store.deleteChunksTx(t.tx, cardID)
-}
-
-// CountPendingChunks returns the number of pending chunks inside the transaction.
-func (t *TxStore) CountPendingChunks(cardID string) (int, error) {
-	return t.store.countPendingChunksTx(t.tx, cardID)
-}
-
 // NewSQLiteStore opens or creates a SQLite database at the given path.
 // It initializes the schema if the tables don't exist.
 // The path should be a file path like "/path/to/pseudocoder.db".
@@ -93,6 +73,13 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
+	}
+	if usesInMemorySQLite(path) {
+		// SQLite gives each pooled :memory: connection its own database. Force a
+		// single shared connection so schema and rows remain visible across
+		// concurrent host/runtime calls in tests.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
 	}
 
 	// Verify the connection is working.
@@ -111,6 +98,10 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 
 	log.Printf("storage: database ready (schema version %d)", currentSchemaVersion)
 	return store, nil
+}
+
+func usesInMemorySQLite(path string) bool {
+	return strings.HasPrefix(path, ":memory:")
 }
 
 // Close releases the database connection.

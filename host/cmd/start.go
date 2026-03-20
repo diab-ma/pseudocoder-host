@@ -44,6 +44,7 @@ This command is a convenience wrapper that:
   1. Creates ~/.pseudocoder/config.toml with mobile-ready settings if missing
   2. Starts the host listening on a safe auto-selected address
   3. Enables authentication by default for security
+  4. Enables structured chat in fresh bootstrap configs for agent sessions
 
 Use 'pseudocoder host start' for more control over configuration.
 

@@ -256,15 +256,6 @@ func (s *Server) SetDecisionHandler(handler DecisionHandler) {
 	s.decisionHandler = handler
 }
 
-// SetChunkDecisionHandler sets the callback for processing per-chunk decisions.
-// This should be called before any clients connect. The handler is called
-// when a client sends a chunk.decision message for a specific chunk within a card.
-func (s *Server) SetChunkDecisionHandler(handler ChunkDecisionHandler) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.chunkDecisionHandler = handler
-}
-
 // SetDeleteHandler sets the callback for processing file deletion requests.
 // This should be called before any clients connect. The handler is called
 // when a client sends a review.delete message for an untracked file.
@@ -284,14 +275,18 @@ func (s *Server) SetUndoHandler(handler UndoHandler) {
 	s.undoHandler = handler
 }
 
-// SetChunkUndoHandler sets the callback for processing chunk-level undo requests.
-// The handler is called when a client sends a chunk.undo message.
-// It should reverse the chunk decision and return the restored chunk info.
-// Phase 20.2: Enables per-chunk undo flow from mobile.
-func (s *Server) SetChunkUndoHandler(handler ChunkUndoHandler) {
+// SetRepoPath sets the repository directory path for session metadata.
+func (s *Server) SetRepoPath(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.chunkUndoHandler = handler
+	s.repoPath = path
+}
+
+// RepoPath returns the repository directory path.
+func (s *Server) RepoPath() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.repoPath
 }
 
 // SetReconnectHandler sets the callback for replaying history on client connect.
@@ -370,6 +365,9 @@ func (s *Server) SetApprovalQueue(queue *ApprovalQueue) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.approvalQueue = queue
+	if queue != nil {
+		queue.SetLifecycleHooks(s.projectApprovalRequest, s.projectApprovalDecision)
+	}
 }
 
 // GetApprovalQueue returns the approval queue for external access.
@@ -431,6 +429,28 @@ func (s *Server) SetSessionStore(store storage.SessionStore) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessionStore = store
+}
+
+// SetStructuredChatEnabled controls whether host structured-chat replay is active.
+func (s *Server) SetStructuredChatEnabled(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.structuredChatEnabled = enabled
+}
+
+
+// SetStructuredChatController wires the structured-chat replay controller.
+func (s *Server) SetStructuredChatController(controller StructuredChatController) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.structuredChatController = controller
+}
+
+// SetStructuredChatRuntime wires the live structured-chat runtime seam.
+func (s *Server) SetStructuredChatRuntime(runtime StructuredChatRuntime) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.structuredChatRuntime = runtime
 }
 
 // GetSessionManager returns the session manager for external access.
@@ -515,4 +535,3 @@ func (s *Server) SetMetricsStore(store storage.MetricsStore) {
 	defer s.mu.Unlock()
 	s.metricsStore = store
 }
-

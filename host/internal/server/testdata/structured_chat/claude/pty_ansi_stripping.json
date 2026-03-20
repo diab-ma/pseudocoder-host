@@ -1,0 +1,101 @@
+{
+  "fixture_name": "pty_ansi_stripping",
+  "session_id": "session-claude-ansi",
+  "steps": [
+    {
+      "label": "user prompt via Observe",
+      "chunk_observed_at": 1000,
+      "chunks": ["Human: test\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-ansi",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "test"
+        }
+      ]
+    },
+    {
+      "label": "assistant line with private mode and SGR codes stripped",
+      "chunk_observed_at": 2000,
+      "chunks": ["\u001b[?2026l\u001b[31m\u25cf Hello world\u001b[0m\u001b[?2026h\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-ansi",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "test"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-ansi",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hello world"
+        }
+      ]
+    },
+    {
+      "label": "continuation with bracketed paste tilde and two-char ESC sequences",
+      "chunk_observed_at": 2100,
+      "chunks": ["\u001b[200~More text\u001b[201~\u001b=\u001b>\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-ansi",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "test"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-ansi",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hello world\nMore text"
+        }
+      ]
+    },
+    {
+      "label": "blank line finalizes assistant",
+      "chunk_observed_at": 2200,
+      "chunks": ["\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-ansi",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "test"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-ansi",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "Hello world\nMore text"
+        }
+      ]
+    }
+  ]
+}

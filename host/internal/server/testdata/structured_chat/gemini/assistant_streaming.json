@@ -1,0 +1,101 @@
+{
+  "fixture_name": "assistant_streaming",
+  "session_id": "session-gemini-1",
+  "steps": [
+    {
+      "label": "user prompt observed",
+      "chunk_observed_at": 1000,
+      "chunks": ["User: explain the bug\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        }
+      ]
+    },
+    {
+      "label": "assistant starts streaming",
+      "chunk_observed_at": 1500,
+      "chunks": ["Gemini: first draft\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        },
+        {
+          "id": "gemini-assistant:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "assistant_message",
+          "created_at": 1500,
+          "provider": "gemini",
+          "status": "in_progress",
+          "markdown": "first draft"
+        }
+      ]
+    },
+    {
+      "label": "assistant updates in place with stable created_at",
+      "chunk_observed_at": 1800,
+      "chunks": ["Gemini: first draft with more detail\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        },
+        {
+          "id": "gemini-assistant:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "assistant_message",
+          "created_at": 1500,
+          "provider": "gemini",
+          "status": "in_progress",
+          "markdown": "first draft with more detail"
+        }
+      ]
+    },
+    {
+      "label": "assistant finalizes on blank line",
+      "chunk_observed_at": 2000,
+      "chunks": ["\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        },
+        {
+          "id": "gemini-assistant:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "assistant_message",
+          "created_at": 1500,
+          "provider": "gemini",
+          "status": "completed",
+          "markdown": "first draft with more detail"
+        }
+      ]
+    }
+  ]
+}

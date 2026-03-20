@@ -60,6 +60,7 @@ type HostStartConfig struct {
 	Pair                    bool
 	QR                      bool
 	PairSocket              string
+	StructuredChatV1        bool
 }
 
 type keepAwakeController interface {
@@ -201,6 +202,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	if cfg.PairSocket == "" {
 		cfg.PairSocket = fileCfg.PairSocket
 	}
+	cfg.StructuredChatV1 = fileCfg.StructuredChatV1
 	if cfg.PairSocket == "" {
 		defaultPairSocket, err := config.DefaultPairSocketPath()
 		if err != nil {
@@ -483,6 +485,22 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	}
 
 	wsServer.SetSessionStore(store)
+	wsServer.SetStructuredChatEnabled(cfg.StructuredChatV1)
+
+	var structuredChatController server.StructuredChatController
+	var structuredChatRuntime server.StructuredChatRuntime
+	if cfg.StructuredChatV1 {
+		structuredChatController = server.NewStructuredChatController(store)
+		wsServer.SetStructuredChatController(structuredChatController)
+		// Use os.Getwd() (the default) for JSONL slug derivation — not repoPath.
+		// PTY sessions inherit the host process's cwd, so Claude's project slug
+		// matches the host cwd, which may differ from the configured repo path.
+		structuredChatRuntime = server.NewStructuredChatRuntime(store, structuredChatController, wsServer.Broadcast)
+		wsServer.SetStructuredChatRuntime(structuredChatRuntime)
+		log.Println("Structured chat v1: enabled (Claude uses JSONL pipeline)")
+	} else {
+		log.Println("Structured chat v1: disabled (set structured_chat_v1 = true in config)")
+	}
 
 	// Create and save the current session for history tracking (Unit 6.3a).
 	// This enables mobile clients to see session history and switch contexts.
@@ -494,6 +512,11 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		LastSeen:  time.Now(),
 		Status:    storage.SessionStatusRunning,
 		IsSystem:  true,
+	}
+	if cfg.StructuredChatV1 {
+		if err := server.ApplySessionMetadataToStorage(currentSession, server.ClassifySessionMetadata(sessionCmd, nil, "")); err != nil {
+			fmt.Fprintf(stderr, "Warning: failed to classify session metadata: %v\n", err)
+		}
 	}
 	if err := store.SaveSession(currentSession); err != nil {
 		// Log warning but don't fail - session history is nice-to-have
@@ -612,9 +635,11 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 			// TODO: Route to session-specific clients in Phase 10.
 			wsServer.BroadcastTerminalOutputWithID(sessionID, line)
 		},
+		SessionStore: store,
 	})
 	wsServer.SetSessionAPIHandler(sessionAPIHandler)
 	wsServer.SetSessionManager(sessionManager)
+	wsServer.SetRepoPath(repoPath)
 
 	// Create the tmux manager for session discovery and attachment (Phase 12).
 	// Must be set BEFORE starting the server so API endpoints are registered.
@@ -802,19 +827,12 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 	// Create the action processor for handling accept/reject decisions.
 	// This applies git stage/restore operations based on user decisions.
 	actionProcessor := actions.NewProcessor(store, repoPath)
-	actionProcessor.SetChunkStore(store)
 	actionProcessor.SetDecidedStore(store) // Phase 20: Enable undo support
 
 	// Wire up the decision handler to route decisions from WebSocket clients
 	// to the action processor.
 	wsServer.SetDecisionHandler(func(cardID, action, comment string) error {
 		return actionProcessor.ProcessDecision(cardID, action, comment)
-	})
-
-	// Wire up the chunk decision handler for per-chunk accept/reject.
-	// The contentHash parameter enables stale detection (empty skips validation).
-	wsServer.SetChunkDecisionHandler(func(cardID string, chunkIndex int, action string, contentHash string) error {
-		return actionProcessor.ProcessChunkDecision(cardID, chunkIndex, action, contentHash)
 	})
 
 	// Wire up the delete handler for removing untracked files.
@@ -832,24 +850,8 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 		}
 		return &server.UndoResult{
 			CardID:       card.ID,
-			ChunkIndex:   -1, // File-level undo
 			File:         card.File,
 			Diff:         card.Patch,
-			OriginalDiff: card.OriginalDiff,
-		}, nil
-	})
-
-	wsServer.SetChunkUndoHandler(func(cardID string, chunkIndex int, contentHash string, confirmed bool) (*server.UndoResult, error) {
-		chunk, card, err := actionProcessor.ProcessChunkUndo(cardID, chunkIndex, contentHash, confirmed)
-		if err != nil {
-			return nil, err
-		}
-		return &server.UndoResult{
-			CardID:       card.ID,
-			ChunkIndex:   chunk.ChunkIndex,
-			ContentHash:  chunk.ContentHash, // Return for client to clear pending state
-			File:         card.File,
-			Diff:         chunk.Patch,
 			OriginalDiff: card.OriginalDiff,
 		}, nil
 	})
@@ -930,13 +932,10 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 
 	// Now create the card streamer with all dependencies.
 	cardStreamer = stream.NewCardStreamer(stream.CardStreamerConfig{
-		Poller:                 diffPoller,
-		Store:                  store,
-		ChunkStore:             store, // SQLiteStore implements both CardStore and ChunkStore
-		Broadcaster:            wsServer,
-		SessionID:              wsServer.SessionID(),
-		ChunkGroupingEnabled:   fileCfg.ChunkGroupingEnabled,
-		ChunkGroupingProximity: fileCfg.ChunkGroupingProximity,
+		Poller:      diffPoller,
+		Store:       store,
+		Broadcaster: wsServer,
+		SessionID:   wsServer.SessionID(),
 		OnError: func(err error) {
 			fmt.Fprintf(stderr, "Card streaming error: %v\n", err)
 		},
@@ -1017,28 +1016,52 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 
 	// Set up the reconnect handler now that we have the PTY session and card store.
 	// This handler replays terminal history and pending cards when a client connects.
-		wsServer.SetReconnectHandler(func(sendToClient func(server.Message)) {
-			// Send session list (after session.status was already sent by the server).
-			// This gives mobile clients the session history for context switching.
-			sessions, err := store.ListSessions(20)
+	wsServer.SetReconnectHandler(func(sendToClient func(server.Message)) {
+		// Send session list (after session.status was already sent by the server).
+		// This gives mobile clients the session history for context switching.
+		sessions, err := store.ListSessions(20)
 		if err != nil {
 			fmt.Fprintf(stderr, "Warning: failed to load sessions for reconnect: %v\n", err)
 		} else if len(sessions) > 0 {
 			// Convert storage.Session to server.SessionInfo
 			sessionInfos := make([]server.SessionInfo, len(sessions))
 			for i, s := range sessions {
-				sessionInfos[i] = server.SessionInfo{
-					ID:         s.ID,
-					Repo:       s.Repo,
-					Branch:     s.Branch,
-					StartedAt:  s.StartedAt.UnixMilli(),
-					LastSeen:   s.LastSeen.UnixMilli(),
-					LastCommit: s.LastCommit,
-					Status:     string(s.Status),
-					IsSystem:   s.IsSystem,
+				info, err := server.SessionInfoFromStoredSession(s)
+				if err != nil {
+					fmt.Fprintf(stderr, "Warning: failed to decode session metadata for %s: %v\n", s.ID, err)
+					info = server.SessionInfo{
+						ID:         s.ID,
+						Repo:       s.Repo,
+						Branch:     s.Branch,
+						StartedAt:  s.StartedAt.UnixMilli(),
+						LastSeen:   s.LastSeen.UnixMilli(),
+						LastCommit: s.LastCommit,
+						Status:     string(s.Status),
+						IsSystem:   s.IsSystem,
+					}
 				}
+				sessionInfos[i] = info
 			}
 			sendToClient(server.NewSessionListMessage(sessionInfos))
+		}
+
+		if structuredChatController != nil {
+			storedSession, err := store.GetSession(wsServer.SessionID())
+			if err != nil {
+				fmt.Fprintf(stderr, "Warning: failed to load session metadata for structured reconnect: %v\n", err)
+			} else if storedSession != nil {
+				info, err := server.SessionInfoFromStoredSession(storedSession)
+				if err != nil {
+					fmt.Fprintf(stderr, "Warning: failed to decode structured reconnect metadata: %v\n", err)
+				} else if info.ChatCapabilities != nil && info.ChatCapabilities.StructuredTimeline {
+					snapshotMsg, err := structuredChatController.LoadSnapshotMessage(wsServer.SessionID())
+					if err != nil {
+						fmt.Fprintf(stderr, "Warning: failed to load structured chat snapshot for reconnect: %v\n", err)
+					} else if snapshotMsg != nil {
+						sendToClient(*snapshotMsg)
+					}
+				}
+			}
 		}
 
 		// Replay terminal history from the ring buffer.
@@ -1061,12 +1084,7 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "Warning: failed to load pending cards for reconnect: %v\n", err)
 		} else {
 			for _, card := range pendingCards {
-				sendToClient(buildReconnectDiffCardMessage(
-					card,
-					fileCfg.ChunkGroupingEnabled,
-					fileCfg.ChunkGroupingProximity,
-					cardStreamer.ReconcileChunksForCard,
-				))
+				sendToClient(buildReconnectDiffCardMessage(card))
 			}
 		}
 	})
@@ -1125,37 +1143,13 @@ func runHostStart(args []string, stdout, stderr io.Writer) int {
 
 // buildReconnectDiffCardMessage rebuilds one pending card into a diff.card message
 // for reconnect replay, including semantic enrichment and summary metadata.
-// The reconcile callback is optional and is used to refresh chunk rows in storage.
-func buildReconnectDiffCardMessage(
-	card *storage.ReviewCard,
-	chunkGroupingEnabled bool,
-	chunkGroupingProximity int,
-	reconcile func(cardID string, chunks []stream.ChunkInfo),
-) server.Message {
+func buildReconnectDiffCardMessage(card *storage.ReviewCard) server.Message {
 	isBinary := card.Diff == diff.BinaryDiffPlaceholder
 
-	var serverChunks []server.ChunkInfo
-	var serverChunkGroups []server.ChunkGroupInfo
 	var serverSemanticGroups []server.SemanticGroupInfo
 	var stats *server.DiffStats
 
 	if !isBinary {
-		chunks := stream.ParseChunkInfoFromDiff(card.Diff)
-
-		if chunkGroupingEnabled && len(chunks) > 0 {
-			proximity := chunkGroupingProximity
-			if proximity <= 0 {
-				proximity = 20
-			}
-			groups, groupedChunks := stream.GroupChunksByProximity(chunks, proximity)
-			chunks = groupedChunks
-			serverChunkGroups = mapStreamChunkGroupsToServer(groups)
-		}
-
-		if reconcile != nil {
-			reconcile(card.ID, chunks)
-		}
-
 		diffStats := diff.CalculateDiffStats(card.Diff)
 		stats = &server.DiffStats{
 			ByteSize:     diffStats.ByteSize,
@@ -1163,73 +1157,24 @@ func buildReconnectDiffCardMessage(
 			AddedLines:   diffStats.AddedLines,
 			DeletedLines: diffStats.DeletedLines,
 		}
-
-		// Deleted cards are represented by zero added lines and at least one deletion.
-		isDeletedLocal := stats.AddedLines == 0 && stats.DeletedLines > 0
-		enrichedChunks, semGroups := stream.EnrichChunksWithSemantics(card.ID, card.File, chunks, false, isDeletedLocal)
-
-		serverChunks = mapStreamChunksToServer(enrichedChunks)
-		serverSemanticGroups = mapStreamSemanticGroupsToServer(semGroups)
-	} else {
-		// Binary cards have no chunk list, but still need semantic_groups parity.
-		_, semGroups := stream.EnrichChunksWithSemantics(card.ID, card.File, nil, true, false)
-		serverSemanticGroups = mapStreamSemanticGroupsToServer(semGroups)
 	}
 
 	isDeleted := stats != nil && stats.AddedLines == 0 && stats.DeletedLines > 0
+
+	// Semantic enrichment (non-blocking).
+	semGroups := stream.EnrichFileWithSemantics(card.ID, card.File, card.Diff, isBinary, isDeleted)
+	serverSemanticGroups = mapStreamSemanticGroupsToServer(semGroups)
+
 	return server.NewDiffCardMessage(
 		card.ID,
 		card.File,
 		card.Diff,
-		serverChunks,
-		serverChunkGroups,
 		serverSemanticGroups,
 		isBinary,
 		isDeleted,
 		stats,
 		card.CreatedAt.UnixMilli(),
 	)
-}
-
-func mapStreamChunksToServer(chunks []stream.ChunkInfo) []server.ChunkInfo {
-	if len(chunks) == 0 {
-		return nil
-	}
-	serverChunks := make([]server.ChunkInfo, len(chunks))
-	for i, h := range chunks {
-		serverChunks[i] = server.ChunkInfo{
-			Index:           h.Index,
-			OldStart:        h.OldStart,
-			OldCount:        h.OldCount,
-			NewStart:        h.NewStart,
-			NewCount:        h.NewCount,
-			Offset:          h.Offset,
-			Length:          h.Length,
-			Content:         h.Content,
-			ContentHash:     h.ContentHash,
-			GroupIndex:      h.GroupIndex,
-			SemanticKind:    h.SemanticKind,
-			SemanticLabel:   h.SemanticLabel,
-			SemanticGroupID: h.SemanticGroupID,
-		}
-	}
-	return serverChunks
-}
-
-func mapStreamChunkGroupsToServer(groups []stream.ChunkGroupInfo) []server.ChunkGroupInfo {
-	if len(groups) == 0 {
-		return nil
-	}
-	serverGroups := make([]server.ChunkGroupInfo, len(groups))
-	for i, g := range groups {
-		serverGroups[i] = server.ChunkGroupInfo{
-			GroupIndex: g.GroupIndex,
-			LineStart:  g.LineStart,
-			LineEnd:    g.LineEnd,
-			ChunkCount: g.ChunkCount,
-		}
-	}
-	return serverGroups
 }
 
 func mapStreamSemanticGroupsToServer(groups []stream.SemanticGroupInfo) []server.SemanticGroupInfo {

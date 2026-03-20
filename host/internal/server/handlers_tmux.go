@@ -107,8 +107,7 @@ func (c *Client) handleTmuxAttach(data []byte) {
 	cfg := pty.SessionConfig{
 		HistoryLines: 5000, // Default history size
 		OnOutputWithID: func(sessionID, line string) {
-			// Broadcast terminal output to all clients with session ID
-			c.server.Broadcast(NewTerminalAppendMessage(sessionID, line))
+			c.server.BroadcastTerminalOutputWithID(sessionID, line)
 		},
 	}
 

@@ -2,6 +2,7 @@ package server
 
 import (
 	"log"
+	"time"
 
 	// Stream package provides CardBroadcaster types for streaming diff cards.
 	"github.com/pseudocoder/host/internal/stream"
@@ -36,6 +37,7 @@ func (s *Server) Broadcast(msg Message) {
 // This is the main method called from the PTY session's OnOutput callback.
 func (s *Server) BroadcastTerminalOutput(chunk string) {
 	s.Broadcast(NewTerminalAppendMessage(s.sessionID, chunk))
+	s.observeStructuredChatOutput(s.sessionID, chunk)
 }
 
 // BroadcastTerminalOutputWithID sends a terminal output chunk with an explicit session ID.
@@ -43,25 +45,32 @@ func (s *Server) BroadcastTerminalOutput(chunk string) {
 // Phase 9.5: Multi-session terminal output broadcasting.
 func (s *Server) BroadcastTerminalOutputWithID(sessionID, chunk string) {
 	s.Broadcast(NewTerminalAppendMessage(sessionID, chunk))
+	s.observeStructuredChatOutput(sessionID, chunk)
+}
+
+func (s *Server) observeStructuredChatOutput(sessionID, chunk string) {
+	s.mu.RLock()
+	runtime := s.structuredChatRuntime
+	s.mu.RUnlock()
+	if runtime == nil {
+		return
+	}
+	runtime.ObservePTYOutput(sessionID, chunk, time.Now().UnixMilli())
 }
 
 // BroadcastDiffCard sends a review card to all connected clients.
-// This is called when the diff poller detects new or changed chunks.
+// This is called when the diff poller detects new or changed file diffs.
 // The card is sent as a diff.card message per the WebSocket protocol.
-// The chunks parameter provides per-chunk metadata for granular decisions.
-// The chunkGroups parameter provides proximity grouping metadata (nil when disabled).
 // The semanticGroups parameter provides semantic grouping metadata (nil when disabled).
-// The isBinary flag indicates per-chunk actions should be disabled.
+// The isBinary flag indicates this is a binary file (file-level actions only).
 // The isDeleted flag indicates this is a file deletion (use file-level actions).
 // The stats parameter provides size metrics for large diff warnings.
-func (s *Server) BroadcastDiffCard(cardID, file, diff string, chunks []stream.ChunkInfo, chunkGroups []stream.ChunkGroupInfo, semanticGroups []stream.SemanticGroupInfo, isBinary, isDeleted bool, stats *stream.DiffStats, createdAt int64) {
+func (s *Server) BroadcastDiffCard(cardID, file, diff string, semanticGroups []stream.SemanticGroupInfo, isBinary, isDeleted bool, stats *stream.DiffStats, createdAt int64) {
 	// Convert stream types to server types using dedicated mappers
-	serverChunks := mapChunksToServer(chunks)
-	serverChunkGroups := mapChunkGroupsToServer(chunkGroups)
 	serverSemanticGroups := mapSemanticGroupsToServer(semanticGroups)
 	serverStats := mapStatsToServer(stats)
 
-	s.Broadcast(NewDiffCardMessage(cardID, file, diff, serverChunks, serverChunkGroups, serverSemanticGroups, isBinary, isDeleted, serverStats, createdAt))
+	s.Broadcast(NewDiffCardMessage(cardID, file, diff, serverSemanticGroups, isBinary, isDeleted, serverStats, createdAt))
 }
 
 // BroadcastCardRemoved notifies clients that a card was removed.

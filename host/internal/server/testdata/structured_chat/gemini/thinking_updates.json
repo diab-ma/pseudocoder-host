@@ -1,0 +1,145 @@
+{
+  "fixture_name": "thinking_updates",
+  "session_id": "session-gemini-1",
+  "steps": [
+    {
+      "label": "user prompt observed",
+      "chunk_observed_at": 1000,
+      "chunks": ["User: explain the bug\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        }
+      ]
+    },
+    {
+      "label": "thinking starts",
+      "chunk_observed_at": 1500,
+      "chunks": ["Thinking: first pass\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        },
+        {
+          "id": "gemini-thinking:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "thinking",
+          "created_at": 1500,
+          "provider": "gemini",
+          "status": "in_progress",
+          "text": "first pass"
+        }
+      ]
+    },
+    {
+      "label": "thinking updates in place with stable created_at",
+      "chunk_observed_at": 1800,
+      "chunks": ["Thinking: first pass with more detail\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        },
+        {
+          "id": "gemini-thinking:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "thinking",
+          "created_at": 1500,
+          "provider": "gemini",
+          "status": "in_progress",
+          "text": "first pass with more detail"
+        }
+      ]
+    },
+    {
+      "label": "assistant starts streaming and thinking becomes completed",
+      "chunk_observed_at": 2200,
+      "chunks": ["Gemini: here is the fix\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        },
+        {
+          "id": "gemini-thinking:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "thinking",
+          "created_at": 1500,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "first pass with more detail"
+        },
+        {
+          "id": "gemini-assistant:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "assistant_message",
+          "created_at": 2200,
+          "provider": "gemini",
+          "status": "in_progress",
+          "markdown": "here is the fix"
+        }
+      ]
+    },
+    {
+      "label": "assistant updates with stable created_at and finalizes",
+      "chunk_observed_at": 2400,
+      "chunks": ["Gemini: here is the fix with more detail\n", "\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        },
+        {
+          "id": "gemini-thinking:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "thinking",
+          "created_at": 1500,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "first pass with more detail"
+        },
+        {
+          "id": "gemini-assistant:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "assistant_message",
+          "created_at": 2200,
+          "provider": "gemini",
+          "status": "completed",
+          "markdown": "here is the fix with more detail"
+        }
+      ]
+    }
+  ]
+}

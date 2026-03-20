@@ -889,6 +889,147 @@ func TestPrependToBuffer_BlankLinesInMiddle(t *testing.T) {
 	}
 }
 
+// =============================================================================
+// PTY Environment & Initial Size Tests
+// =============================================================================
+
+// TestStart_SetsTermEnv verifies the spawned process sees TERM=xterm-256color.
+func TestStart_SetsTermEnv(t *testing.T) {
+	var mu sync.Mutex
+	var receivedChunks []string
+
+	s := NewSession(SessionConfig{
+		OnOutput: func(chunk string) {
+			mu.Lock()
+			receivedChunks = append(receivedChunks, chunk)
+			mu.Unlock()
+		},
+	})
+
+	if err := s.Start("/bin/sh", "-c", "echo $TERM"); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	waitDone(t, s)
+
+	mu.Lock()
+	combined := normalizeNewlines(strings.Join(receivedChunks, ""))
+	mu.Unlock()
+
+	if !strings.Contains(combined, "xterm-256color") {
+		t.Errorf("expected TERM=xterm-256color in output, got %q", combined)
+	}
+}
+
+// TestStart_SetsColortermEnv verifies the spawned process sees COLORTERM=truecolor.
+func TestStart_SetsColortermEnv(t *testing.T) {
+	var mu sync.Mutex
+	var receivedChunks []string
+
+	s := NewSession(SessionConfig{
+		OnOutput: func(chunk string) {
+			mu.Lock()
+			receivedChunks = append(receivedChunks, chunk)
+			mu.Unlock()
+		},
+	})
+
+	if err := s.Start("/bin/sh", "-c", "echo $COLORTERM"); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	waitDone(t, s)
+
+	mu.Lock()
+	combined := normalizeNewlines(strings.Join(receivedChunks, ""))
+	mu.Unlock()
+
+	if !strings.Contains(combined, "truecolor") {
+		t.Errorf("expected COLORTERM=truecolor in output, got %q", combined)
+	}
+}
+
+// TestStart_InitialPTYSize verifies the initial PTY size is 80x24.
+func TestStart_InitialPTYSize(t *testing.T) {
+	var mu sync.Mutex
+	var receivedChunks []string
+
+	s := NewSession(SessionConfig{
+		OnOutput: func(chunk string) {
+			mu.Lock()
+			receivedChunks = append(receivedChunks, chunk)
+			mu.Unlock()
+		},
+	})
+
+	if err := s.Start("/bin/sh", "-c", "stty size"); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	waitDone(t, s)
+
+	mu.Lock()
+	combined := normalizeNewlines(strings.Join(receivedChunks, ""))
+	mu.Unlock()
+
+	// stty size outputs "rows cols", so we expect "24 80"
+	if !strings.Contains(combined, "24 80") {
+		t.Errorf("expected initial PTY size '24 80', got %q", combined)
+	}
+}
+
+// TestStart_ResizeOverridesInitialSize verifies that Resize() overrides the default 80x24.
+func TestStart_ResizeOverridesInitialSize(t *testing.T) {
+	var mu sync.Mutex
+	var receivedChunks []string
+
+	s := NewSession(SessionConfig{
+		OnOutput: func(chunk string) {
+			mu.Lock()
+			receivedChunks = append(receivedChunks, chunk)
+			mu.Unlock()
+		},
+	})
+
+	if err := s.Start("/bin/sh"); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Override the initial size
+	if err := s.Resize(120, 40); err != nil {
+		t.Fatalf("Resize failed: %v", err)
+	}
+
+	// Give the shell time to process the SIGWINCH
+	time.Sleep(50 * time.Millisecond)
+
+	// Clear previous output
+	mu.Lock()
+	receivedChunks = nil
+	mu.Unlock()
+
+	// Query the new size
+	if _, err := s.Write([]byte("stty size\n")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// Wait for output
+	time.Sleep(200 * time.Millisecond)
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	waitDone(t, s)
+
+	mu.Lock()
+	combined := normalizeNewlines(strings.Join(receivedChunks, ""))
+	mu.Unlock()
+
+	if !strings.Contains(combined, "40 120") {
+		t.Errorf("expected resized PTY size '40 120', got %q", combined)
+	}
+}
+
 // TestPrependToBuffer_WithTerminalOutput verifies prepended content appears before PTY output.
 func TestPrependToBuffer_WithTerminalOutput(t *testing.T) {
 	s := NewSession(SessionConfig{HistoryLines: 100})

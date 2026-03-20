@@ -232,32 +232,6 @@ func (c *Client) handleRepoCommit(data []byte) {
 			}
 		}
 
-		// Mark any accepted chunks as committed.
-		allCards, allErr := decidedStore.ListAllDecidedCards()
-		if allErr != nil {
-			log.Printf("repo.commit: failed to list all decided cards for chunk processing: %v", allErr)
-		} else {
-			for _, card := range allCards {
-				chunks, chunkErr := decidedStore.GetDecidedChunks(card.ID)
-				if chunkErr != nil {
-					log.Printf("repo.commit: failed to get chunks for card %s: %v", card.ID, chunkErr)
-					continue
-				}
-
-				var acceptedIndexes []int
-				for _, chunk := range chunks {
-					if chunk.Status == storage.CardAccepted {
-						acceptedIndexes = append(acceptedIndexes, chunk.ChunkIndex)
-					}
-				}
-
-				if len(acceptedIndexes) > 0 {
-					if markErr := decidedStore.MarkChunksCommitted(card.ID, acceptedIndexes, hash); markErr != nil {
-						log.Printf("repo.commit: failed to mark chunks as committed for card %s: %v", card.ID, markErr)
-					}
-				}
-			}
-		}
 	}
 
 	// 6. Requester-only success

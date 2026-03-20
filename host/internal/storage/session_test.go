@@ -320,6 +320,316 @@ func TestSessionRetention(t *testing.T) {
 	}
 }
 
+func TestSessionRetentionDeletesStructuredSnapshots(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	baseTime := time.Now().UTC().Truncate(time.Millisecond)
+	for i := 0; i < 25; i++ {
+		sessionID := "session-" + itoa(i)
+		session := &Session{
+			ID:        sessionID,
+			Repo:      "/path/to/repo",
+			Branch:    "main",
+			StartedAt: baseTime.Add(time.Duration(i) * time.Minute),
+			LastSeen:  baseTime.Add(time.Duration(i) * time.Minute),
+			Status:    SessionStatusRunning,
+		}
+		if err := store.SaveSession(session); err != nil {
+			t.Fatalf("SaveSession(%s) failed: %v", sessionID, err)
+		}
+		if err := store.ReplaceStructuredChatSnapshot(&StructuredChatSnapshot{
+			SessionID: sessionID,
+			Revision:  1,
+			UpdatedAt: baseTime.Add(time.Duration(i) * time.Minute),
+			Items: []StructuredChatStoredItem{
+				testStructuredChatStoredItem(sessionID, "item-"+itoa(i), int64(i+1), baseTime.Add(time.Duration(i)*time.Minute)),
+			},
+		}); err != nil {
+			t.Fatalf("ReplaceStructuredChatSnapshot(%s) failed: %v", sessionID, err)
+		}
+	}
+
+	for i := 0; i < 5; i++ {
+		if snapshot, err := store.LoadStructuredChatSnapshot("session-" + itoa(i)); err != nil {
+			t.Fatalf("LoadStructuredChatSnapshot(session-%d) failed: %v", i, err)
+		} else if snapshot != nil {
+			t.Fatalf("session-%d snapshot should be deleted by retention", i)
+		}
+	}
+
+	for i := 5; i < 25; i++ {
+		if snapshot, err := store.LoadStructuredChatSnapshot("session-" + itoa(i)); err != nil {
+			t.Fatalf("LoadStructuredChatSnapshot(session-%d) failed: %v", i, err)
+		} else if snapshot == nil {
+			t.Fatalf("session-%d snapshot should be retained", i)
+		}
+	}
+}
+
+func TestClearArchivedSessionsDeletesStructuredSnapshots(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	sessions := []*Session{
+		{
+			ID:        "running-session",
+			Repo:      "/repo",
+			Branch:    "main",
+			StartedAt: now,
+			LastSeen:  now,
+			Status:    SessionStatusRunning,
+		},
+		{
+			ID:        "archived-session",
+			Repo:      "/repo",
+			Branch:    "main",
+			StartedAt: now.Add(time.Second),
+			LastSeen:  now.Add(time.Second),
+			Status:    SessionStatusComplete,
+		},
+		{
+			ID:        "system-archived",
+			Repo:      "/repo",
+			Branch:    "main",
+			StartedAt: now.Add(2 * time.Second),
+			LastSeen:  now.Add(2 * time.Second),
+			Status:    SessionStatusError,
+			IsSystem:  true,
+		},
+	}
+	for _, session := range sessions {
+		if err := store.SaveSession(session); err != nil {
+			t.Fatalf("SaveSession(%s) failed: %v", session.ID, err)
+		}
+	}
+
+	for _, sessionID := range []string{"running-session", "archived-session", "system-archived"} {
+		if err := store.ReplaceStructuredChatSnapshot(&StructuredChatSnapshot{
+			SessionID: sessionID,
+			Revision:  1,
+			UpdatedAt: now,
+			Items: []StructuredChatStoredItem{
+				testStructuredChatStoredItem(sessionID, "item-"+sessionID, 1, now),
+			},
+		}); err != nil {
+			t.Fatalf("ReplaceStructuredChatSnapshot(%s) failed: %v", sessionID, err)
+		}
+	}
+
+	deleted, err := store.ClearArchivedSessions()
+	if err != nil {
+		t.Fatalf("ClearArchivedSessions failed: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+
+	if snapshot, err := store.LoadStructuredChatSnapshot("archived-session"); err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot(archived-session) failed: %v", err)
+	} else if snapshot != nil {
+		t.Fatal("archived-session snapshot should be deleted")
+	}
+
+	if snapshot, err := store.LoadStructuredChatSnapshot("running-session"); err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot(running-session) failed: %v", err)
+	} else if snapshot == nil {
+		t.Fatal("running-session snapshot should remain")
+	}
+
+	if snapshot, err := store.LoadStructuredChatSnapshot("system-archived"); err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot(system-archived) failed: %v", err)
+	} else if snapshot == nil {
+		t.Fatal("system-archived snapshot should remain")
+	}
+}
+
+func TestSessionStructuredChatMetadataRoundTrip(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	session := &Session{
+		ID:                   "session-codex",
+		Repo:                 "/repo",
+		Branch:               "main",
+		StartedAt:            now,
+		LastSeen:             now,
+		Status:               SessionStatusRunning,
+		SessionKind:          "agent",
+		AgentProvider:        "codex",
+		ChatCapabilitiesJSON: `{"structured_timeline":true,"markdown":true,"tool_cards":false,"approval_inline":false,"transcript_fallback":true,"default_view":"chat"}`,
+	}
+
+	if err := store.SaveSession(session); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+
+	got, err := store.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetSession returned nil")
+	}
+	if got.SessionKind != "agent" {
+		t.Fatalf("SessionKind = %q, want agent", got.SessionKind)
+	}
+	if got.AgentProvider != "codex" {
+		t.Fatalf("AgentProvider = %q, want codex", got.AgentProvider)
+	}
+	if got.ChatCapabilitiesJSON != session.ChatCapabilitiesJSON {
+		t.Fatalf("ChatCapabilitiesJSON = %q, want %q", got.ChatCapabilitiesJSON, session.ChatCapabilitiesJSON)
+	}
+
+	sessions, err := store.ListSessions(10)
+	if err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("len(ListSessions) = %d, want 1", len(sessions))
+	}
+	if sessions[0].SessionKind != "agent" || sessions[0].AgentProvider != "codex" {
+		t.Fatalf("ListSessions metadata = (%q,%q), want (agent,codex)", sessions[0].SessionKind, sessions[0].AgentProvider)
+	}
+}
+
+func TestSessionStructuredChatMetadataLegacyDefaults(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if err := store.SaveSession(&Session{
+		ID:        "legacy-session",
+		Repo:      "/repo",
+		Branch:    "main",
+		StartedAt: now,
+		LastSeen:  now,
+		Status:    SessionStatusRunning,
+	}); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+
+	got, err := store.GetSession("legacy-session")
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetSession returned nil")
+	}
+	if got.SessionKind != "" {
+		t.Fatalf("SessionKind = %q, want empty", got.SessionKind)
+	}
+	if got.AgentProvider != "" {
+		t.Fatalf("AgentProvider = %q, want empty", got.AgentProvider)
+	}
+	if got.ChatCapabilitiesJSON != "" {
+		t.Fatalf("ChatCapabilitiesJSON = %q, want empty", got.ChatCapabilitiesJSON)
+	}
+}
+
+func TestSessionStructuredChatDowngradeMetadataPersists(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	session := &Session{
+		ID:                   "session-downgrade",
+		Repo:                 "/repo",
+		Branch:               "main",
+		StartedAt:            now,
+		LastSeen:             now,
+		Status:               SessionStatusRunning,
+		SessionKind:          "agent",
+		AgentProvider:        "codex",
+		ChatCapabilitiesJSON: `{"structured_timeline":false,"markdown":false,"tool_cards":false,"approval_inline":false,"transcript_fallback":true,"default_view":"terminal"}`,
+	}
+
+	if err := store.SaveSession(session); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+
+	got, err := store.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetSession returned nil")
+	}
+	if got.ChatCapabilitiesJSON != session.ChatCapabilitiesJSON {
+		t.Fatalf("ChatCapabilitiesJSON = %q, want %q", got.ChatCapabilitiesJSON, session.ChatCapabilitiesJSON)
+	}
+}
+
+func TestSessionStructuredChatGeminiMetadataRoundTrip(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	session := &Session{
+		ID:                   "session-gemini",
+		Repo:                 "/repo",
+		Branch:               "main",
+		StartedAt:            now,
+		LastSeen:             now,
+		Status:               SessionStatusRunning,
+		SessionKind:          "agent",
+		AgentProvider:        "gemini",
+		ChatCapabilitiesJSON: `{"structured_timeline":true,"markdown":true,"tool_cards":false,"approval_inline":false,"transcript_fallback":true,"default_view":"chat"}`,
+	}
+
+	if err := store.SaveSession(session); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+
+	got, err := store.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetSession returned nil")
+	}
+	if got.SessionKind != "agent" {
+		t.Fatalf("SessionKind = %q, want agent", got.SessionKind)
+	}
+	if got.AgentProvider != "gemini" {
+		t.Fatalf("AgentProvider = %q, want gemini", got.AgentProvider)
+	}
+	if got.ChatCapabilitiesJSON != session.ChatCapabilitiesJSON {
+		t.Fatalf("ChatCapabilitiesJSON = %q, want %q", got.ChatCapabilitiesJSON, session.ChatCapabilitiesJSON)
+	}
+
+	sessions, err := store.ListSessions(10)
+	if err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("len(ListSessions) = %d, want 1", len(sessions))
+	}
+	if sessions[0].SessionKind != "agent" || sessions[0].AgentProvider != "gemini" {
+		t.Fatalf("ListSessions metadata = (%q,%q), want (agent,gemini)", sessions[0].SessionKind, sessions[0].AgentProvider)
+	}
+}
+
 // TestUpdateSessionLastSeen verifies that last_seen can be updated.
 func TestUpdateSessionLastSeen(t *testing.T) {
 	store, err := NewSQLiteStore(":memory:")

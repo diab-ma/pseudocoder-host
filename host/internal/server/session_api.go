@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/pseudocoder/host/internal/pty"
+	"github.com/pseudocoder/host/internal/storage"
 )
 
 // MaxSessionNameLength is the maximum allowed length for session names.
@@ -96,6 +97,9 @@ type SessionAPIConfig struct {
 	// OnSessionOutput is called for each line of session output.
 	// The callback receives the session ID and the output line.
 	OnSessionOutput func(sessionID, line string)
+
+	// SessionStore persists authored sessions when session history is enabled.
+	SessionStore storage.SessionStore
 }
 
 // SessionAPIHandler handles HTTP requests for session management.
@@ -191,10 +195,11 @@ func (h *SessionAPIHandler) handleNew(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create the session.
+	outputGate := newSessionOutputGate(h.config.OnSessionOutput)
 	session, err := h.manager.Create(pty.SessionConfig{
 		Name:           req.Name,
 		HistoryLines:   h.config.HistoryLines,
-		OnOutputWithID: h.config.OnSessionOutput,
+		OnOutputWithID: outputGate.Callback,
 	})
 	if err != nil {
 		if err == pty.ErrMaxSessionsReached {
@@ -213,6 +218,15 @@ func (h *SessionAPIHandler) handleNew(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, "Failed to start session: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	startedAt := time.Now()
+	if err := persistSessionRecord(h.config.SessionStore, session.ID, command, args, startedAt); err != nil {
+		outputGate.Drop()
+		_ = h.manager.Close(session.ID)
+		writeJSONError(w, "Failed to persist session metadata: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	outputGate.Activate()
 
 	// Return success response.
 	resp := SessionNewResponse{

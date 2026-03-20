@@ -434,6 +434,347 @@ func TestApprovalQueue_NilBroadcaster(t *testing.T) {
 	// Test passes if no panic occurred
 }
 
+func TestStructuredChatApprovalProjectionPendingDecisionAndTimeout(t *testing.T) {
+	s := NewServer(":0")
+	store := newStructuredRuntimeSessionStoreForSession(t, s.SessionID(), ClassifySessionMetadata("codex", nil, ""))
+	defer store.Close()
+	s.SetSessionStore(store)
+	s.SetStructuredChatEnabled(true)
+	controller := NewStructuredChatController(store)
+	s.SetStructuredChatController(controller)
+
+	queue := NewApprovalQueue(500*time.Millisecond, nil)
+	s.SetApprovalQueue(queue)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := queue.Queue(ctx, ApprovalRequest{
+			RequestID: "approval-1",
+			Command:   "rg TODO",
+			Rationale: "search repo",
+		})
+		resultCh <- err
+	}()
+
+	var pending *storage.StructuredChatSnapshot
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := store.LoadStructuredChatSnapshot(s.SessionID())
+		if err != nil {
+			t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+		}
+		if snapshot != nil && len(snapshot.Items) == 1 {
+			pending = snapshot
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pending == nil {
+		t.Fatal("expected pending approval snapshot")
+	}
+	items, err := decodeStoredChatItems(pending.Items)
+	if err != nil {
+		t.Fatalf("decodeStoredChatItems failed: %v", err)
+	}
+	if items[0].Decision != "" || items[0].Status != ChatItemStatusPending {
+		t.Fatalf("pending item = %#v, want decision empty and pending status", items[0])
+	}
+
+	if err := queue.DecideWithDevice("approval-1", "approve", nil, "device-1"); err != nil {
+		t.Fatalf("DecideWithDevice failed: %v", err)
+	}
+	if err := <-resultCh; err != nil {
+		t.Fatalf("Queue returned err = %v, want nil", err)
+	}
+
+	approved, err := store.LoadStructuredChatSnapshot(s.SessionID())
+	if err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+	}
+	items, err = decodeStoredChatItems(approved.Items)
+	if err != nil {
+		t.Fatalf("decodeStoredChatItems failed: %v", err)
+	}
+	if items[0].Decision != "approve" || items[0].Status != ChatItemStatusCompleted {
+		t.Fatalf("approved item = %#v, want approve/completed", items[0])
+	}
+
+	timeoutQueue := NewApprovalQueue(50*time.Millisecond, nil)
+	s.SetApprovalQueue(timeoutQueue)
+	timeoutErrCh := make(chan error, 1)
+	go func() {
+		_, err := timeoutQueue.Queue(ctx, ApprovalRequest{
+			RequestID: "approval-2",
+			Command:   "rm tmp.txt",
+			Rationale: "cleanup",
+		})
+		timeoutErrCh <- err
+	}()
+	err = <-timeoutErrCh
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("timeout err = %v, want approval timeout", err)
+	}
+
+	timedOut, err := store.LoadStructuredChatSnapshot(s.SessionID())
+	if err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+	}
+	items, err = decodeStoredChatItems(timedOut.Items)
+	if err != nil {
+		t.Fatalf("decodeStoredChatItems failed: %v", err)
+	}
+	foundDenied := false
+	for _, item := range items {
+		if item.ApprovalRequestID == "approval-2" {
+			foundDenied = true
+			if item.Decision != "deny" || item.Status != ChatItemStatusFailed {
+				t.Fatalf("timed out item = %#v, want deny/failed", item)
+			}
+		}
+	}
+	if !foundDenied {
+		t.Fatal("expected timed out approval item")
+	}
+}
+
+func TestStructuredChatApprovalProjectionSkipsWhenPrimarySessionIsNotStructured(t *testing.T) {
+	s := NewServer(":0")
+	store := newStructuredRuntimeSessionStoreForSession(t, s.SessionID(), SessionInfo{
+		SessionKind:   SessionKindShell,
+		AgentProvider: AgentProviderUnknown,
+	})
+	defer store.Close()
+	s.SetSessionStore(store)
+	s.SetStructuredChatEnabled(true)
+	s.SetStructuredChatController(NewStructuredChatController(store))
+
+	queue := NewApprovalQueue(50*time.Millisecond, nil)
+	s.SetApprovalQueue(queue)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := queue.Queue(ctx, ApprovalRequest{
+		RequestID: "approval-1",
+		Command:   "rg TODO",
+		Rationale: "search repo",
+	})
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("Queue err = %v, want approval timeout", err)
+	}
+	snapshot, err := store.LoadStructuredChatSnapshot(s.SessionID())
+	if err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+	}
+	if snapshot != nil {
+		t.Fatalf("snapshot = %#v, want nil", snapshot)
+	}
+}
+
+func TestStructuredChatApprovalProjectionResolvesInPlaceForSameRequestID(t *testing.T) {
+	s := NewServer(":0")
+	store := newStructuredRuntimeSessionStoreForSession(t, s.SessionID(), ClassifySessionMetadata("codex", nil, ""))
+	defer store.Close()
+	s.SetSessionStore(store)
+	s.SetStructuredChatEnabled(true)
+	controller := NewStructuredChatController(store)
+	s.SetStructuredChatController(controller)
+
+	queue := NewApprovalQueue(2*time.Second, nil)
+	s.SetApprovalQueue(queue)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := queue.Queue(ctx, ApprovalRequest{
+			RequestID: "approval-1",
+			Command:   "rg TODO",
+			Rationale: "search repo",
+		})
+		resultCh <- err
+	}()
+
+	// Poll for pending snapshot
+	var pending *storage.StructuredChatSnapshot
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := store.LoadStructuredChatSnapshot(s.SessionID())
+		if err != nil {
+			t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+		}
+		if snapshot != nil && len(snapshot.Items) == 1 {
+			pending = snapshot
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pending == nil {
+		t.Fatal("expected pending approval snapshot")
+	}
+
+	// Resolve the approval
+	if err := queue.DecideWithDevice("approval-1", "approve", nil, "device-1"); err != nil {
+		t.Fatalf("DecideWithDevice failed: %v", err)
+	}
+	if err := <-resultCh; err != nil {
+		t.Fatalf("Queue returned err = %v, want nil", err)
+	}
+
+	// Load resolved snapshot -- should have exactly 1 item (updated in place, not 2)
+	resolved, err := store.LoadStructuredChatSnapshot(s.SessionID())
+	if err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+	}
+	items, err := decodeStoredChatItems(resolved.Items)
+	if err != nil {
+		t.Fatalf("decodeStoredChatItems failed: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1 (resolve should update in place)", len(items))
+	}
+	if items[0].ApprovalRequestID != "approval-1" {
+		t.Fatalf("item request ID = %q, want approval-1", items[0].ApprovalRequestID)
+	}
+	if items[0].Decision != "approve" || items[0].Status != ChatItemStatusCompleted {
+		t.Fatalf("item = %#v, want approve/completed", items[0])
+	}
+}
+
+func TestStructuredChatApprovalProjectionAllowsRequestIDReuseAfterResolution(t *testing.T) {
+	s := NewServer(":0")
+	store := newStructuredRuntimeSessionStoreForSession(t, s.SessionID(), ClassifySessionMetadata("codex", nil, ""))
+	defer store.Close()
+	s.SetSessionStore(store)
+	s.SetStructuredChatEnabled(true)
+	controller := NewStructuredChatController(store)
+	s.SetStructuredChatController(controller)
+
+	queue := NewApprovalQueue(2*time.Second, nil)
+	s.SetApprovalQueue(queue)
+
+	// Queue and resolve first approval with request ID "approval-1"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := queue.Queue(ctx, ApprovalRequest{
+			RequestID: "approval-1",
+			Command:   "rg TODO",
+			Rationale: "search repo",
+		})
+		resultCh <- err
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := store.LoadStructuredChatSnapshot(s.SessionID())
+		if err != nil {
+			t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+		}
+		if snapshot != nil && len(snapshot.Items) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := queue.DecideWithDevice("approval-1", "approve", nil, "device-1"); err != nil {
+		t.Fatalf("DecideWithDevice failed: %v", err)
+	}
+	if err := <-resultCh; err != nil {
+		t.Fatalf("first Queue returned err = %v, want nil", err)
+	}
+
+	resolved, err := store.LoadStructuredChatSnapshot(s.SessionID())
+	if err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+	}
+	resolvedItems, err := decodeStoredChatItems(resolved.Items)
+	if err != nil {
+		t.Fatalf("decodeStoredChatItems failed: %v", err)
+	}
+	if len(resolvedItems) != 1 {
+		t.Fatalf("len(resolvedItems) = %d, want 1 after first resolution", len(resolvedItems))
+	}
+	if resolvedItems[0].ApprovalRequestID != "approval-1" {
+		t.Fatalf("resolved request ID = %q, want approval-1", resolvedItems[0].ApprovalRequestID)
+	}
+	if resolvedItems[0].Decision != "approve" || resolvedItems[0].Status != ChatItemStatusCompleted {
+		t.Fatalf("resolved item = %#v, want approve/completed", resolvedItems[0])
+	}
+
+	// Queue a second approval reusing the same request ID "approval-1"
+	queue2 := NewApprovalQueue(500*time.Millisecond, nil)
+	s.SetApprovalQueue(queue2)
+	resultCh2 := make(chan error, 1)
+	go func() {
+		_, err := queue2.Queue(ctx, ApprovalRequest{
+			RequestID: "approval-1",
+			Command:   "rm tmp.txt",
+			Rationale: "cleanup",
+		})
+		resultCh2 <- err
+	}()
+
+	// Poll for the second pending item and assert the stale resolved item is not retained.
+	var pendingItems []ChatItem
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := store.LoadStructuredChatSnapshot(s.SessionID())
+		if err != nil {
+			t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+		}
+		if snapshot != nil {
+			items, err := decodeStoredChatItems(snapshot.Items)
+			if err != nil {
+				t.Fatalf("decodeStoredChatItems failed: %v", err)
+			}
+			if len(items) == 1 &&
+				items[0].ApprovalRequestID == "approval-1" &&
+				items[0].Status == ChatItemStatusPending &&
+				items[0].Decision == "" &&
+				items[0].Command == "rm tmp.txt" {
+				pendingItems = items
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(pendingItems) != 1 {
+		t.Fatal("expected exactly one fresh pending item for reused request ID approval-1")
+	}
+	if pendingItems[0].Reason != "cleanup" {
+		t.Fatalf("pending reason = %q, want cleanup", pendingItems[0].Reason)
+	}
+
+	// Let it time out
+	err = <-resultCh2
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("second Queue err = %v, want timeout", err)
+	}
+
+	timedOut, err := store.LoadStructuredChatSnapshot(s.SessionID())
+	if err != nil {
+		t.Fatalf("LoadStructuredChatSnapshot failed: %v", err)
+	}
+	timedOutItems, err := decodeStoredChatItems(timedOut.Items)
+	if err != nil {
+		t.Fatalf("decodeStoredChatItems failed: %v", err)
+	}
+	if len(timedOutItems) != 1 {
+		t.Fatalf("len(timedOutItems) = %d, want 1 after reused request timeout", len(timedOutItems))
+	}
+	if timedOutItems[0].ApprovalRequestID != "approval-1" {
+		t.Fatalf("timedOut request ID = %q, want approval-1", timedOutItems[0].ApprovalRequestID)
+	}
+	if timedOutItems[0].Status != ChatItemStatusFailed || timedOutItems[0].Decision != "deny" {
+		t.Fatalf("timedOut item = %#v, want deny/failed", timedOutItems[0])
+	}
+	if timedOutItems[0].Command != "rm tmp.txt" || timedOutItems[0].Reason != "cleanup" {
+		t.Fatalf("timedOut item = %#v, want reused request payload", timedOutItems[0])
+	}
+}
+
 // TestNewApprovalRequestMessage tests the message constructor
 func TestNewApprovalRequestMessage(t *testing.T) {
 	expiresAt := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
@@ -851,7 +1192,7 @@ func TestApproveHandler_InvalidBearerFormat(t *testing.T) {
 	handler := createTestApproveHandler("valid-token", nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/approve", strings.NewReader(`{"command":"test"}`))
-	req.RemoteAddr = "127.0.0.1:12345" // Loopback
+	req.RemoteAddr = "127.0.0.1:12345"              // Loopback
 	req.Header.Set("Authorization", "Basic abc123") // Wrong format
 	req.Header.Set("Content-Type", "application/json")
 

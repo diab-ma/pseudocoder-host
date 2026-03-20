@@ -1,0 +1,335 @@
+{
+  "fixture_name": "pty_noise_filtering",
+  "session_id": "session-claude-noise-1",
+  "steps": [
+    {
+      "label": "user prompt",
+      "chunk_observed_at": 1000,
+      "chunks": ["Human: what is the answer\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        }
+      ]
+    },
+    {
+      "label": "assistant bullet marker with effort badge prefix stripped",
+      "chunk_observed_at": 2000,
+      "chunks": ["\u25cf high \u00b7 /effort \u2733 Hi! How can I help you?\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you?"
+        }
+      ]
+    },
+    {
+      "label": "box-drawing separator line is filtered",
+      "chunk_observed_at": 2100,
+      "chunks": ["\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you?"
+        }
+      ]
+    },
+    {
+      "label": "progress spinner line is filtered",
+      "chunk_observed_at": 2200,
+      "chunks": ["Searching...  >\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you?"
+        }
+      ]
+    },
+    {
+      "label": "spinner-only line is filtered",
+      "chunk_observed_at": 2250,
+      "chunks": ["\u2733 \u2026\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you?"
+        }
+      ]
+    },
+    {
+      "label": "effort badge standalone line is filtered",
+      "chunk_observed_at": 2275,
+      "chunks": ["high \u00b7 /effort\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you?"
+        }
+      ]
+    },
+    {
+      "label": "thinking status line is filtered",
+      "chunk_observed_at": 2280,
+      "chunks": ["(thinking with high effort)\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you?"
+        }
+      ]
+    },
+    {
+      "label": "expand hint line is filtered",
+      "chunk_observed_at": 2285,
+      "chunks": ["(ctrl+o to expand)\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you?"
+        }
+      ]
+    },
+    {
+      "label": "assistant line with trailing Spinning... > is stripped",
+      "chunk_observed_at": 2290,
+      "chunks": ["\u25cf high \u00b7 /effort \u2733 Hi! How can I help you today? \u2733 Spinning... >\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you today?"
+        }
+      ]
+    },
+    {
+      "label": "terminal prompt line is filtered",
+      "chunk_observed_at": 2300,
+      "chunks": ["user@hostname ~/project\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you today?"
+        }
+      ]
+    },
+    {
+      "label": "Searched for N pattern line is filtered",
+      "chunk_observed_at": 2350,
+      "chunks": ["Searched for 1 pattern, read 4 files (ctrl+o to expand)\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you today?"
+        }
+      ]
+    },
+    {
+      "label": "real content line is kept",
+      "chunk_observed_at": 2400,
+      "chunks": ["Here is the answer\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "in_progress",
+          "markdown": "Hi! How can I help you today?\nHere is the answer"
+        }
+      ]
+    },
+    {
+      "label": "prompt marker finalizes assistant",
+      "chunk_observed_at": 2500,
+      "chunks": ["\u276f \n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "claude-user:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "claude",
+          "status": "completed",
+          "text": "what is the answer"
+        },
+        {
+          "id": "claude-assistant:turn-1",
+          "session_id": "session-claude-noise-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "claude",
+          "status": "completed",
+          "markdown": "Hi! How can I help you today?\nHere is the answer"
+        }
+      ]
+    }
+  ]
+}

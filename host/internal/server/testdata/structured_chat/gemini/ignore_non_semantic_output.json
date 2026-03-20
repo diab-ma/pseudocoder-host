@@ -1,0 +1,66 @@
+{
+  "fixture_name": "ignore_non_semantic_output",
+  "session_id": "session-gemini-1",
+  "steps": [
+    {
+      "label": "user prompt observed",
+      "chunk_observed_at": 1000,
+      "chunks": ["User: explain the bug\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        }
+      ]
+    },
+    {
+      "label": "non semantic output is ignored",
+      "chunk_observed_at": 1500,
+      "chunks": ["[status] waiting for tool\n", "[tool] ls -la\n", "[debug] retained raw terminal output\n"],
+      "expect_status": "no_change",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        }
+      ]
+    },
+    {
+      "label": "gemini response still parses after ignored output",
+      "chunk_observed_at": 2000,
+      "chunks": ["Gemini: here is the fix\n", "\n"],
+      "expect_status": "timeline_changed",
+      "expect_timeline": [
+        {
+          "id": "gemini-user:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "user_message",
+          "created_at": 1000,
+          "provider": "gemini",
+          "status": "completed",
+          "text": "explain the bug"
+        },
+        {
+          "id": "gemini-assistant:turn-1",
+          "session_id": "session-gemini-1",
+          "kind": "assistant_message",
+          "created_at": 2000,
+          "provider": "gemini",
+          "status": "completed",
+          "markdown": "here is the fix"
+        }
+      ]
+    }
+  ]
+}

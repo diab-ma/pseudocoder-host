@@ -46,6 +46,10 @@ func (c *Client) handleTerminalInput(data []byte) {
 
 	// Phase 9.3: Try multi-session routing first if session manager is configured
 	if mgr != nil && payload.SessionID != "" {
+		if c.server.hasSessionPrompt(payload.SessionID) {
+			c.sendError(apperrors.CodeInputPromptPending, "structured prompt is in flight for this session")
+			return
+		}
 		session := mgr.Get(payload.SessionID)
 		if session != nil {
 			// Log input event without content for privacy
@@ -72,11 +76,20 @@ func (c *Client) handleTerminalInput(data []byte) {
 	}
 
 	// Legacy single-session mode (backward compatibility)
+	effectiveSessionID := payload.SessionID
+	if effectiveSessionID == "" {
+		effectiveSessionID = legacySessionID
+	}
+
 	// Validate session_id matches current session
-	if payload.SessionID != legacySessionID {
+	if effectiveSessionID != legacySessionID {
 		log.Printf("terminal.input session mismatch: got %s, want %s",
-			payload.SessionID, legacySessionID)
+			effectiveSessionID, legacySessionID)
 		c.sendError(apperrors.CodeInputSessionInvalid, "session ID mismatch")
+		return
+	}
+	if c.server.hasSessionPrompt(effectiveSessionID) {
+		c.sendError(apperrors.CodeInputPromptPending, "structured prompt is in flight for this session")
 		return
 	}
 

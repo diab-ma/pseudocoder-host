@@ -86,6 +86,9 @@ func TestWriteDefaultIntegration(t *testing.T) {
 	if !cfg.RequireAuth {
 		t.Error("RequireAuth = false, want true (security default)")
 	}
+	if !cfg.StructuredChatV1 {
+		t.Error("StructuredChatV1 = false, want true (mobile-ready structured chat default)")
+	}
 	if cfg.Repo != repoPath {
 		t.Errorf("Repo = %q, want %q", cfg.Repo, repoPath)
 	}
@@ -113,6 +116,7 @@ func TestWriteDefaultNoOverwrite(t *testing.T) {
 	// Create existing config with different values
 	existingContent := `addr = "127.0.0.1:9999"
 require_auth = false
+structured_chat_v1 = false
 `
 	if err := os.WriteFile(configPath, []byte(existingContent), 0600); err != nil {
 		t.Fatalf("Failed to write existing config: %v", err)
@@ -135,6 +139,9 @@ require_auth = false
 	}
 	if cfg.RequireAuth {
 		t.Error("RequireAuth = true, want false (original should be preserved)")
+	}
+	if cfg.StructuredChatV1 {
+		t.Error("StructuredChatV1 = true, want false (original should be preserved)")
 	}
 }
 

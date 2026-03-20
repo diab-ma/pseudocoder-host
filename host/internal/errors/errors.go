@@ -30,10 +30,8 @@ const (
 	CodeActionGitFailed      = "action.git_failed"      // Git operation failed
 	CodeActionCardNotFound   = "action.card_not_found"  // Card not found for action
 	CodeActionAlreadyDecided = "action.already_decided" // Card already has a decision
-	CodeActionChunkStale     = "action.chunk_stale"     // Chunk content has changed since viewed
 	CodeActionUntrackedFile  = "action.untracked_file"  // File is untracked (cannot restore)
 	CodeActionFileDeleted    = "action.file_deleted"    // File was deleted from disk
-	CodeActionBinaryFile     = "action.binary_file"     // Cannot apply per-chunk actions to binary files
 
 	// Decision reliability domain - validation/verification and divergence
 	CodeValidationFailed   = "validation.failed"   // Pre-apply validation failed
@@ -65,11 +63,14 @@ const (
 	CodeSessionStartFailed    = "session.start_failed"    // Failed to start session command (Phase 9.3)
 	CodeSessionCloseFailed    = "session.close_failed"    // Failed to close session (Phase 9.3)
 	CodeSessionRenameFailed   = "session.rename_failed"   // Failed to rename session (Phase 9.6)
+	CodeSessionDeleteFailed   = "session.delete_failed"   // Failed to delete session
+	CodeSessionStillRunning   = "session.still_running"   // Cannot delete a running session
 
 	// Input domain - terminal input errors (Phase 5.5)
 	CodeInputRateLimited    = "input.rate_limited"    // Too many input messages per second
 	CodeInputSessionInvalid = "input.session_invalid" // Session ID doesn't match current session
 	CodeInputWriteFailed    = "input.write_failed"    // Failed to write input to PTY
+	CodeInputPromptPending  = "input.prompt_pending"  // Same-session raw input blocked during structured prompt mutation
 
 	// Diff domain - diff polling and parsing errors
 	CodeDiffParseFailed = "diff.parse_failed" // Failed to parse git diff
@@ -151,13 +152,13 @@ const (
 	CodeKeepAwakeAcquireFailed          = "keep_awake.acquire_failed"          // Host failed to acquire inhibitor
 	CodeKeepAwakeConflict               = "keep_awake.conflict"                // Keep-awake mutation conflict or fail-closed audit conflict
 	CodeKeepAwakeExpired                = "keep_awake.expired"                 // Lease expired before requested operation
+	CodeKeepAwakeUnavailable            = "keep_awake.unavailable"             // Keep-awake auth system temporarily unavailable
 
 	// Undo domain - undo operation errors (Phase 20, 25)
 	CodeUndoConflict       = "undo.conflict"        // Patch apply failed during undo (conflicts)
 	CodeUndoBaseMissing    = "undo.base_missing"    // Cannot apply patch (file or content missing)
 	CodeUndoNotStaged      = "undo.not_staged"      // Cannot undo commit (changes not in current index)
 	CodeUndoAlreadyPending = "undo.already_pending" // Card is already in pending state
-	CodeUndoChunkOnly      = "undo.chunk_only"      // Card has per-chunk decisions, use chunk-level undo (Phase 25)
 
 	// General domain - catch-all errors
 	CodeUnknown  = "error.unknown"  // Unknown error
@@ -290,6 +291,7 @@ var NextAction = map[string]string{
 	CodeKeepAwakeAcquireFailed:          "Retry keep-awake; if repeated, run `pseudocoder doctor` and inspect host logs.",
 	CodeKeepAwakeConflict:               "Retry with a new request after host state refresh.",
 	CodeKeepAwakeExpired:                "Request a new keep-awake lease.",
+	CodeKeepAwakeUnavailable:            "Wait a moment and retry; the host auth system is starting up.",
 }
 
 // GetNextAction returns the primary recovery guidance for an error code.
@@ -331,14 +333,6 @@ func Internal(message string, cause error) *CodedError {
 	return Wrap(CodeInternal, message, cause)
 }
 
-// ChunkStale creates an "action.chunk_stale" error.
-// This indicates the chunk content has changed since the user viewed it,
-// and they should refresh to see the current state before deciding.
-func ChunkStale(cardID string, chunkIndex int) *CodedError {
-	msg := fmt.Sprintf("chunk %d in card %s has changed, please refresh", chunkIndex, cardID)
-	return New(CodeActionChunkStale, msg)
-}
-
 // UntrackedFile creates an "action.untracked_file" error.
 // This indicates the file is not tracked by git and cannot be restored.
 // The user should delete the file manually or use the delete action.
@@ -353,14 +347,6 @@ func UntrackedFile(file string) *CodedError {
 func FileDeleted(file string) *CodedError {
 	msg := fmt.Sprintf("file %s was deleted and the decision cannot be applied (refresh to update)", file)
 	return New(CodeActionFileDeleted, msg)
-}
-
-// BinaryFile creates an "action.binary_file" error.
-// This indicates per-chunk actions are not supported for binary files.
-// The user should use file-level accept/reject instead.
-func BinaryFile(file string) *CodedError {
-	msg := fmt.Sprintf("file %s is binary - use file-level accept/reject instead of per-chunk actions", file)
-	return New(CodeActionBinaryFile, msg)
 }
 
 // ValidationFailed creates a "validation.failed" error.
@@ -696,10 +682,3 @@ func UndoAlreadyPending(cardID string) *CodedError {
 	return New(CodeUndoAlreadyPending, msg)
 }
 
-// UndoChunkOnly creates an "undo.chunk_only" error.
-// This indicates the card has per-chunk decisions and file-level undo is not supported.
-// The user should use chunk-level undo instead.
-func UndoChunkOnly(cardID string) *CodedError {
-	msg := fmt.Sprintf("card %s has per-chunk decisions - use chunk-level undo instead", cardID)
-	return New(CodeUndoChunkOnly, msg)
-}
