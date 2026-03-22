@@ -28,7 +28,7 @@ func (c *Client) handleReviewUndo(data []byte) {
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		log.Printf("Failed to parse review.undo payload: %v", err)
-		c.sendUndoResult("", -1, false,
+		c.sendUndoResultWithHash("", -1, "", false,
 			apperrors.CodeServerInvalidMessage, "invalid message format")
 		return
 	}
@@ -36,7 +36,7 @@ func (c *Client) handleReviewUndo(data []byte) {
 	payload := msg.Payload
 	if payload.CardID == "" {
 		log.Printf("review.undo missing card_id")
-		c.sendUndoResult("", -1, false,
+		c.sendUndoResultWithHash("", -1, "", false,
 			apperrors.CodeServerInvalidMessage, "card_id is required")
 		return
 	}
@@ -48,7 +48,7 @@ func (c *Client) handleReviewUndo(data []byte) {
 
 	if handler == nil {
 		log.Printf("No undo handler registered, ignoring undo for card %s", payload.CardID)
-		c.sendUndoResult(payload.CardID, -1, false,
+		c.sendUndoResultWithHash(payload.CardID, -1, "", false,
 			apperrors.CodeServerHandlerMissing, "undo handler not configured")
 		return
 	}
@@ -58,7 +58,7 @@ func (c *Client) handleReviewUndo(data []byte) {
 	if err != nil {
 		log.Printf("Undo handler error for card %s: %v", payload.CardID, err)
 		code, message := apperrors.ToCodeAndMessage(err)
-		c.sendUndoResult(payload.CardID, -1, false, code, message)
+		c.sendUndoResultWithHash(payload.CardID, -1, "", false, code, message)
 		return
 	}
 

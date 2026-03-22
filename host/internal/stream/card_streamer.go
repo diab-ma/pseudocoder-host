@@ -176,28 +176,12 @@ func (cs *CardStreamer) ClearFileHash(file string) {
 	delete(cs.seenFileHashes, file)
 }
 
-// ProcessChunks handles a batch of chunks from the diff poller.
-// Chunks are aggregated by file, and one card is created per file.
-// If chunks change for a file (different content hash), the card is updated.
-//
-// It also detects files that no longer have changes (staged/reverted externally)
-// and removes their cards from storage, broadcasting the removal to clients.
+// ProcessChunksRaw handles a batch of chunks with the raw diff output.
+// It aggregates chunks by file, creates one card per file, and detects
+// binary files and calculates diff statistics for large file warnings.
 //
 // If storage fails, the file is NOT marked as seen, allowing retry on the
-// next ProcessChunks call. This method is designed to be used as the OnChunks
-// callback for diff.Poller.
-//
-// Note: This method cannot detect binary files. Use ProcessChunksRaw for full support.
-func (cs *CardStreamer) ProcessChunks(chunks []*diff.Chunk) {
-	// Delegate to ProcessChunksRaw with empty raw diff (disables binary detection)
-	cs.ProcessChunksRaw(chunks, "")
-}
-
-// ProcessChunksRaw handles a batch of chunks with the raw diff output.
-// This is an enhanced version of ProcessChunks that can detect binary files
-// and calculate diff statistics for large file warnings.
-//
-// Use this as the OnChunksRaw callback for diff.Poller.
+// next call. Use this as the OnChunksRaw callback for diff.Poller.
 func (cs *CardStreamer) ProcessChunksRaw(chunks []*diff.Chunk, rawDiff string) {
 	// Aggregate chunks by file
 	fileChunks := diff.AggregateByFile(chunks)
@@ -450,15 +434,6 @@ func (cs *CardStreamer) StreamPendingCards() error {
 
 	log.Printf("Streamed %d pending cards to clients", len(pendingCards))
 	return nil
-}
-
-
-// ClearSeen resets the seen file hashes tracking.
-// This is useful for testing or when you want to re-process all chunks.
-func (cs *CardStreamer) ClearSeen() {
-	cs.mu.Lock()
-	cs.seenFileHashes = make(map[string]string)
-	cs.mu.Unlock()
 }
 
 // hashContent creates a content hash for change detection.

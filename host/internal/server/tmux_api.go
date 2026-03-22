@@ -189,8 +189,7 @@ func (h *TmuxAPIHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := TmuxListResponse{Sessions: items}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleAttach attaches to a tmux session.
@@ -269,8 +268,7 @@ func (h *TmuxAPIHandler) handleAttach(w http.ResponseWriter, r *http.Request) {
 		TmuxSession: req.TmuxSession,
 		Name:        req.Name,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleDetach detaches from a tmux session.
@@ -338,6 +336,5 @@ func (h *TmuxAPIHandler) handleDetach(w http.ResponseWriter, r *http.Request, id
 		TmuxSession: tmuxSessionName,
 		Killed:      killed,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }

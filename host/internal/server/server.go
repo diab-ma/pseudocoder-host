@@ -32,14 +32,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"strings"
 	"time"
 
-	// Internal error codes package for standardized error handling.
 	"github.com/pseudocoder/host/internal/config"
 	apperrors "github.com/pseudocoder/host/internal/errors"
+	"github.com/pseudocoder/host/internal/netutil"
 )
 
 // DeviceStore is the interface for device storage operations.
@@ -77,9 +76,7 @@ func (h *RevokeDeviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// Security: Only allow requests from loopback addresses
 	if !isLoopbackRequest(r) {
 		log.Printf("server: rejected device revoke from non-loopback address: %s", r.RemoteAddr)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{
+		writeJSON(w, http.StatusForbidden, map[string]string{
 			"error":   "forbidden",
 			"message": "Device revocation is only available from localhost",
 		})
@@ -88,9 +85,7 @@ func (h *RevokeDeviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	// Only accept POST
 	if r.Method != http.MethodPost {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{
 			"error":   "method_not_allowed",
 			"message": "Only POST is allowed",
 		})
@@ -101,9 +96,7 @@ func (h *RevokeDeviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// Path format: /devices/UUID/revoke
 	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(pathParts) != 3 || pathParts[0] != "devices" || pathParts[2] != "revoke" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_path",
 			"message": "Expected path format: /devices/{id}/revoke",
 		})
@@ -112,9 +105,7 @@ func (h *RevokeDeviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	deviceID := pathParts[1]
 
 	if deviceID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error":   "missing_device_id",
 			"message": "Device ID is required",
 		})
@@ -125,18 +116,14 @@ func (h *RevokeDeviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	device, err := h.deviceStore.GetDevice(deviceID)
 	if err != nil {
 		log.Printf("server: failed to lookup device %s: %v", deviceID, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error":   "lookup_failed",
 			"message": "Failed to lookup device",
 		})
 		return
 	}
 	if device == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{
+		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error":   "not_found",
 			"message": "Device not found",
 		})
@@ -150,9 +137,7 @@ func (h *RevokeDeviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// Delete from storage
 	if err := h.deviceStore.DeleteDevice(deviceID); err != nil {
 		log.Printf("server: failed to delete device %s: %v", deviceID, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error":   "delete_failed",
 			"message": "Failed to delete device",
 		})
@@ -161,9 +146,7 @@ func (h *RevokeDeviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	log.Printf("server: revoked device %s (%s), closed %d connection(s)", deviceID, device.Name, closedCount)
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"device_id":          deviceID,
 		"device_name":        device.Name,
 		"connections_closed": closedCount,
@@ -171,73 +154,9 @@ func (h *RevokeDeviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 }
 
 // isLoopbackRequest checks if the HTTP request came from the local machine.
-// This is used to restrict sensitive endpoints to local-only access.
-// Returns true for loopback or local interface addresses.
-// Note: This duplicates the function in auth/handler.go to avoid circular imports.
+// Delegates to the shared netutil.IsLoopbackRequest implementation.
 func isLoopbackRequest(r *http.Request) bool {
-	// Extract the host part from RemoteAddr (format is "host:port" or "[host]:port" for IPv6)
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		// If we can't parse the address, be conservative and reject
-		log.Printf("server: failed to parse RemoteAddr %q: %v", r.RemoteAddr, err)
-		return false
-	}
-
-	// Parse the IP address
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// If we can't parse the IP, be conservative and reject
-		log.Printf("server: failed to parse IP from host %q", host)
-		return false
-	}
-
-	if ip.IsLoopback() {
-		return true
-	}
-
-	return isLocalInterfaceIP(ip)
-}
-
-func isLocalInterfaceIP(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		ip = ip4
-	}
-
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		log.Printf("server: failed to list interfaces: %v", err)
-		return false
-	}
-
-	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			var localIP net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				localIP = v.IP
-			case *net.IPAddr:
-				localIP = v.IP
-			}
-			if localIP == nil {
-				continue
-			}
-			if localIP4 := localIP.To4(); localIP4 != nil {
-				localIP = localIP4
-			}
-			if localIP.Equal(ip) {
-				return true
-			}
-		}
-	}
-
-	return false
+	return netutil.IsLoopbackRequest(r)
 }
 
 // ApprovalTokenValidator validates approval tokens for the /approve endpoint.
@@ -300,9 +219,7 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Security: Only allow requests from loopback addresses
 	if !isLoopbackRequest(r) {
 		log.Printf("server: rejected /approve from non-loopback address: %s", r.RemoteAddr)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(approveResponse{
+		writeJSON(w, http.StatusForbidden, approveResponse{
 			Approved: false,
 			Error:    "forbidden",
 			Message:  "Approval endpoint is only available from localhost",
@@ -312,9 +229,7 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Only accept POST
 	if r.Method != http.MethodPost {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(approveResponse{
+		writeJSON(w, http.StatusMethodNotAllowed, approveResponse{
 			Approved: false,
 			Error:    "method_not_allowed",
 			Message:  "Only POST is allowed",
@@ -325,9 +240,7 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Extract and validate Bearer token from Authorization header
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(approveResponse{
+		writeJSON(w, http.StatusUnauthorized, approveResponse{
 			Approved: false,
 			Error:    "approval.invalid_token",
 			Message:  "Authorization header required",
@@ -338,9 +251,7 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse Bearer token
 	const bearerPrefix = "Bearer "
 	if !strings.HasPrefix(authHeader, bearerPrefix) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(approveResponse{
+		writeJSON(w, http.StatusUnauthorized, approveResponse{
 			Approved: false,
 			Error:    "approval.invalid_token",
 			Message:  "Invalid authorization format (expected Bearer token)",
@@ -352,9 +263,7 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Validate token
 	if !h.tokenValidator.ValidateToken(token) {
 		log.Printf("server: rejected /approve with invalid token")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(approveResponse{
+		writeJSON(w, http.StatusUnauthorized, approveResponse{
 			Approved: false,
 			Error:    "approval.invalid_token",
 			Message:  "Invalid approval token",
@@ -365,9 +274,7 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse request body
 	var req approveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(approveResponse{
+		writeJSON(w, http.StatusBadRequest, approveResponse{
 			Approved: false,
 			Error:    "invalid_request",
 			Message:  fmt.Sprintf("Invalid JSON body: %v", err),
@@ -377,9 +284,7 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Validate required fields
 	if req.Command == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(approveResponse{
+		writeJSON(w, http.StatusBadRequest, approveResponse{
 			Approved: false,
 			Error:    "invalid_request",
 			Message:  "Command is required",
@@ -391,9 +296,7 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	queue := h.server.GetApprovalQueue()
 	if queue == nil {
 		log.Printf("server: /approve called but no approval queue configured")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(approveResponse{
+		writeJSON(w, http.StatusServiceUnavailable, approveResponse{
 			Approved: false,
 			Error:    "service_unavailable",
 			Message:  "Approval queue not configured",
@@ -428,9 +331,7 @@ func (h *ApproveHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result.TemporaryAllowUntil = &ts
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(result)
+	writeJSON(w, http.StatusOK, result)
 }
 
 // KeepAwakePolicyHandler handles POST /api/keep-awake/policy for CLI-driven
@@ -462,9 +363,7 @@ type keepAwakePolicyRequest struct {
 func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. POST-only.
 	if r.Method != http.MethodPost {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusMethodNotAllowed, KeepAwakePolicyMutationResponse{
 			ErrorCode: "keep_awake.method_not_allowed",
 			Error:     "Only POST is allowed",
 		})
@@ -474,9 +373,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	// 2. Loopback enforcement.
 	if !isLoopbackRequest(r) {
 		log.Printf("server: rejected /api/keep-awake/policy from non-loopback: %s", r.RemoteAddr)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusUnauthorized, KeepAwakePolicyMutationResponse{
 			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
 			Error:     "Policy endpoint is only available from localhost",
 		})
@@ -485,9 +382,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 	// 3. Token validator unavailable -> 503.
 	if h.tokenValidator == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusServiceUnavailable, KeepAwakePolicyMutationResponse{
 			ErrorCode: apperrors.CodeKeepAwakeUnavailable,
 			Error:     "Authentication system unavailable",
 		})
@@ -497,9 +392,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	// 4. Bearer token extraction and validation.
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusUnauthorized, KeepAwakePolicyMutationResponse{
 			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
 			Error:     "Authorization header required",
 		})
@@ -507,9 +400,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	const bearerPrefix = "Bearer "
 	if !strings.HasPrefix(authHeader, bearerPrefix) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusUnauthorized, KeepAwakePolicyMutationResponse{
 			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
 			Error:     "Invalid authorization format (expected Bearer token)",
 		})
@@ -518,9 +409,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	tokenRaw := strings.TrimPrefix(authHeader, bearerPrefix)
 	tokenRaw = strings.TrimSpace(tokenRaw)
 	if tokenRaw == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusUnauthorized, KeepAwakePolicyMutationResponse{
 			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
 			Error:     "Authorization token is required",
 		})
@@ -528,9 +417,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	if !h.tokenValidator.ValidateToken(tokenRaw) {
 		log.Printf("server: rejected /api/keep-awake/policy with invalid token")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusUnauthorized, KeepAwakePolicyMutationResponse{
 			ErrorCode: apperrors.CodeKeepAwakeUnauthorized,
 			Error:     "Invalid approval token",
 		})
@@ -545,27 +432,21 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusBadRequest, KeepAwakePolicyMutationResponse{
 			ErrorCode: apperrors.CodeServerInvalidMessage,
 			Error:     fmt.Sprintf("Invalid JSON: %v", err),
 		})
 		return
 	}
 	if req.RequestID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusBadRequest, KeepAwakePolicyMutationResponse{
 			ErrorCode: apperrors.CodeServerInvalidMessage,
 			Error:     "request_id is required",
 		})
 		return
 	}
 	if req.RemoteEnabled == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusBadRequest, KeepAwakePolicyMutationResponse{
 			RequestID: req.RequestID,
 			ErrorCode: apperrors.CodeServerInvalidMessage,
 			Error:     "remote_enabled is required",
@@ -576,9 +457,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	// 7. Normalize reason.
 	reason, err := normalizeKeepAwakePolicyReason(req.Reason)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusBadRequest, KeepAwakePolicyMutationResponse{
 			RequestID: req.RequestID,
 			ErrorCode: apperrors.CodeServerInvalidMessage,
 			Error:     err.Error(),
@@ -595,16 +474,12 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	cached, replay, idErr := h.server.policyIdempotencyCheckLocked(idKey, fingerprint)
 	if replay {
 		h.server.keepAwake.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(cached)
+		writeJSON(w, http.StatusOK, cached)
 		return
 	}
 	if idErr != nil {
 		h.server.keepAwake.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusConflict, KeepAwakePolicyMutationResponse{
 			RequestID: req.RequestID,
 			ErrorCode: apperrors.CodeKeepAwakeConflict,
 			Error:     idErr.Error(),
@@ -628,9 +503,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		}
 		h.server.policyIdempotencyCompleteLocked(idKey, fingerprint, resp)
 		h.server.keepAwake.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(resp)
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
@@ -646,9 +519,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		h.server.keepAwake.mu.Lock()
 		h.server.policyIdempotencyCancelLocked(idKey)
 		h.server.keepAwake.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusConflict, KeepAwakePolicyMutationResponse{
 			RequestID: req.RequestID,
 			ErrorCode: apperrors.CodeKeepAwakeConflict,
 			Error:     "config path is unavailable; cannot persist keep-awake policy",
@@ -660,9 +531,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		h.server.keepAwake.mu.Lock()
 		h.server.policyIdempotencyCancelLocked(idKey)
 		h.server.keepAwake.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusConflict, KeepAwakePolicyMutationResponse{
 			RequestID: req.RequestID,
 			ErrorCode: apperrors.CodeKeepAwakeConflict,
 			Error:     "policy persistence failed: " + err.Error(),
@@ -704,9 +573,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		if persisted && h.configPath != "" {
 			if rbErr := h.persistPolicy(h.configPath, oldPolicy.RemoteEnabled); rbErr != nil {
 				log.Printf("keep-awake policy rollback persist failed: %v", rbErr)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusConflict)
-				json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+				writeJSON(w, http.StatusConflict, KeepAwakePolicyMutationResponse{
 					RequestID: req.RequestID,
 					ErrorCode: apperrors.CodeKeepAwakeConflict,
 					Error:     "policy apply failed and rollback failed; manually restore keep_awake_remote_enabled in config: " + rbErr.Error(),
@@ -715,9 +582,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			}
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+		writeJSON(w, http.StatusConflict, KeepAwakePolicyMutationResponse{
 			RequestID: req.RequestID,
 			ErrorCode: apperrors.CodeKeepAwakeConflict,
 			Error:     "policy apply failed; rollback completed: " + apperrors.GetMessage(err),
@@ -742,9 +607,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 				h.server.keepAwake.mu.Unlock()
 				changedMsg := NewKeepAwakeChangedMessage(status)
 				go h.server.broadcastKeepAwakeChanged(changedMsg, nil, true)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusConflict)
-				json.NewEncoder(w).Encode(KeepAwakePolicyMutationResponse{
+				writeJSON(w, http.StatusConflict, KeepAwakePolicyMutationResponse{
 					RequestID: req.RequestID,
 					ErrorCode: apperrors.CodeKeepAwakeConflict,
 					Error:     "policy apply failed; keep-awake forced fail-closed after revoke audit error",
@@ -780,9 +643,7 @@ func (h *KeepAwakePolicyHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	go h.server.broadcastKeepAwakeChanged(changedMsg, nil, true)
 
 	// 12. Return 200.
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // sha256Hex returns the hex-encoded SHA256 digest of s.

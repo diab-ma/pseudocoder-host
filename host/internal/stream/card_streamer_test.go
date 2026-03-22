@@ -103,7 +103,7 @@ func TestCardStreamer_ProcessChunks(t *testing.T) {
 	}
 
 	// Process the chunks
-	streamer.ProcessChunks(chunks)
+	streamer.ProcessChunksRaw(chunks, "")
 
 	// Verify cards were broadcast
 	broadcastedCards := broadcaster.getCards()
@@ -158,8 +158,8 @@ func TestCardStreamer_DeduplicatesCards(t *testing.T) {
 	chunk := diff.NewChunk("file.go", 10, 5, 10, 7, "+added line")
 	chunks := []*diff.Chunk{chunk}
 
-	streamer.ProcessChunks(chunks)
-	streamer.ProcessChunks(chunks)
+	streamer.ProcessChunksRaw(chunks, "")
+	streamer.ProcessChunksRaw(chunks, "")
 
 	// Should only have one broadcast and one stored card
 	broadcastedCards := broadcaster.getCards()
@@ -221,7 +221,7 @@ func TestCardStreamer_LoadsPendingOnStart(t *testing.T) {
 		CreatedAt: time.Now().UnixMilli(),
 	}
 
-	streamer.ProcessChunks([]*diff.Chunk{fakeChunk})
+	streamer.ProcessChunksRaw([]*diff.Chunk{fakeChunk}, "")
 
 	// Should not broadcast since the card was already pending
 	broadcastedCards := broadcaster.getCards()
@@ -289,39 +289,6 @@ func TestCardStreamer_StreamPendingCards(t *testing.T) {
 	}
 }
 
-// TestCardStreamer_ClearSeen tests that clearing seen cards allows
-// re-processing of chunks.
-func TestCardStreamer_ClearSeen(t *testing.T) {
-	store, err := storage.NewSQLiteStore(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	broadcaster := newMockBroadcaster()
-
-	streamer := NewCardStreamer(CardStreamerConfig{
-		Store:       store,
-		Broadcaster: broadcaster,
-		SessionID:   "test-session",
-	})
-
-	// Process a chunk
-	chunk := diff.NewChunk("file.go", 10, 5, 10, 7, "+added line")
-	streamer.ProcessChunks([]*diff.Chunk{chunk})
-
-	// Clear seen cards
-	streamer.ClearSeen()
-
-	// Process the same chunk again - should be broadcast again
-	streamer.ProcessChunks([]*diff.Chunk{chunk})
-
-	broadcastedCards := broadcaster.getCards()
-	if len(broadcastedCards) != 2 {
-		t.Errorf("expected 2 broadcast cards after ClearSeen, got %d", len(broadcastedCards))
-	}
-}
-
 // TestCardStreamer_NilStore tests that the streamer works without storage
 // (broadcast only mode).
 func TestCardStreamer_NilStore(t *testing.T) {
@@ -335,7 +302,7 @@ func TestCardStreamer_NilStore(t *testing.T) {
 
 	// Process chunks
 	chunk := diff.NewChunk("file.go", 10, 5, 10, 7, "+added line")
-	streamer.ProcessChunks([]*diff.Chunk{chunk})
+	streamer.ProcessChunksRaw([]*diff.Chunk{chunk}, "")
 
 	// Should still broadcast
 	broadcastedCards := broadcaster.getCards()
@@ -361,7 +328,7 @@ func TestCardStreamer_NilBroadcaster(t *testing.T) {
 
 	// Process chunks
 	chunk := diff.NewChunk("file.go", 10, 5, 10, 7, "+added line")
-	streamer.ProcessChunks([]*diff.Chunk{chunk})
+	streamer.ProcessChunksRaw([]*diff.Chunk{chunk}, "")
 
 	// Should still save to storage
 	allCards, err := store.ListAll()
@@ -422,7 +389,7 @@ func TestCardStreamer_CardPayloadMatchesProtocol(t *testing.T) {
 	// Create a chunk with known values
 	chunk := diff.NewChunk("src/main.go", 100, 10, 100, 12, "@@ -100,10 +100,12 @@\n context\n+added line")
 
-	streamer.ProcessChunks([]*diff.Chunk{chunk})
+	streamer.ProcessChunksRaw([]*diff.Chunk{chunk}, "")
 
 	broadcastedCards := broadcaster.getCards()
 	if len(broadcastedCards) != 1 {
@@ -514,7 +481,7 @@ func TestCardStreamer_RetryAfterSaveFailure(t *testing.T) {
 	chunks := []*diff.Chunk{chunk}
 
 	// First call - should fail to save
-	streamer.ProcessChunks(chunks)
+	streamer.ProcessChunksRaw(chunks, "")
 
 	// Verify: OnError was called, no broadcast, no card in storage
 	if len(capturedErrors) != 1 {
@@ -528,7 +495,7 @@ func TestCardStreamer_RetryAfterSaveFailure(t *testing.T) {
 	}
 
 	// Second call - same chunk should be retried and succeed
-	streamer.ProcessChunks(chunks)
+	streamer.ProcessChunksRaw(chunks, "")
 
 	// Verify: card now saved and broadcast
 	if store.getCallCount() != 2 {
@@ -549,7 +516,7 @@ func TestCardStreamer_RetryAfterSaveFailure(t *testing.T) {
 	}
 
 	// Third call - chunk should now be seen, no retry
-	streamer.ProcessChunks(chunks)
+	streamer.ProcessChunksRaw(chunks, "")
 	if store.getCallCount() != 2 {
 		t.Errorf("expected no additional SaveCard calls (already seen), got %d", store.getCallCount())
 	}
@@ -579,7 +546,7 @@ func TestCardStreamer_MultipleCardsStreamedInOrder(t *testing.T) {
 		diff.NewChunk("c.go", 1, 1, 1, 2, "+third"),
 	}
 
-	streamer.ProcessChunks(chunks)
+	streamer.ProcessChunksRaw(chunks, "")
 
 	broadcastedCards := broadcaster.getCards()
 	if len(broadcastedCards) != 3 {
@@ -639,7 +606,7 @@ func TestCardStreamer_StartHandlesListPendingFailure(t *testing.T) {
 
 	// Processing new chunks should still work
 	chunk := diff.NewChunk("file.go", 1, 1, 1, 2, "+new")
-	streamer.ProcessChunks([]*diff.Chunk{chunk})
+	streamer.ProcessChunksRaw([]*diff.Chunk{chunk}, "")
 
 	// Card should be broadcast (ListPending failure doesn't block processing)
 	broadcastedCards := broadcaster.getCards()
@@ -676,7 +643,7 @@ func TestCardStreamer_DuplicateIDsInSingleBatch(t *testing.T) {
 	}
 
 	// Process batch with duplicate IDs
-	streamer.ProcessChunks([]*diff.Chunk{chunk1, chunk2})
+	streamer.ProcessChunksRaw([]*diff.Chunk{chunk1, chunk2}, "")
 
 	// Only one should be processed (first one marks as seen, second is skipped)
 	broadcastedCards := broadcaster.getCards()
@@ -949,7 +916,7 @@ func TestClearFileHashAllowsRebroadcast(t *testing.T) {
 	chunks := []*diff.Chunk{
 		{File: "test.txt", Content: "@@ -1 +1 @@\n-old\n+new\n"},
 	}
-	streamer.ProcessChunks(chunks)
+	streamer.ProcessChunksRaw(chunks, "")
 
 	// Verify card was broadcast
 	cards := broadcaster.getCards()
@@ -961,7 +928,7 @@ func TestClearFileHashAllowsRebroadcast(t *testing.T) {
 	broadcaster.clearCards()
 
 	// Process the same chunks again (should be skipped - same hash)
-	streamer.ProcessChunks(chunks)
+	streamer.ProcessChunksRaw(chunks, "")
 	if len(broadcaster.getCards()) != 0 {
 		t.Error("expected same chunks to be skipped (duplicate hash)")
 	}
@@ -970,7 +937,7 @@ func TestClearFileHashAllowsRebroadcast(t *testing.T) {
 	streamer.ClearFileHash("test.txt")
 
 	// Process the same chunks again - should be broadcast now
-	streamer.ProcessChunks(chunks)
+	streamer.ProcessChunksRaw(chunks, "")
 	cards = broadcaster.getCards()
 	if len(cards) != 1 {
 		t.Errorf("expected card to be re-broadcast after ClearFileHash, got %d cards", len(cards))

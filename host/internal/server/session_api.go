@@ -234,8 +234,7 @@ func (h *SessionAPIHandler) handleNew(w http.ResponseWriter, r *http.Request) {
 		Name:    req.Name,
 		Command: command,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleList returns all active sessions.
@@ -260,8 +259,7 @@ func (h *SessionAPIHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(items)
+	writeJSON(w, http.StatusOK, items)
 }
 
 // handleKill terminates a session.
@@ -291,8 +289,7 @@ func (h *SessionAPIHandler) handleKill(w http.ResponseWriter, r *http.Request, i
 		ID:     id,
 		Killed: true,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleRename changes a session's human-readable name.
@@ -335,8 +332,7 @@ func (h *SessionAPIHandler) handleRename(w http.ResponseWriter, r *http.Request,
 		ID:   id,
 		Name: req.Name,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // validateSessionName checks if a session name is valid.
@@ -363,7 +359,5 @@ func validateSessionName(name string) string {
 
 // writeJSONError writes a JSON error response.
 func writeJSONError(w http.ResponseWriter, message string, status int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+	writeJSON(w, status, map[string]string{"error": message})
 }

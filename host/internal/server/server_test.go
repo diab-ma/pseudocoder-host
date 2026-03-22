@@ -2192,7 +2192,9 @@ func TestIsLoopbackRequest(t *testing.T) {
 		{"127.255.255.255:12345", true},
 		{"[::1]:12345", true},
 		{"8.8.8.8:12345", false},
-		{"", false},
+		{"", true},               // empty RemoteAddr indicates Unix socket
+		{"/tmp/test.sock", true},  // Unix socket path
+		{"@test.sock", true},      // abstract Unix socket
 		{"invalid", false},
 	}
 

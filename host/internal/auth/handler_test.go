@@ -404,7 +404,7 @@ func TestIsLoopbackRequest(t *testing.T) {
 		{"[2001:db8::1]:54321", false},
 		{"[::]:54321", false},
 
-		// Local interface addresses (should return false)
+		// Local interface addresses (should return true — same machine)
 
 		// Edge cases (should return false)
 		{"invalid", false},
@@ -415,7 +415,7 @@ func TestIsLoopbackRequest(t *testing.T) {
 		tests = append(tests, struct {
 			remoteAddr string
 			expected   bool
-		}{remoteAddr: net.JoinHostPort(ip, "54321"), expected: false})
+		}{remoteAddr: net.JoinHostPort(ip, "54321"), expected: true})
 	}
 
 	for _, tt := range tests {

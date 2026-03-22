@@ -5,337 +5,118 @@ import (
 	"time"
 )
 
-// sendDecisionResult sends a decision result message to this client.
-// For failures, provide both errCode and errMsg. For success, both should be empty.
+// trySend sends a message non-blocking, dropping it if the client buffer is full.
+func (c *Client) trySend(msg Message, label string) {
+	select {
+	case c.send <- msg:
+	default:
+		log.Printf("Warning: client send buffer full, dropping %s", label)
+	}
+}
+
+// trySendChecked sends a message non-blocking, but first checks if the client is done.
+func (c *Client) trySendChecked(msg Message, label string) {
+	select {
+	case <-c.done:
+		return
+	case c.send <- msg:
+	default:
+		log.Printf("Warning: client send buffer full, dropping %s", label)
+	}
+}
+
+// trySendTimeout sends a message with a timeout, checking if the client is done.
+func (c *Client) trySendTimeout(msg Message, label string, d time.Duration) {
+	select {
+	case <-c.done:
+		return
+	case c.send <- msg:
+	case <-time.After(d):
+		log.Printf("Warning: timeout sending %s to client", label)
+	}
+}
+
+// --- Pattern A: simple non-blocking sends ---
+
 func (c *Client) sendDecisionResult(cardID, action string, success bool, errCode, errMsg string) {
-	// Use non-blocking send to avoid blocking on slow clients
-	select {
-	case c.send <- NewDecisionResultMessage(cardID, action, success, errCode, errMsg):
-	default:
-		log.Printf("Warning: client send buffer full, dropping decision result")
-	}
+	c.trySend(NewDecisionResultMessage(cardID, action, success, errCode, errMsg), "decision result")
 }
 
-// sendDeleteResult sends a delete result message to this client.
-// For failures, provide both errCode and errMsg. For success, both should be empty.
 func (c *Client) sendDeleteResult(cardID string, success bool, errCode, errMsg string) {
-	// Use non-blocking send to avoid blocking on slow clients
-	select {
-	case c.send <- NewDeleteResultMessage(cardID, success, errCode, errMsg):
-	default:
-		log.Printf("Warning: client send buffer full, dropping delete result")
-	}
+	c.trySend(NewDeleteResultMessage(cardID, success, errCode, errMsg), "delete result")
 }
 
-// sendUndoResult sends an undo result message to this client.
-// Set chunkIndex to -1 (omitted from JSON).
-// For failures, provide both errCode and errMsg. For success, both should be empty.
-func (c *Client) sendUndoResult(cardID string, chunkIndex int, success bool, errCode, errMsg string) {
-	c.sendUndoResultWithHash(cardID, chunkIndex, "", success, errCode, errMsg)
-}
-
-// sendUndoResultWithHash sends an undo result message with content hash to this client.
-// Set chunkIndex to -1 (omitted from JSON).
-// For failures, provide both errCode and errMsg. For success, both should be empty.
 func (c *Client) sendUndoResultWithHash(cardID string, chunkIndex int, contentHash string, success bool, errCode, errMsg string) {
-	// Use non-blocking send to avoid blocking on slow clients
-	select {
-	case c.send <- NewUndoResultMessageWithHash(cardID, chunkIndex, contentHash, success, errCode, errMsg):
-	default:
-		log.Printf("Warning: client send buffer full, dropping undo result")
-	}
+	c.trySend(NewUndoResultMessageWithHash(cardID, chunkIndex, contentHash, success, errCode, errMsg), "undo result")
 }
 
-// sendError sends an error message to this client.
-// Uses non-blocking send to avoid blocking on slow clients.
 func (c *Client) sendError(code, message string) {
-	select {
-	case c.send <- NewErrorMessage(code, message):
-	default:
-		log.Printf("Warning: client send buffer full, dropping error message")
-	}
+	c.trySend(NewErrorMessage(code, message), "error message")
 }
 
-// sendCommitResult sends a repo.commit_result message to the client.
+func (c *Client) sendFileListResult(msg Message)   { c.trySend(msg, "file.list_result") }
+func (c *Client) sendFileReadResult(msg Message)   { c.trySend(msg, "file.read_result") }
+func (c *Client) sendFileWriteResult(msg Message)  { c.trySend(msg, "file.write_result") }
+func (c *Client) sendFileCreateResult(msg Message) { c.trySend(msg, "file.create_result") }
+func (c *Client) sendFileDeleteResult(msg Message) { c.trySend(msg, "file.delete_result") }
+
+// --- Pattern B: checked sends (respect c.done) ---
+
 func (c *Client) sendCommitResult(requestID string, success bool, hash, summary, errCode, errMsg string) {
-	msg := NewRepoCommitResultMessage(requestID, success, hash, summary, errCode, errMsg)
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping commit result")
-	}
+	c.trySendChecked(NewRepoCommitResultMessage(requestID, success, hash, summary, errCode, errMsg), "commit result")
 }
 
-// sendCommitResultMsg sends a pre-built repo.commit_result message to the client.
-func (c *Client) sendCommitResultMsg(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping commit result")
-	}
-}
+func (c *Client) sendCommitResultMsg(msg Message) { c.trySendChecked(msg, "commit result") }
 
-// sendPushResult sends a repo.push_result message to the client.
 func (c *Client) sendPushResult(requestID string, success bool, output, errCode, errMsg string) {
-	msg := NewRepoPushResultMessage(requestID, success, output, errCode, errMsg)
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping push result")
-	}
+	c.trySendChecked(NewRepoPushResultMessage(requestID, success, output, errCode, errMsg), "push result")
 }
 
-// sendPushResultMsg sends a pre-built repo.push_result message to the client.
-func (c *Client) sendPushResultMsg(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping push result")
-	}
-}
+func (c *Client) sendPushResultMsg(msg Message) { c.trySendChecked(msg, "push result") }
 
-// sendFetchResult sends a repo.fetch_result message to the client.
 func (c *Client) sendFetchResult(requestID string, success bool, output, errCode, errMsg string) {
-	msg := NewRepoFetchResultMessage(requestID, success, output, errCode, errMsg)
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping fetch result")
-	}
+	c.trySendChecked(NewRepoFetchResultMessage(requestID, success, output, errCode, errMsg), "fetch result")
 }
 
-// sendFetchResultMsg sends a pre-built repo.fetch_result message to the client.
-func (c *Client) sendFetchResultMsg(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping fetch result")
-	}
-}
+func (c *Client) sendFetchResultMsg(msg Message) { c.trySendChecked(msg, "fetch result") }
 
-// sendPullResult sends a repo.pull_result message to the client.
 func (c *Client) sendPullResult(requestID string, success bool, output, errCode, errMsg string) {
-	msg := NewRepoPullResultMessage(requestID, success, output, errCode, errMsg)
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping pull result")
-	}
+	c.trySendChecked(NewRepoPullResultMessage(requestID, success, output, errCode, errMsg), "pull result")
 }
 
-// sendPullResultMsg sends a pre-built repo.pull_result message to the client.
-func (c *Client) sendPullResultMsg(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping pull result")
-	}
-}
+func (c *Client) sendPullResultMsg(msg Message) { c.trySendChecked(msg, "pull result") }
 
-// sendTmuxSessions sends a tmux.sessions message to this client.
-func (c *Client) sendTmuxSessions(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	case <-time.After(5 * time.Second):
-		log.Printf("Warning: timeout sending tmux.sessions to client")
-	}
-}
+func (c *Client) sendHistoryResult(msg Message)      { c.trySendChecked(msg, "repo.history_result") }
+func (c *Client) sendBranchesResult(msg Message)     { c.trySendChecked(msg, "repo.branches_result") }
+func (c *Client) sendBranchCreateResult(msg Message) { c.trySendChecked(msg, "repo.branch_create_result") }
+func (c *Client) sendBranchSwitchResult(msg Message) { c.trySendChecked(msg, "repo.branch_switch_result") }
 
-// sendFileListResult sends a file.list_result message to this client.
-func (c *Client) sendFileListResult(msg Message) {
-	select {
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping file.list_result")
-	}
-}
-
-// sendFileReadResult sends a file.read_result message to this client.
-func (c *Client) sendFileReadResult(msg Message) {
-	select {
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping file.read_result")
-	}
-}
-
-// sendFileWriteResult sends a file.write_result message to this client.
-func (c *Client) sendFileWriteResult(msg Message) {
-	select {
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping file.write_result")
-	}
-}
-
-// sendFileCreateResult sends a file.create_result message to this client.
-func (c *Client) sendFileCreateResult(msg Message) {
-	select {
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping file.create_result")
-	}
-}
-
-// sendFileDeleteResult sends a file.delete_result message to this client.
-func (c *Client) sendFileDeleteResult(msg Message) {
-	select {
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping file.delete_result")
-	}
-}
-
-// sendHistoryResult sends a repo.history_result message to this client.
-func (c *Client) sendHistoryResult(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.history_result")
-	}
-}
-
-// sendBranchesResult sends a repo.branches_result message to this client.
-func (c *Client) sendBranchesResult(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.branches_result")
-	}
-}
-
-// sendBranchCreateResult sends a repo.branch_create_result message to this client.
-func (c *Client) sendBranchCreateResult(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.branch_create_result")
-	}
-}
-
-// sendBranchSwitchResult sends a repo.branch_switch_result message to this client.
-func (c *Client) sendBranchSwitchResult(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.branch_switch_result")
-	}
-}
-
-// sendPrListResult sends a repo.pr_list_result message to the client.
 func (c *Client) sendPrListResult(requestID string, success bool, entries []RepoPrEntryPayload, errCode, errMsg string) {
-	msg := NewRepoPrListResultMessage(requestID, success, entries, errCode, errMsg)
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.pr_list_result")
-	}
+	c.trySendChecked(NewRepoPrListResultMessage(requestID, success, entries, errCode, errMsg), "repo.pr_list_result")
 }
 
-// sendPrListResultMsg sends a pre-built repo.pr_list_result message to the client.
-func (c *Client) sendPrListResultMsg(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.pr_list_result")
-	}
-}
+func (c *Client) sendPrListResultMsg(msg Message) { c.trySendChecked(msg, "repo.pr_list_result") }
 
-// sendPrViewResult sends a repo.pr_view_result message to the client.
 func (c *Client) sendPrViewResult(requestID string, success bool, pr *RepoPrDetailPayload, errCode, errMsg string) {
-	msg := NewRepoPrViewResultMessage(requestID, success, pr, errCode, errMsg)
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.pr_view_result")
-	}
+	c.trySendChecked(NewRepoPrViewResultMessage(requestID, success, pr, errCode, errMsg), "repo.pr_view_result")
 }
 
-// sendPrViewResultMsg sends a pre-built repo.pr_view_result message to the client.
-func (c *Client) sendPrViewResultMsg(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.pr_view_result")
-	}
-}
+func (c *Client) sendPrViewResultMsg(msg Message) { c.trySendChecked(msg, "repo.pr_view_result") }
 
-// sendPrCreateResult sends a repo.pr_create_result message to the client.
 func (c *Client) sendPrCreateResult(requestID string, success bool, pr *RepoPrDetailPayload, errCode, errMsg string) {
-	msg := NewRepoPrCreateResultMessage(requestID, success, pr, errCode, errMsg)
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.pr_create_result")
-	}
+	c.trySendChecked(NewRepoPrCreateResultMessage(requestID, success, pr, errCode, errMsg), "repo.pr_create_result")
 }
 
-// sendPrCreateResultMsg sends a pre-built repo.pr_create_result message to the client.
-func (c *Client) sendPrCreateResultMsg(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.pr_create_result")
-	}
-}
+func (c *Client) sendPrCreateResultMsg(msg Message) { c.trySendChecked(msg, "repo.pr_create_result") }
 
-// sendPrCheckoutResult sends a repo.pr_checkout_result message to the client.
 func (c *Client) sendPrCheckoutResult(requestID string, success bool, branchName string, changedBranch bool, blockers []string, errCode, errMsg string) {
-	msg := NewRepoPrCheckoutResultMessage(requestID, success, branchName, changedBranch, blockers, errCode, errMsg)
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.pr_checkout_result")
-	}
+	c.trySendChecked(NewRepoPrCheckoutResultMessage(requestID, success, branchName, changedBranch, blockers, errCode, errMsg), "repo.pr_checkout_result")
 }
 
-// sendPrCheckoutResultMsg sends a pre-built repo.pr_checkout_result message to the client.
-func (c *Client) sendPrCheckoutResultMsg(msg Message) {
-	select {
-	case <-c.done:
-		return
-	case c.send <- msg:
-	default:
-		log.Printf("Warning: client send buffer full, dropping repo.pr_checkout_result")
-	}
+func (c *Client) sendPrCheckoutResultMsg(msg Message) { c.trySendChecked(msg, "repo.pr_checkout_result") }
+
+// --- Pattern C: timeout sends ---
+
+func (c *Client) sendTmuxSessions(msg Message) {
+	c.trySendTimeout(msg, "tmux.sessions", 5*time.Second)
 }
