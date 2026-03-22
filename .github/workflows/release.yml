@@ -109,3 +109,87 @@ jobs:
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-formula:
+    name: Update Homebrew Formula
+    runs-on: ubuntu-latest
+    needs: release
+    # Only update formula for stable releases (skip alpha/beta/rc).
+    if: ${{ !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'rc') }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download checksums from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ steps.version.outputs.tag }}" \
+            --pattern "checksums.txt" \
+            --dir .
+
+      - name: Update formula
+        run: |
+          SHA_DARWIN_ARM64=$(grep 'pseudocoder-darwin-arm64$' checksums.txt | awk '{print $1}')
+          SHA_DARWIN_AMD64=$(grep 'pseudocoder-darwin-amd64$' checksums.txt | awk '{print $1}')
+          SHA_LINUX_AMD64=$(grep 'pseudocoder-linux-amd64$' checksums.txt | awk '{print $1}')
+
+          if [ -z "$SHA_DARWIN_ARM64" ] || [ -z "$SHA_DARWIN_AMD64" ] || [ -z "$SHA_LINUX_AMD64" ]; then
+            echo "ERROR: Failed to extract all checksums"
+            cat checksums.txt
+            exit 1
+          fi
+
+          echo "Version: ${{ steps.version.outputs.version }}"
+          echo "darwin-arm64: $SHA_DARWIN_ARM64"
+          echo "darwin-amd64: $SHA_DARWIN_AMD64"
+          echo "linux-amd64:  $SHA_LINUX_AMD64"
+
+          # Update version
+          sed -i "s/version \".*\"/version \"${{ steps.version.outputs.version }}\"/" Formula/pseudocoder.rb
+
+          # Update SHA256 checksums in order: darwin-arm64, darwin-amd64, linux-amd64
+          awk -v sha1="$SHA_DARWIN_ARM64" \
+              -v sha2="$SHA_DARWIN_AMD64" \
+              -v sha3="$SHA_LINUX_AMD64" '
+          BEGIN { count = 0 }
+          /sha256 "/ {
+            count++
+            if (count == 1) { sub(/sha256 ".*"/, "sha256 \"" sha1 "\"") }
+            if (count == 2) { sub(/sha256 ".*"/, "sha256 \"" sha2 "\"") }
+            if (count == 3) { sub(/sha256 ".*"/, "sha256 \"" sha3 "\"") }
+          }
+          { print }
+          ' Formula/pseudocoder.rb > Formula/pseudocoder.rb.tmp
+          mv Formula/pseudocoder.rb.tmp Formula/pseudocoder.rb
+
+      - name: Verify formula
+        run: |
+          cat Formula/pseudocoder.rb
+          grep -q "version \"${{ steps.version.outputs.version }}\"" Formula/pseudocoder.rb
+          CHECKSUM_COUNT=$(grep -c 'sha256 "' Formula/pseudocoder.rb)
+          if [ "$CHECKSUM_COUNT" -ne 3 ]; then
+            echo "ERROR: Expected 3 sha256 lines, found $CHECKSUM_COUNT"
+            exit 1
+          fi
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pseudocoder.rb
+          git commit -m "formula: update to ${{ steps.version.outputs.tag }}"
+          git push origin main
