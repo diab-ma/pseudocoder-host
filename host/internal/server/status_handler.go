@@ -3,7 +3,6 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"time"
 )
@@ -153,9 +152,5 @@ func (h *StatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.KeepAwake = summary
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		// Log error but response is already partially sent
-		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-	}
+	writeJSON(w, http.StatusOK, resp)
 }

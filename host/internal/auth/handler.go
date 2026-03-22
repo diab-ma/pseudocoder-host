@@ -3,12 +3,11 @@ package auth
 import (
 	"encoding/json"
 	"log"
-	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	hostErrors "github.com/pseudocoder/host/internal/errors"
+	"github.com/pseudocoder/host/internal/netutil"
 )
 
 // PairRequest is the JSON body for the /pair endpoint.
@@ -130,16 +129,8 @@ func (h *PairHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// writeError sends a JSON error response with taxonomy code and next action.
 func (h *PairHandler) writeError(w http.ResponseWriter, status int, legacyCode, taxonomyCode, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(ErrorResponse{
-		Error:      legacyCode,
-		ErrorCode:  taxonomyCode,
-		Message:    message,
-		NextAction: hostErrors.GetNextAction(taxonomyCode),
-	})
+	writeAuthError(w, status, legacyCode, taxonomyCode, message)
 }
 
 // GenerateCodeResponse is the JSON response for /pair/generate.
@@ -160,43 +151,17 @@ func NewGenerateCodeHandler(pm *PairingManager) *GenerateCodeHandler {
 }
 
 // isLoopbackRequest checks if the request originates from the local machine.
-// This is used to restrict sensitive endpoints like /pair/generate to local access only.
-// Returns true for loopback or unix socket addresses.
+// Delegates to the shared netutil.IsLoopbackRequest implementation.
 func isLoopbackRequest(r *http.Request) bool {
-	// Extract the host part from RemoteAddr (format is "host:port" or "[host]:port" for IPv6)
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		if isUnixSocketRemoteAddr(r.RemoteAddr) {
-			return true
-		}
-		// If we can't parse the address, be conservative and reject
-		log.Printf("auth: failed to parse RemoteAddr %q: %v", r.RemoteAddr, err)
-		return false
-	}
-
-	// Parse the IP address
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// If we can't parse the IP, be conservative and reject
-		log.Printf("auth: failed to parse IP from host %q", host)
-		return false
-	}
-
-	return ip.IsLoopback()
+	return netutil.IsLoopbackRequest(r)
 }
 
-func isUnixSocketRemoteAddr(remoteAddr string) bool {
-	if remoteAddr == "" {
-		return true
-	}
-	if strings.HasPrefix(remoteAddr, "/") || strings.HasPrefix(remoteAddr, "@") {
-		return true
-	}
-	return false
-}
-
-// writeError sends a JSON error response with taxonomy code and next action.
 func (h *GenerateCodeHandler) writeError(w http.ResponseWriter, status int, legacyCode, taxonomyCode, message string) {
+	writeAuthError(w, status, legacyCode, taxonomyCode, message)
+}
+
+// writeAuthError sends a JSON error response with taxonomy code and next action.
+func writeAuthError(w http.ResponseWriter, status int, legacyCode, taxonomyCode, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(ErrorResponse{

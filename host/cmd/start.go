@@ -60,6 +60,14 @@ Options:
 		return 1
 	}
 
+	// Non-blocking update check (skip for dev builds and if suppressed).
+	var updateCh <-chan updateCheckResult
+	if Version != "dev" && os.Getenv("PSEUDOCODER_NO_UPDATE_CHECK") != "1" {
+		ch := make(chan updateCheckResult, 1)
+		go func() { ch <- checkForUpdate(Version) }()
+		updateCh = ch
+	}
+
 	explicitFlags := make(map[string]bool)
 	fs.Visit(func(f *flag.Flag) {
 		explicitFlags[f.Name] = true
@@ -154,6 +162,12 @@ Options:
 	fmt.Fprintln(stdout, "  Pairing:  Run 'pseudocoder pair' to connect")
 	fmt.Fprintln(stdout, "===========================================")
 	fmt.Fprintln(stdout, "")
+
+	// Print update notification if available.
+	if updateCh != nil {
+		result := <-updateCh
+		printUpdateNotification(stdout, result, Version)
+	}
 
 	// Build args for runHostStart
 	// We explicitly pass the flags to ensure mobile-ready defaults even if
